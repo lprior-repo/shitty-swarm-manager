@@ -235,6 +235,74 @@ async fn record_stage_complete_failure_sets_waiting_and_attempt() {
 
 #[tokio::test]
 #[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
+async fn claim_next_bead_prefers_existing_in_progress_claim() {
+    let db = test_db().await;
+    setup_schema(&db).await;
+    reset_runtime_tables(&db).await;
+
+    let agent_id = AgentId::new(RepoId::new("local"), 1);
+    let bead_id = BeadId::new(unique_bead("bead-resume"));
+
+    let seed_result = db.seed_idle_agents(1).await;
+    assert!(
+        seed_result.is_ok(),
+        "seed_idle_agents failed: {:?}",
+        seed_result
+    );
+
+    let insert_result = sqlx::query(
+        "INSERT INTO bead_claims (bead_id, claimed_by, status) VALUES ($1, $2, 'in_progress')",
+    )
+    .bind(bead_id.value())
+    .bind(agent_id.number() as i32)
+    .execute(db.pool())
+    .await;
+    assert!(
+        insert_result.is_ok(),
+        "insert bead_claims failed: {:?}",
+        insert_result
+    );
+
+    let claim_result = db.claim_next_bead(&agent_id).await;
+    assert!(
+        claim_result.is_ok(),
+        "claim_next_bead failed: {:?}",
+        claim_result
+    );
+
+    let claimed = match claim_result {
+        Ok(value) => value,
+        Err(err) => panic!("claim_next_bead failed: {}", err),
+    };
+    assert_eq!(
+        claimed.as_ref().map(|bead| bead.value()),
+        Some(bead_id.value())
+    );
+
+    let state_row = sqlx::query_as::<_, (Option<String>, String, Option<String>)>(
+        "SELECT bead_id, status, current_stage FROM agent_state WHERE agent_id = $1",
+    )
+    .bind(agent_id.number() as i32)
+    .fetch_optional(db.pool())
+    .await;
+    assert!(
+        state_row.is_ok(),
+        "fetch agent_state failed: {:?}",
+        state_row
+    );
+
+    let (state_bead, status, stage) = match state_row.ok().flatten() {
+        Some(values) => values,
+        None => (None, "missing".to_string(), None),
+    };
+
+    assert_eq!(state_bead.as_deref(), Some(bead_id.value()));
+    assert_eq!(status.as_str(), "working");
+    assert_eq!(stage.as_deref(), Some("rust-contract"));
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
 async fn ninety_concurrent_claims_are_unique_and_bounded() {
     let db = test_db().await;
     setup_schema(&db).await;

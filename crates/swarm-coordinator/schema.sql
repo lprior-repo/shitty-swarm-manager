@@ -214,6 +214,25 @@ DECLARE
     v_bead_id TEXT;
 BEGIN
     SELECT bead_id INTO v_bead_id
+    FROM bead_claims
+    WHERE status = 'in_progress'
+      AND claimed_by = p_agent_id
+    ORDER BY claimed_at ASC
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1;
+
+    IF v_bead_id IS NOT NULL THEN
+        UPDATE agent_state
+        SET bead_id = v_bead_id,
+            current_stage = 'rust-contract',
+            stage_started_at = NOW(),
+            status = 'working'
+        WHERE agent_id = p_agent_id;
+
+        RETURN v_bead_id;
+    END IF;
+
+    SELECT bead_id INTO v_bead_id
     FROM bead_backlog
     WHERE status = 'pending' AND priority = 'p0'
     ORDER BY created_at ASC
