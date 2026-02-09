@@ -1,6 +1,6 @@
 use super::{determine_transition, StageTransition};
 use crate::db::SwarmDb;
-use crate::types::{AgentId, BeadId, RepoId, Stage, StageResult};
+use crate::types::{AgentId, ArtifactType, BeadId, MessageType, RepoId, Stage, StageResult};
 use futures_util::future::join_all;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -37,9 +37,17 @@ async fn setup_schema(db: &SwarmDb) {
          DROP VIEW IF EXISTS v_feedback_required CASCADE;
          DROP VIEW IF EXISTS v_swarm_progress CASCADE;
          DROP VIEW IF EXISTS v_active_agents CASCADE;
+         DROP VIEW IF EXISTS v_unread_messages CASCADE;
+         DROP VIEW IF EXISTS v_contract_artifacts CASCADE;
+         DROP VIEW IF EXISTS v_bead_artifacts CASCADE;
+         DROP FUNCTION IF EXISTS mark_messages_read(TEXT, INTEGER, BIGINT[]) CASCADE;
+         DROP FUNCTION IF EXISTS get_unread_messages(TEXT, INTEGER, TEXT) CASCADE;
+         DROP FUNCTION IF EXISTS send_agent_message(TEXT, INTEGER, TEXT, INTEGER, TEXT, TEXT, TEXT, TEXT, JSONB) CASCADE;
+         DROP FUNCTION IF EXISTS store_stage_artifact(BIGINT, TEXT, TEXT, JSONB) CASCADE;
          DROP FUNCTION IF EXISTS claim_next_p0_bead(INTEGER) CASCADE;
          DROP FUNCTION IF EXISTS claim_next_p0_bead(SMALLINT) CASCADE;
          DROP FUNCTION IF EXISTS set_agent_last_update() CASCADE;
+         DROP TABLE IF EXISTS agent_messages CASCADE;
          DROP TABLE IF EXISTS stage_artifacts CASCADE;
          DROP TABLE IF EXISTS stage_history CASCADE;
          DROP TABLE IF EXISTS agent_run_logs CASCADE;
@@ -59,7 +67,7 @@ async fn setup_schema(db: &SwarmDb) {
 
 async fn reset_runtime_tables(db: &SwarmDb) {
     sqlx::query(
-        "TRUNCATE TABLE stage_artifacts, stage_history, agent_run_logs, bead_claims, bead_backlog, agent_state RESTART IDENTITY",
+        "TRUNCATE TABLE agent_messages, stage_artifacts, stage_history, agent_run_logs, bead_claims, bead_backlog, agent_state RESTART IDENTITY",
     )
     .execute(db.pool())
     .await
@@ -274,4 +282,180 @@ async fn ninety_concurrent_claims_are_unique_and_bounded() {
 
     let overflow = join_all(overflow_futures).await;
     assert!(overflow.into_iter().all(|v| v.is_none()));
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
+async fn stage_artifact_store_is_deduplicated_by_hash_and_type() {
+    let db = test_db().await;
+    setup_schema(&db).await;
+    reset_runtime_tables(&db).await;
+
+    let agent_id = AgentId::new(RepoId::new("local"), 1);
+    let bead_id = BeadId::new(unique_bead("bead-artifact"));
+
+    db.seed_idle_agents(1)
+        .await
+        .unwrap_or_else(|e| panic!("seed_idle_agents failed: {}", e));
+    sqlx::query(
+        "INSERT INTO bead_backlog (bead_id, priority, status) VALUES ($1, 'p0', 'pending')",
+    )
+    .bind(bead_id.value())
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("insert backlog failed: {}", e));
+    db.claim_next_bead(&agent_id)
+        .await
+        .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
+    db.record_stage_started(&agent_id, &bead_id, Stage::RustContract, 1)
+        .await
+        .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
+
+    let stage_history_id = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM stage_history WHERE agent_id = $1 AND bead_id = $2 ORDER BY id DESC LIMIT 1",
+    )
+    .bind(agent_id.number() as i32)
+    .bind(bead_id.value())
+    .fetch_one(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("failed to fetch stage_history id: {}", e));
+
+    let first_id = db
+        .store_stage_artifact(
+            stage_history_id,
+            ArtifactType::ContractDocument,
+            "contract-body",
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("store_stage_artifact first failed: {}", e));
+
+    let duplicate_id = db
+        .store_stage_artifact(
+            stage_history_id,
+            ArtifactType::ContractDocument,
+            "contract-body",
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("store_stage_artifact duplicate failed: {}", e));
+
+    let second_type_id = db
+        .store_stage_artifact(
+            stage_history_id,
+            ArtifactType::StageLog,
+            "contract-body",
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("store_stage_artifact different type failed: {}", e));
+
+    assert_eq!(first_id, duplicate_id);
+    assert_ne!(first_id, second_type_id);
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
+async fn message_send_receive_and_mark_read_round_trip_works() {
+    let db = test_db().await;
+    setup_schema(&db).await;
+    reset_runtime_tables(&db).await;
+
+    let from_agent = AgentId::new(RepoId::new("local"), 1);
+    let to_agent = AgentId::new(RepoId::new("local"), 2);
+    let bead_id = BeadId::new(unique_bead("bead-msg"));
+
+    db.seed_idle_agents(2)
+        .await
+        .unwrap_or_else(|e| panic!("seed_idle_agents failed: {}", e));
+
+    let message_id = db
+        .send_agent_message(
+            &from_agent,
+            Some(&to_agent),
+            Some(&bead_id),
+            MessageType::QaFailed,
+            "qa failed",
+            "3 tests failed",
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("send_agent_message failed: {}", e));
+
+    let unread_before = db
+        .get_unread_messages(&to_agent, Some(&bead_id))
+        .await
+        .unwrap_or_else(|e| panic!("get_unread_messages failed: {}", e));
+
+    assert_eq!(unread_before.len(), 1);
+    assert_eq!(unread_before[0].id, message_id);
+    assert_eq!(unread_before[0].message_type, MessageType::QaFailed);
+
+    db.mark_messages_read(&to_agent, &[message_id])
+        .await
+        .unwrap_or_else(|e| panic!("mark_messages_read failed: {}", e));
+
+    let unread_after = db
+        .get_unread_messages(&to_agent, Some(&bead_id))
+        .await
+        .unwrap_or_else(|e| panic!("get_unread_messages after mark failed: {}", e));
+
+    assert!(unread_after.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
+async fn release_agent_resets_agent_and_requeues_bead() {
+    let db = test_db().await;
+    setup_schema(&db).await;
+    reset_runtime_tables(&db).await;
+
+    let agent_id = AgentId::new(RepoId::new("local"), 1);
+    let bead_id = BeadId::new(unique_bead("bead-release"));
+
+    db.seed_idle_agents(1)
+        .await
+        .unwrap_or_else(|e| panic!("seed_idle_agents failed: {}", e));
+    sqlx::query(
+        "INSERT INTO bead_backlog (bead_id, priority, status) VALUES ($1, 'p0', 'pending')",
+    )
+    .bind(bead_id.value())
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("insert backlog failed: {}", e));
+
+    db.claim_next_bead(&agent_id)
+        .await
+        .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
+
+    let released = db
+        .release_agent(&agent_id)
+        .await
+        .unwrap_or_else(|e| panic!("release_agent failed: {}", e));
+
+    assert_eq!(released.as_ref().map(BeadId::value), Some(bead_id.value()));
+
+    let status =
+        sqlx::query_scalar::<_, String>("SELECT status FROM agent_state WHERE agent_id = $1")
+            .bind(agent_id.number() as i32)
+            .fetch_one(db.pool())
+            .await
+            .unwrap_or_else(|e| panic!("fetch agent status failed: {}", e));
+    assert_eq!(status, "idle");
+
+    let backlog_status =
+        sqlx::query_scalar::<_, String>("SELECT status FROM bead_backlog WHERE bead_id = $1")
+            .bind(bead_id.value())
+            .fetch_one(db.pool())
+            .await
+            .unwrap_or_else(|e| panic!("fetch backlog status failed: {}", e));
+    assert_eq!(backlog_status, "pending");
+
+    let claim_count =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM bead_claims WHERE bead_id = $1")
+            .bind(bead_id.value())
+            .fetch_one(db.pool())
+            .await
+            .unwrap_or_else(|e| panic!("fetch claim count failed: {}", e));
+    assert_eq!(claim_count, 0);
 }

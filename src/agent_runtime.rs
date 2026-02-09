@@ -1,11 +1,18 @@
+use crate::agent_runtime_support::{
+    build_full_message_body, execute_stage, stage_failure_message_type, stage_primary_artifact,
+    stage_success_message_type,
+};
 use crate::config::StageCommands;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Instant;
-use tokio::process::Command;
 use tracing::{error, info, warn};
 
-use swarm::{AgentId, BeadId, Result, Stage, StageResult, SwarmDb, SwarmError};
+use serde_json::json;
+use swarm::{
+    stage_executors::execute_stage_rust, AgentId, ArtifactType, BeadId, MessageType, Result, Stage,
+    StageResult, SwarmDb, SwarmError,
+};
 
 pub async fn run_agent(
     db: &SwarmDb,
@@ -35,85 +42,6 @@ pub async fn run_smoke_once(db: &SwarmDb, agent_id: &AgentId) -> Result<()> {
             Ok(())
         }
     }
-}
-
-pub async fn execute_stage(
-    stage: Stage,
-    bead_id: &BeadId,
-    agent_id: &AgentId,
-    commands: &StageCommands,
-) -> StageResult {
-    let command = render_stage_command(
-        stage_command_template(stage, commands),
-        bead_id.value(),
-        agent_id.number(),
-    );
-    info!("Executing stage command [{}]: {}", stage, command);
-    match run_shell_command(&command).await {
-        Ok(output) if output.status_success => StageResult::Passed,
-        Ok(output) => StageResult::Failed(output.message),
-        Err(err) => StageResult::Error(format!("Stage command error: {}", err)),
-    }
-}
-
-pub fn render_stage_command(template: &str, bead_id: &str, agent_id: u32) -> String {
-    let safe_bead_id = shell_escape(bead_id);
-    let safe_agent_id = shell_escape(&agent_id.to_string());
-    template
-        .replace("{bead_id}", &safe_bead_id)
-        .replace("{agent_id}", &safe_agent_id)
-}
-
-fn shell_escape(value: &str) -> String {
-    if value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/')
-    {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "'\\''"))
-    }
-}
-
-pub fn stage_command_template(stage: Stage, commands: &StageCommands) -> &str {
-    match stage {
-        Stage::RustContract => commands.rust_contract.as_str(),
-        Stage::Implement => commands.implement.as_str(),
-        Stage::QaEnforcer => commands.qa_enforcer.as_str(),
-        Stage::RedQueen => commands.red_queen.as_str(),
-        Stage::Done => "true",
-    }
-}
-
-pub struct CommandOutput {
-    pub status_success: bool,
-    pub message: String,
-}
-
-pub async fn run_shell_command(command: &str) -> Result<CommandOutput> {
-    let output = Command::new("bash")
-        .arg("-lc")
-        .arg(command)
-        .output()
-        .await
-        .map_err(SwarmError::IoError)?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let message = if output.status.success() {
-        stdout
-    } else if stderr.is_empty() {
-        stdout
-    } else if stdout.is_empty() {
-        stderr
-    } else {
-        format!("{}\n{}", stdout, stderr)
-    };
-
-    Ok(CommandOutput {
-        status_success: output.status.success(),
-        message,
-    })
 }
 
 fn run_agent_recursive<'a>(
@@ -173,20 +101,152 @@ async fn process_work_state(
     }
 
     if let (Some(stage), Some(bead_id)) = (state.current_stage, state.bead_id) {
+        let unread_messages = db.get_unread_messages(agent_id, Some(&bead_id)).await?;
+        let feedback_messages = unread_messages
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m.message_type,
+                    MessageType::QaFailed
+                        | MessageType::RedQueenFailed
+                        | MessageType::ImplementationRetry
+                )
+            })
+            .map(|m| format!("[{}] {}", m.message_type.as_str(), m.body))
+            .collect::<Vec<_>>();
+
         let attempt = state.implementation_attempt.saturating_add(1);
         let started = Instant::now();
         db.record_stage_started(agent_id, &bead_id, stage, attempt)
             .await?;
-        let result = execute_stage(stage, &bead_id, agent_id, stage_commands).await;
+
+        let stage_history_id = db
+            .get_stage_history_id(agent_id, &bead_id, stage, attempt)
+            .await?
+            .ok_or_else(|| {
+                SwarmError::DatabaseError(
+                    "Missing started stage_history row for artifact storage".to_string(),
+                )
+            })?;
+
+        if !feedback_messages.is_empty() {
+            let feedback_payload = feedback_messages.join("\n\n");
+            db.store_stage_artifact(
+                stage_history_id,
+                ArtifactType::Feedback,
+                &feedback_payload,
+                Some(json!({"source": "agent_messages"})),
+            )
+            .await?;
+        }
+
+        let rust_result = execute_stage_rust(db, stage, &bead_id, agent_id, stage_history_id).await;
+        let (result, used_fallback) = match &rust_result {
+            StageResult::Error(err) => {
+                warn!(
+                    "Rust stage executor errored for bead {} stage {}: {}; falling back to configured command",
+                    bead_id,
+                    stage,
+                    err
+                );
+                (
+                    execute_stage(stage, &bead_id, agent_id, stage_commands).await,
+                    true,
+                )
+            }
+            _ => (rust_result, false),
+        };
+        let status = result.as_str();
+        let is_success = result.is_success();
+
+        let result_message = result
+            .message()
+            .map_or_else(String::new, std::string::ToString::to_string);
+
+        if used_fallback {
+            db.store_stage_artifact(
+                stage_history_id,
+                ArtifactType::StageLog,
+                &result_message,
+                Some(json!({
+                    "stage": stage.as_str(),
+                    "status": result.as_str(),
+                    "attempt": attempt,
+                })),
+            )
+            .await?;
+
+            db.store_stage_artifact(
+                stage_history_id,
+                stage_primary_artifact(stage, &result),
+                &result_message,
+                Some(json!({
+                    "stage": stage.as_str(),
+                    "status": result.as_str(),
+                    "source": "fallback_shell_executor",
+                })),
+            )
+            .await?;
+        }
+
+        let stage_artifacts = db
+            .get_stage_artifacts(stage_history_id)
+            .await
+            .unwrap_or_else(|_| Vec::new());
+        let artifact_types = stage_artifacts
+            .iter()
+            .map(|artifact| artifact.artifact_type.as_str().to_string())
+            .collect::<Vec<_>>();
+        let message_body = build_full_message_body(
+            stage,
+            &status,
+            &bead_id,
+            &result_message,
+            &stage_artifacts,
+            is_success,
+        );
+
         db.record_stage_complete(
             agent_id,
             &bead_id,
             stage,
             attempt,
-            result,
+            result.clone(),
             started.elapsed().as_millis() as u64,
         )
         .await?;
+
+        let maybe_message_type = if is_success {
+            stage_success_message_type(stage)
+        } else {
+            stage_failure_message_type(stage)
+        };
+
+        if let Some(message_type) = maybe_message_type {
+            let subject = format!("{} {} {}", stage.as_str(), status, bead_id.value());
+            let body = message_body;
+
+            db.send_agent_message(
+                agent_id,
+                Some(agent_id),
+                Some(&bead_id),
+                message_type,
+                &subject,
+                &body,
+                Some(json!({
+                    "stage": stage.as_str(),
+                    "status": status,
+                    "attempt": attempt,
+                    "stage_history_id": stage_history_id,
+                    "artifact_count": stage_artifacts.len(),
+                    "artifact_types": artifact_types,
+                })),
+            )
+            .await?;
+        }
+
+        let unread_message_ids = unread_messages.iter().map(|m| m.id).collect::<Vec<_>>();
+        db.mark_messages_read(agent_id, &unread_message_ids).await?;
     }
 
     run_agent_recursive(db, agent_id, stage_commands).await
@@ -225,82 +285,4 @@ fn run_smoke_stages_recursive<'a>(
             )
             .await
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{execute_stage, render_stage_command, run_shell_command, stage_command_template};
-    use crate::config::StageCommands;
-    use swarm::{AgentId, BeadId, RepoId, Stage, StageResult};
-
-    #[tokio::test]
-    async fn shell_command_failure_captures_both_streams() {
-        let output = run_shell_command("echo out; echo err >&2; exit 1").await;
-        assert!(output.is_ok());
-        if let Ok(out) = output {
-            assert!(!out.status_success);
-            assert!(out.message.contains("out") && out.message.contains("err"));
-        }
-    }
-
-    #[tokio::test]
-    async fn execute_stage_maps_success_and_failure() {
-        let ok = StageCommands::for_mode(true);
-        let passed = execute_stage(
-            Stage::Implement,
-            &BeadId::new("b1"),
-            &AgentId::new(RepoId::new("local"), 1),
-            &ok,
-        )
-        .await;
-        assert_eq!(passed, StageResult::Passed);
-
-        let fail = StageCommands {
-            implement: "echo fail >&2; exit 9".to_string(),
-            ..ok
-        };
-        let failed = execute_stage(
-            Stage::Implement,
-            &BeadId::new("b2"),
-            &AgentId::new(RepoId::new("local"), 2),
-            &fail,
-        )
-        .await;
-        assert!(matches!(failed, StageResult::Failed(_)));
-    }
-
-    #[test]
-    fn template_and_render_work() {
-        let commands = StageCommands::default();
-        assert_eq!(stage_command_template(Stage::Done, &commands), "true");
-        assert_eq!(
-            render_stage_command("echo {bead_id}:{agent_id}", "bead-1", 7),
-            "echo bead-1:7"
-        );
-    }
-
-    #[test]
-    fn adversarial_payload_is_shell_escaped() {
-        let rendered = render_stage_command("echo {bead_id}", "bead-1; rm -rf /tmp/evil", 7);
-        assert!(rendered.contains("'bead-1; rm -rf /tmp/evil'"));
-    }
-
-    #[tokio::test]
-    async fn adversarial_payload_does_not_execute_extra_commands() {
-        let commands = StageCommands {
-            rust_contract: "true".to_string(),
-            implement: "printf %s {bead_id}".to_string(),
-            qa_enforcer: "true".to_string(),
-            red_queen: "true".to_string(),
-        };
-        let result = execute_stage(
-            Stage::Implement,
-            &BeadId::new("x; false"),
-            &AgentId::new(RepoId::new("local"), 1),
-            &commands,
-        )
-        .await;
-
-        assert_eq!(result, StageResult::Passed);
-    }
 }

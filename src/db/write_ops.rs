@@ -1,6 +1,8 @@
 use crate::db::SwarmDb;
 use crate::error::{Result, SwarmError};
-use crate::types::{AgentId, BeadId, RepoId, Stage, StageResult, SwarmStatus};
+use crate::types::{
+    AgentId, ArtifactType, BeadId, MessageType, RepoId, Stage, StageResult, SwarmStatus,
+};
 use sqlx::Acquire;
 use std::future::Future;
 use std::pin::Pin;
@@ -132,6 +134,70 @@ impl SwarmDb {
         Ok(())
     }
 
+    pub async fn store_stage_artifact(
+        &self,
+        stage_history_id: i64,
+        artifact_type: ArtifactType,
+        content: &str,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<i64> {
+        sqlx::query_scalar::<_, i64>("SELECT store_stage_artifact($1, $2, $3, $4)")
+            .bind(stage_history_id)
+            .bind(artifact_type.as_str())
+            .bind(content)
+            .bind(metadata)
+            .fetch_one(self.pool())
+            .await
+            .map_err(|e| {
+                SwarmError::DatabaseError(format!("Failed to store stage artifact: {}", e))
+            })
+    }
+
+    pub async fn send_agent_message(
+        &self,
+        from_agent: &AgentId,
+        to_agent: Option<&AgentId>,
+        bead_id: Option<&BeadId>,
+        message_type: MessageType,
+        subject: &str,
+        body: &str,
+        metadata: Option<serde_json::Value>,
+    ) -> Result<i64> {
+        let to_repo_id = to_agent.map(|agent| agent.repo_id().value().to_string());
+        let to_agent_id = to_agent.map(|agent| agent.number() as i32);
+
+        sqlx::query_scalar::<_, i64>(
+            "SELECT send_agent_message($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        )
+        .bind(from_agent.repo_id().value())
+        .bind(from_agent.number() as i32)
+        .bind(to_repo_id)
+        .bind(to_agent_id)
+        .bind(bead_id.map(BeadId::value))
+        .bind(message_type.as_str())
+        .bind(subject)
+        .bind(body)
+        .bind(metadata)
+        .fetch_one(self.pool())
+        .await
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to send agent message: {}", e)))
+    }
+
+    pub async fn mark_messages_read(&self, agent_id: &AgentId, message_ids: &[i64]) -> Result<()> {
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+
+        sqlx::query("SELECT mark_messages_read($1, $2, $3)")
+            .bind(agent_id.repo_id().value())
+            .bind(agent_id.number() as i32)
+            .bind(message_ids)
+            .execute(self.pool())
+            .await
+            .map(|_| ())
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to mark messages read: {}", e)))
+    }
+
     async fn apply_stage_transition(
         &self,
         transition: &StageTransition,
@@ -235,6 +301,77 @@ impl SwarmDb {
         tx.commit()
             .await
             .map_err(|e| SwarmError::DatabaseError(format!("Failed to commit tx: {}", e)))
+    }
+
+    pub async fn release_agent(&self, agent_id: &AgentId) -> Result<Option<BeadId>> {
+        let mut tx = self
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to begin tx: {}", e)))?;
+
+        let conn = tx
+            .acquire()
+            .await
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to acquire tx conn: {}", e)))?;
+
+        let bead = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT bead_id FROM agent_state WHERE agent_id = $1 FOR UPDATE",
+        )
+        .bind(agent_id.number() as i32)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to read agent state: {}", e)))?
+        .flatten();
+
+        if let Some(bead_id) = bead.as_deref() {
+            sqlx::query("DELETE FROM bead_claims WHERE bead_id = $1")
+                .bind(bead_id)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| {
+                    SwarmError::DatabaseError(format!(
+                        "Failed to clear bead claim on release: {}",
+                        e
+                    ))
+                })?;
+
+            sqlx::query(
+                "UPDATE bead_backlog
+                 SET status = 'pending'
+                 WHERE bead_id = $1 AND status <> 'completed'",
+            )
+            .bind(bead_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| {
+                SwarmError::DatabaseError(format!(
+                    "Failed to reset backlog status on release: {}",
+                    e
+                ))
+            })?;
+        }
+
+        sqlx::query(
+            "UPDATE agent_state
+             SET bead_id = NULL,
+                 current_stage = NULL,
+                 stage_started_at = NULL,
+                 status = 'idle',
+                 feedback = NULL,
+                 implementation_attempt = 0
+             WHERE agent_id = $1",
+        )
+        .bind(agent_id.number() as i32)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to reset agent state: {}", e)))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to commit tx: {}", e)))?;
+
+        Ok(bead.map(BeadId::new))
     }
 
     async fn finalize_agent_and_bead(&self, agent_id: &AgentId, bead_id: &BeadId) -> Result<()> {

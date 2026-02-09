@@ -19,6 +19,65 @@ pub fn emit_output(output: &OutputFormat, command: &str, payload: serde_json::Va
     }
 }
 
+pub fn emit_error(output: &OutputFormat, error: &SwarmError) {
+    let exit_code = map_error_to_exit_code(error);
+    let (kind, hint) = error_kind_and_hint(error);
+
+    match output {
+        OutputFormat::Text => {
+            eprintln!("error [{}]: {}", kind, error);
+            eprintln!("hint: {}", hint);
+        }
+        OutputFormat::Json => {
+            eprintln!(
+                "{}",
+                json!({
+                    "status": "error",
+                    "error": {
+                        "kind": kind,
+                        "message": error.to_string(),
+                        "hint": hint,
+                        "exit_code": exit_code,
+                    }
+                })
+            );
+        }
+    }
+}
+
+fn error_kind_and_hint(error: &SwarmError) -> (&'static str, &'static str) {
+    match error {
+        SwarmError::ConfigError(_) => (
+            "config_error",
+            "Check CLI flags, config path, and required local files.",
+        ),
+        SwarmError::DatabaseError(_) => (
+            "database_error",
+            "Verify DATABASE_URL and confirm Postgres is reachable.",
+        ),
+        SwarmError::AgentError(_) => (
+            "agent_error",
+            "Inspect agent state and message queue for the current bead.",
+        ),
+        SwarmError::BeadError(_) => (
+            "bead_error",
+            "Confirm bead ID exists and bead status allows this action.",
+        ),
+        SwarmError::StageError(_) => (
+            "stage_error",
+            "Check stage artifacts and prior stage outputs for this bead.",
+        ),
+        SwarmError::IoError(_) => (
+            "io_error",
+            "Verify filesystem permissions and external command availability.",
+        ),
+        SwarmError::SerializationError(_) => (
+            "serialization_error",
+            "Review payload format and schema expectations.",
+        ),
+    }
+}
+
 pub fn map_error_to_exit_code(error: &SwarmError) -> i32 {
     match error {
         SwarmError::ConfigError(_) => 2,
@@ -33,7 +92,7 @@ pub fn map_error_to_exit_code(error: &SwarmError) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::map_error_to_exit_code;
+    use super::{error_kind_and_hint, map_error_to_exit_code};
     use swarm::SwarmError;
 
     #[test]
@@ -68,5 +127,12 @@ mod tests {
             map_error_to_exit_code(&SwarmError::SerializationError(serde_err)),
             8
         );
+    }
+
+    #[test]
+    fn error_kind_and_hint_mapping_is_stable() {
+        let (kind, hint) = error_kind_and_hint(&SwarmError::ConfigError("x".to_string()));
+        assert_eq!(kind, "config_error");
+        assert!(hint.contains("config"));
     }
 }

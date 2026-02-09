@@ -11,21 +11,28 @@
 - **Complete picture**: Shows callers, callees, types, dependencies in ONE call
 - **Symbol-level precision**: Knows about functions, structs, traits, not just text
 
+### Codanna Status for This Project
+
+✅ **Indexed and Ready**: 302 symbols across 15 files
+- Location: `.codanna/index`
+- Semantic search: Enabled (AllMiniLML6V2)
+- Relationships: 452 resolved
+
 ### How to Use Codanna (Workflow)
 
 ```bash
 # STEP 1: Start with semantic search (gets full context)
-mcp__codanna__semantic_search_with_context "DAG scheduler" --limit 5
+mcp__codanna__semantic_search_with_context "database operations" --limit 5
 
 # STEP 2: Find exact symbols
-mcp__codanna__find_symbol "WorkflowDAG"
+mcp__codanna__find_symbol "AgentRuntime"
 
 # STEP 3: Analyze impact (see complete dependency graph)
 mcp__codanna__analyze_impact --symbol_id 12345
 
 # STEP 4: Get specific details
-mcp__codanna__get_calls --function_name "schedule_bead"
-mcp__codanna__find_callers --function_name "handle_event"
+mcp__codanna__get_calls --function_name "spawn_agent"
+mcp__codanna__find_callers --function_name "handle_command"
 ```
 
 ### DO NOT Use These (Wasteful)
@@ -41,15 +48,15 @@ mcp__codanna__find_callers --function_name "handle_event"
 
 **Without codanna**:
 ```bash
-grep -r "scheduler" crates/    # 50K tokens of raw output
-cat workflow.rs                 # 2K tokens
-cat scheduler.rs                # 3K tokens
+grep -r "agent" src/       # 50K tokens of raw output
+cat agent_runtime.rs        # 2K tokens
+cat commands.rs             # 3K tokens
 # Still don't know relationships
 ```
 
 **With codanna**:
 ```bash
-semantic_search_with_context "scheduler" --limit 3
+semantic_search_with_context "agent runtime" --limit 3
 # Returns: 3 symbols + documentation + callers + callees + dependencies
 # Total: ~2K tokens, COMPLETE understanding
 ```
@@ -73,28 +80,24 @@ This includes but is not limited to:
 - `clippy.toml`
 - Any `#![allow(...)]` or `#![deny(...)]` attributes in `lib.rs` or `main.rs`
 - Clippy-related sections in `Cargo.toml`
-- Any lint configuration in `moon.yml` or build scripts
 
 If clippy reports warnings or errors, fix the **code**, not the lint rules.
-The user has explicitly configured these rules. Do not second-guess them.
 
-### Build System: Moon Only
-**NEVER use raw cargo commands.** Always use Moon for all build operations:
+### Build System: Cargo
+
+This project uses standard Cargo for builds:
 
 ```bash
-# Correct
-moon run :quick      # Format + lint check
-moon run :test       # Run tests
-moon run :build      # Release build
-moon run :ci         # Full pipeline
-moon run :fmt-fix    # Auto-fix formatting
-moon run :check      # Fast type check
+# Development
+cargo build                   # Debug build
+cargo build --release         # Release build
+cargo test                    # Run tests
+cargo clippy                  # Lint checks
+cargo fmt                     # Format code
 
-# WRONG - Never do this
-cargo fmt            # NO
-cargo clippy         # NO
-cargo test           # NO
-cargo build          # NO
+# Quick iteration
+cargo check                   # Fast type check (no compilation)
+cargo clippy -- -D warnings   # Strict linting
 ```
 
 ### Code Quality
@@ -103,221 +106,123 @@ cargo build          # NO
 - All errors must use `Result<T, Error>` with proper propagation
 - Use functional patterns: `map`, `and_then`, `?` operator
 
+## Project Overview
+
+**shitty-swarm-manager** is a PostgreSQL-based agent swarm coordination system.
+
 ### Project Structure
 ```
-crates/
-  oya-pipeline/   # Core library (error handling, types, functional utils)
-  oya/        # CLI binary (new, stage, approve, show, list)
+src/
+├── main.rs              # Binary entry point
+├── lib.rs               # Library exports
+├── cli.rs               # CLI argument parsing (clap)
+├── commands.rs          # Command handlers
+├── config.rs            # Configuration loading
+├── agent_runtime.rs     # Agent execution logic
+├── monitor.rs           # Monitoring/dashboard
+├── output.rs            # Output formatting
+├── types.rs             # Type definitions
+├── error.rs             # Error types
+└── db/                  # Database layer
+    ├── mod.rs           # Database module
+    ├── mappers.rs       # Row/Entity mappers
+    ├── read_ops.rs      # Read operations
+    └── write_ops.rs     # Write operations
 ```
 
-### MVP Commands
-1. `oya new -s <slug>` - Create task with JJ workspace
-2. `oya stage -s <slug> --stage <name>` - Run pipeline stage
-3. `oya approve -s <slug>` - Mark task for integration
-4. `oya show -s <slug>` - Show task details
-5. `oya list` - List all tasks
+### Core Types
+- **Agent**: Represents an autonomous agent in the swarm
+- **Task**: Work units assigned to agents
+- **AgentStatus**: Agent lifecycle states (idle, active, failed, etc.)
+- **SwarmDb**: Database abstraction layer
 
-### Key Decisions
-- **Code intelligence**: codanna MCP server for all code exploration (token-efficient)
-- **Workspace isolation**: zjj CLI for workspace + session management
-- **Task storage**: `.oya/tasks.json`
-- **Beads**: Hard requirement, always integrate with `.beads/`
-- **Stages**: implement, unit-test, coverage, lint, static, integration, security, review, accept
-
-### Dependencies
-- zjj CLI for workspace isolation with Zellij integration
-- Beads for issue tracking integration
-- Language-specific tooling per stage
-
-### Version Control & Workspace Isolation: zjj CLI
-
-**Use zjj CLI for all workspace operations.** zjj wraps Jujutsu with Zellij integration:
+### CLI Commands
 
 ```bash
-# Correct - Use zjj
-zjj add <session-name>     # Create isolated workspace + Zellij tab
-zjj spawn <bead-id>        # Create workspace for agent work
-zjj status                 # Show session status
-zjj done                   # Merge to main and cleanup
-zjj sync                   # Sync workspace with main
-zjj diff                   # Show differences
-
-# For raw jj when needed
-jj commit -m "msg"         # Create commit
-jj git fetch               # Fetch from remote
-jj git push                # Push to remote
+swarm init                          # Initialize workspace
+swarm register [count]              # Register N agents (default: 12)
+swarm agent -i <id>                 # Show agent details
+swarm status [-a]                   # Show swarm status
+swarm ps [-a]                       # List all agents
+swarm dashboard [-r ms]             # Launch dashboard
+swarm release -i <agent_id>         # Release an agent
+swarm init-db [-u url] [-s schema]  # Initialize database
+swarm monitor [-v view]             # Monitor swarm activity
+swarm spawn-prompts [-n count]      # Generate agent prompts
+swarm smoke -i <id>                 # Run smoke test
 ```
 
-**Why zjj**: Workspace isolation + Zellij session management in one tool.
+## Database
 
----
+**PostgreSQL** is the primary data store:
 
-## Quick Reference
+- Default URL: `postgresql://oya:oya@localhost:5432/swarm_db`
+- Schema: SQL migrations in `crates/swarm-coordinator/schema.sql`
+- Access via `SwarmDb` type in `src/db/`
 
-### Issue Tracking (Beads)
+### Database Operations
 
-**See [docs/BEADS.md](docs/BEADS.md) for complete br reference.**
+- **Read**: `src/db/read_ops.rs` - Query agents, tasks, status
+- **Write**: `src/db/write_ops.rs` - Create, update, delete operations
+- **Mappers**: `src/db/mappers.rs` - Convert DB rows to domain types
 
-### Development (Moon CI/CD)
-```bash
-moon run :quick       # Fast checks (6-7ms with cache!)
-moon run :ci          # Full pipeline (parallel)
-moon run :fmt-fix     # Auto-fix formatting
-moon run :build       # Release build
-moon run :install     # Install to ~/.local/bin
-```
+## Development Workflow
 
-## Hyper-Fast CI/CD Pipeline
-
-This project uses **Moon + bazel-remote** for 98.5% faster builds:
-
-### Performance Characteristics
-- **6-7ms** for cached tasks (vs ~450ms uncached)
-- **Parallel execution** across all crates
-- **100GB local cache** persists across sessions
-- **Zero sudo** required (systemd user service)
-
-### Development Workflow
-
-**1. Quick Iteration Loop** (6-7ms with cache):
+### Quick Iteration Loop
 ```bash
 # Edit code...
-moon run :quick  # Parallel fmt + clippy check
+cargo check              # Fast type check
+cargo clippy             # Lint checks
 ```
 
-**2. Before Committing**:
+### Before Committing
 ```bash
-moon run :fmt-fix  # Auto-fix formatting
-moon run :ci       # Full pipeline (if tests pass)
+cargo fmt                # Format code
+cargo test               # Run tests
+cargo clippy -- -D warnings  # Strict linting
 ```
 
-**3. Cache Management**:
+### Running Tests
 ```bash
-# View cache stats
-curl http://localhost:9090/status | jq
-
-# Restart cache if needed
-systemctl --user restart bazel-remote
+cargo test               # All tests
+cargo test --test integration  # Integration tests only
 ```
 
-### Build System Rules
+## Key Dependencies
 
-**ALWAYS use Moon, NEVER raw cargo:**
-- `moon run :build` (cached, fast)
-- `moon run :test` (parallel with nextest)
-- `moon run :check` (quick type check)
+- **tokio**: Async runtime
+- **sqlx**: Database queries with compile-time verification
+- **clap**: CLI argument parsing
+- **tracing**: Structured logging
+- **serde/serde_json**: Serialization
+- **anyhow/thiserror**: Error handling
+- **uuid**: Unique identifiers
 
-**Why**: Moon provides:
-- Persistent remote caching (survives `moon clean`)
-- Parallel task execution
-- Dependency-aware rebuilds
-- 98.5% faster with cache hits
+## Session Completion
 
----
+**When ending a work session**, ensure the following:
 
-## Using bv as an AI Sidecar
-
-bv is a graph-aware triage engine for Beads projects (.beads/beads.jsonl). Instead of parsing JSONL or hallucinating graph traversal, use robot flags for deterministic, dependency-aware outputs with precomputed metrics (PageRank, betweenness, critical path, cycles, HITS, eigenvector, k-core).
-
-**CRITICAL: Use ONLY `--robot-*` flags. Bare `bv` launches an interactive TUI that blocks your session.**
-
-### The Workflow: Start With Triage
-
-**`bv --robot-triage` is your single entry point.** It returns everything you need in one call:
-- `quick_ref`: at-a-glance counts + top 3 picks
-- `recommendations`: ranked actionable items with scores, reasons, unblock info
-- `quick_wins`: low-effort high-impact items
-- `blockers_to_clear`: items that unblock the most downstream work
-- `project_health`: status/type/priority distributions, graph metrics
-- `commands`: copy-paste shell commands for next steps
-
-```bash
-bv --robot-triage        # THE MEGA-COMMAND: start here
-bv --robot-next          # Minimal: just the single top pick + claim command
-```
-
----
-
-## Parallel Agent Workflow (Orchestration Pattern)
-
-For high-throughput parallel work, use this multi-agent workflow orchestrated through subagents:
-
-### The Complete Pipeline
-
-Each autonomous agent follows this workflow from triage to merge:
-
-```bash
-# Step 1: TRIAGE - Find what to work on
-bv --robot-triage --robot-triage-by-track  # Get parallel execution tracks
-# OR for single issue:
-bv --robot-next  # Get top recommendation + claim command
-
-# Step 2: CLAIM - Reserve the bead
-br update <bead-id> --status in_progress
-
-# Step 3: ISOLATE - Create isolated workspace
-# Use zjj skill to spawn isolated JJ workspace + Zellij tab
-zjj add <session-name>
-
-# Step 4: IMPLEMENT - Build with functional patterns
-# For Rust: functional-rust-generator skill
-# Implements with: zero panics, zero unwraps, Railway-Oriented Programming
-
-# Step 5: REVIEW - Adversarial QA
-# Use red-queen skill for evolutionary testing
-# Drives regression hunting and quality gates
-
-# Step 6: LAND - Finalize and push
-# Use land skill for mandatory quality gates:
-# - Moon quick check (6-7ms cached)
-# - jj commit with proper message
-# - br sync --flush-only
-# - git add .beads/ && git commit -m "sync beads"
-# - jj git push (MANDATORY - work not done until pushed)
-
-# Step 7: MERGE - Reintegrate to main
-# Use zjj skill to merge workspace back to main
-# This handles: jj rebase -d main, cleanup, tab switching
-```
-
----
-
-## Landing the Plane (Session Completion)
-
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `jj git push` succeeds.
-
-**MANDATORY WORKFLOW:**
-
-1. **File issues for remaining work** - Create issues for anything that needs follow-up
-2. **Run quality gates** (if code changed):
+1. **Run quality gates** (if code changed):
    ```bash
-   moon run :quick  # Fast check (6-7ms)
-   # OR for full validation:
-   moon run :ci     # Complete pipeline
+   cargo fmt
+   cargo clippy -- -D warnings
+   cargo test
    ```
-3. **Update issue status** - Close finished work, update in-progress items
-4. **COMMIT AND PUSH** - This is MANDATORY:
+
+2. **Commit changes**:
    ```bash
-   jj commit -m "description"  # jj auto-tracks changes, no 'add' needed
-   br sync --flush-only        # Export beads to JSONL
-   git add .beads/
-   git commit -m "sync beads"
-   jj git fetch                # Fetch from remote (auto-rebases)
-   jj git push                 # Push to remote
-   jj status                   # MUST show clean working copy
+   git add .
+   git commit -m "description"
+   git push
    ```
-5. **Verify cache health**:
+
+3. **Verify build**:
    ```bash
-   systemctl --user is-active bazel-remote  # Should be "active"
+   cargo build --release
    ```
-6. **Clean up** - Clear abandoned workspaces
-7. **Hand off** - Provide context for next session
 
 **CRITICAL RULES:**
-- Work is NOT complete until `jj git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
-- Always use jj for version control (NEVER raw git commands)
-- Always use Moon for builds (NEVER raw cargo commands)
-- YOU ARE TO NEVER TOUCH CLIPPY SETTINGS EVER
+- Always use `cargo` for builds (not Moon or other tools)
+- Zero panics/panics - use `Result<T, Error>` everywhere
+- DO NOT modify clippy/lint configuration
+- Test before committing

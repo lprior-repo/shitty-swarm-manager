@@ -73,7 +73,7 @@ When all stages pass:
 ## Connection defaults
 
 - Host: `localhost`
-- Port: `5432`
-- DB: `swarm_db`
-- User: `oya`
-- Password: `oya`
+- Port: `5437`
+- DB: `shitty_swarm_manager_db`
+- User: `shitty_swarm_manager`
+- Password: `shitty_swarm_manager`

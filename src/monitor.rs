@@ -12,6 +12,7 @@ pub async fn render_monitor_view(
         MonitorView::Active => render_active(db, output).await,
         MonitorView::Progress => render_progress(db, output).await,
         MonitorView::Failures => render_failures(db, output).await,
+        MonitorView::Messages => render_messages(db, output).await,
     }
 }
 
@@ -100,5 +101,47 @@ async fn render_failures(db: &SwarmDb, output: &OutputFormat) -> Result<()> {
             })
             .for_each(|line| println!("{}", line));
     }
+    Ok(())
+}
+
+async fn render_messages(db: &SwarmDb, output: &OutputFormat) -> Result<()> {
+    let messages = db.get_all_unread_messages().await?;
+
+    if *output == OutputFormat::Json {
+        let rows = messages
+            .into_iter()
+            .map(|message| {
+                json!({
+                    "id": message.id,
+                    "from_agent_id": message.from_agent_id,
+                    "to_agent_id": message.to_agent_id,
+                    "bead_id": message.bead_id.map(|b| b.value().to_string()),
+                    "message_type": message.message_type.as_str(),
+                    "subject": message.subject,
+                    "created_at": message.created_at,
+                    "read": message.read,
+                })
+            })
+            .collect::<Vec<_>>();
+        emit_output(output, "monitor", json!({"view":"messages", "rows": rows}));
+    } else {
+        println!("Unread Messages");
+        messages
+            .iter()
+            .map(|message| {
+                format!(
+                    "{:<8} {:<8} {:<20} {:<18} {}",
+                    message.id,
+                    message.from_agent_id,
+                    message
+                        .to_agent_id
+                        .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                    message.message_type.as_str(),
+                    message.subject
+                )
+            })
+            .for_each(|line| println!("{}", line));
+    }
+
     Ok(())
 }

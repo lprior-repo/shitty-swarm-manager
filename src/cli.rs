@@ -12,7 +12,13 @@ pub struct Cli {
     #[arg(short, long, global = true)]
     pub config: Option<PathBuf>,
 
-    #[arg(long, global = true, value_enum, default_value = "text")]
+    #[arg(long, global = true)]
+    pub database_url: Option<String>,
+
+    #[arg(long, global = true)]
+    pub database_url_pass: Option<String>,
+
+    #[arg(long, global = true, value_enum, default_value = "json")]
     pub output: OutputFormat,
 
     #[arg(long, global = true, default_value_t = false)]
@@ -47,12 +53,8 @@ pub enum Commands {
         agent_id: u32,
     },
     InitDb {
-        #[arg(
-            short,
-            long,
-            default_value = "postgresql://oya:oya@localhost:5432/swarm_db"
-        )]
-        url: String,
+        #[arg(short, long)]
+        url: Option<String>,
         #[arg(long, default_value = "crates/swarm-coordinator/schema.sql")]
         schema: PathBuf,
         #[arg(long, default_value = "12")]
@@ -100,4 +102,5 @@ pub enum MonitorView {
     Active,
     Progress,
     Failures,
+    Messages,
 }

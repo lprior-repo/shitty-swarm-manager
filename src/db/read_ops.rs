@@ -2,7 +2,8 @@ use crate::db::mappers::{parse_agent_state, parse_swarm_config, to_u32_i32};
 use crate::db::SwarmDb;
 use crate::error::{Result, SwarmError};
 use crate::types::{
-    AgentId, AgentState, AgentStatus, AvailableAgent, BeadId, ProgressSummary, RepoId, SwarmConfig,
+    AgentId, AgentMessage, AgentState, AgentStatus, ArtifactType, AvailableAgent, BeadId,
+    MessageType, ProgressSummary, RepoId, Stage, StageArtifact, SwarmConfig,
 };
 use sqlx::FromRow;
 
@@ -60,6 +61,34 @@ struct FeedbackRow {
     attempt_number: i32,
     feedback: Option<String>,
     completed_at: Option<String>,
+}
+
+#[derive(FromRow)]
+struct StageArtifactRow {
+    id: i64,
+    stage_history_id: i64,
+    artifact_type: String,
+    content: String,
+    metadata: Option<serde_json::Value>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    content_hash: Option<String>,
+}
+
+#[derive(FromRow)]
+struct AgentMessageRow {
+    id: i64,
+    from_repo_id: String,
+    from_agent_id: i32,
+    to_repo_id: Option<String>,
+    to_agent_id: Option<i32>,
+    bead_id: Option<String>,
+    message_type: String,
+    subject: String,
+    body: String,
+    metadata: Option<serde_json::Value>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    read_at: Option<chrono::DateTime<chrono::Utc>>,
+    read: bool,
 }
 
 impl SwarmDb {
@@ -215,5 +244,178 @@ impl SwarmDb {
                 })
                 .collect::<Vec<_>>()
         })
+    }
+
+    pub async fn get_stage_artifacts(&self, stage_history_id: i64) -> Result<Vec<StageArtifact>> {
+        sqlx::query_as::<_, StageArtifactRow>(
+            "SELECT id, stage_history_id, artifact_type, content, metadata, created_at, content_hash
+             FROM stage_artifacts
+             WHERE stage_history_id = $1
+             ORDER BY created_at ASC",
+        )
+        .bind(stage_history_id)
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to get stage artifacts: {}", e)))
+        .and_then(|rows| {
+            rows.into_iter()
+                .map(|row| {
+                    ArtifactType::try_from(row.artifact_type.as_str())
+                        .map_err(SwarmError::DatabaseError)
+                        .map(|artifact_type| StageArtifact {
+                            id: row.id,
+                            stage_history_id: row.stage_history_id,
+                            artifact_type,
+                            content: row.content,
+                            metadata: row.metadata,
+                            created_at: row.created_at,
+                            content_hash: row.content_hash,
+                        })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+    }
+
+    pub async fn get_bead_artifacts_by_type(
+        &self,
+        bead_id: &BeadId,
+        artifact_type: ArtifactType,
+    ) -> Result<Vec<StageArtifact>> {
+        sqlx::query_as::<_, StageArtifactRow>(
+            "SELECT sa.id, sa.stage_history_id, sa.artifact_type, sa.content, sa.metadata, sa.created_at, sa.content_hash
+             FROM stage_artifacts sa
+             JOIN stage_history sh ON sa.stage_history_id = sh.id
+             WHERE sh.bead_id = $1 AND sa.artifact_type = $2
+             ORDER BY sa.created_at ASC",
+        )
+        .bind(bead_id.value())
+        .bind(artifact_type.as_str())
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| {
+            SwarmError::DatabaseError(format!("Failed to get bead artifacts by type: {}", e))
+        })
+        .and_then(|rows| {
+            rows.into_iter()
+                .map(|row| {
+                    ArtifactType::try_from(row.artifact_type.as_str())
+                        .map_err(SwarmError::DatabaseError)
+                        .map(|mapped_type| StageArtifact {
+                            id: row.id,
+                            stage_history_id: row.stage_history_id,
+                            artifact_type: mapped_type,
+                            content: row.content,
+                            metadata: row.metadata,
+                            created_at: row.created_at,
+                            content_hash: row.content_hash,
+                        })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+    }
+
+    pub async fn get_unread_messages(
+        &self,
+        agent_id: &AgentId,
+        bead_id: Option<&BeadId>,
+    ) -> Result<Vec<AgentMessage>> {
+        sqlx::query_as::<_, AgentMessageRow>(
+            "SELECT id, from_repo_id, from_agent_id, to_repo_id, to_agent_id, bead_id, message_type,
+                    subject, body, metadata, created_at, read_at, read
+             FROM get_unread_messages($1, $2, $3)",
+        )
+        .bind(agent_id.repo_id().value())
+        .bind(agent_id.number() as i32)
+        .bind(bead_id.map(BeadId::value))
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to get unread messages: {}", e)))
+        .and_then(|rows| {
+            rows.into_iter()
+                .map(|row| {
+                    MessageType::try_from(row.message_type.as_str())
+                        .map_err(SwarmError::DatabaseError)
+                        .map(|message_type| AgentMessage {
+                            id: row.id,
+                            from_repo_id: row.from_repo_id,
+                            from_agent_id: to_u32_i32(row.from_agent_id),
+                            to_repo_id: row.to_repo_id,
+                            to_agent_id: row.to_agent_id.map(to_u32_i32),
+                            bead_id: row.bead_id.map(BeadId::new),
+                            message_type,
+                            subject: row.subject,
+                            body: row.body,
+                            metadata: row.metadata,
+                            created_at: row.created_at,
+                            read_at: row.read_at,
+                            read: row.read,
+                        })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+    }
+
+    pub async fn get_all_unread_messages(&self) -> Result<Vec<AgentMessage>> {
+        sqlx::query_as::<_, AgentMessageRow>(
+            "SELECT id, from_repo_id, from_agent_id, to_repo_id, to_agent_id, bead_id, message_type,
+                    subject, body, metadata, created_at, read_at, read
+             FROM v_unread_messages",
+        )
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| {
+            SwarmError::DatabaseError(format!("Failed to get all unread messages: {}", e))
+        })
+        .and_then(|rows| {
+            rows.into_iter()
+                .map(|row| {
+                    MessageType::try_from(row.message_type.as_str())
+                        .map_err(SwarmError::DatabaseError)
+                        .map(|message_type| AgentMessage {
+                            id: row.id,
+                            from_repo_id: row.from_repo_id,
+                            from_agent_id: to_u32_i32(row.from_agent_id),
+                            to_repo_id: row.to_repo_id,
+                            to_agent_id: row.to_agent_id.map(to_u32_i32),
+                            bead_id: row.bead_id.map(BeadId::new),
+                            message_type,
+                            subject: row.subject,
+                            body: row.body,
+                            metadata: row.metadata,
+                            created_at: row.created_at,
+                            read_at: row.read_at,
+                            read: row.read,
+                        })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+    }
+
+    pub async fn get_stage_history_id(
+        &self,
+        agent_id: &AgentId,
+        bead_id: &BeadId,
+        stage: Stage,
+        attempt: u32,
+    ) -> Result<Option<i64>> {
+        sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT id
+             FROM stage_history
+             WHERE agent_id = $1
+               AND bead_id = $2
+               AND stage = $3
+               AND attempt_number = $4
+               AND status = 'started'
+             ORDER BY started_at DESC
+             LIMIT 1",
+        )
+        .bind(agent_id.number() as i32)
+        .bind(bead_id.value())
+        .bind(stage.as_str())
+        .bind(attempt as i32)
+        .fetch_optional(self.pool())
+        .await
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to get stage history id: {}", e)))
+        .map(|row| row.flatten())
     }
 }

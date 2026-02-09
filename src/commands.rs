@@ -1,14 +1,16 @@
 use crate::agent_runtime::{run_agent, run_smoke_once};
 use crate::cli::{Cli, Commands, OutputFormat};
-use crate::config::load_config;
+use crate::commands_support::{
+    collect_progress_rows, database_url_from_pass, register_agents_recursive,
+    watch_monitor_recursive, write_prompts_recursive,
+};
+use crate::config::{default_database_url_for_cli, load_config};
 use crate::load_profile::run_load_profile;
 use crate::monitor::render_monitor_view;
 use crate::output::emit_output;
 use clap::Parser;
 use serde_json::json;
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
 use swarm::{AgentId, RepoId, Result, SwarmDb, SwarmError};
 
 pub async fn run() -> Result<()> {
@@ -39,7 +41,19 @@ async fn dispatch(cli: Cli) -> Result<()> {
             url,
             schema,
             seed_agents,
-        } => init_db_command(&cli.output, url, schema, seed_agents).await,
+        } => {
+            init_db_command(
+                &cli.output,
+                cli.config.clone(),
+                cli.claude_mode,
+                cli.database_url.clone(),
+                cli.database_url_pass.clone(),
+                url,
+                schema,
+                seed_agents,
+            )
+            .await
+        }
         Commands::Monitor { ref view, watch_ms } => {
             monitor_command(&cli, view.clone(), watch_ms).await
         }
@@ -58,7 +72,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
 }
 
 async fn register_command(cli: &Cli, count: u32) -> Result<()> {
-    let config = load_config(cli.config.clone(), cli.claude_mode).await?;
+    let config = load_runtime_config_with_overrides(cli).await?;
     let db = SwarmDb::new(&config.database_url).await?;
     let repo_id = RepoId::from_current_dir()
         .ok_or_else(|| SwarmError::ConfigError("Not in a git repo".to_string()))?;
@@ -81,7 +95,7 @@ async fn register_command(cli: &Cli, count: u32) -> Result<()> {
 }
 
 async fn agent_command(cli: &Cli, id: u32) -> Result<()> {
-    let config = load_config(cli.config.clone(), cli.claude_mode).await?;
+    let config = load_runtime_config_with_overrides(cli).await?;
     let db = SwarmDb::new(&config.database_url).await?;
     let repo_id = RepoId::from_current_dir()
         .ok_or_else(|| SwarmError::ConfigError("Not in a git repo".to_string()))?;
@@ -96,7 +110,7 @@ async fn agent_command(cli: &Cli, id: u32) -> Result<()> {
 }
 
 async fn smoke_command(cli: &Cli, id: u32) -> Result<()> {
-    let config = load_config(cli.config.clone(), cli.claude_mode).await?;
+    let config = load_runtime_config_with_overrides(cli).await?;
     let db = SwarmDb::new(&config.database_url).await?;
     run_smoke_once(&db, &AgentId::new(RepoId::new("local"), id)).await?;
     emit_output(
@@ -108,13 +122,13 @@ async fn smoke_command(cli: &Cli, id: u32) -> Result<()> {
 }
 
 async fn load_profile_command(cli: &Cli, agents: u32, rounds: u32, timeout_ms: u64) -> Result<()> {
-    let config = load_config(cli.config.clone(), cli.claude_mode).await?;
+    let config = load_runtime_config_with_overrides(cli).await?;
     let db = SwarmDb::new(&config.database_url).await?;
     run_load_profile(&db, agents, rounds, timeout_ms, &cli.output).await
 }
 
 async fn status_command(cli: &Cli, all: bool) -> Result<()> {
-    let config = load_config(cli.config.clone(), cli.claude_mode).await?;
+    let config = load_runtime_config_with_overrides(cli).await?;
     let db = SwarmDb::new(&config.database_url).await?;
     if all {
         let repos = db.list_repos().await?;
@@ -134,7 +148,7 @@ async fn status_command(cli: &Cli, all: bool) -> Result<()> {
 }
 
 async fn ps_command(cli: &Cli) -> Result<()> {
-    let config = load_config(cli.config.clone(), cli.claude_mode).await?;
+    let config = load_runtime_config_with_overrides(cli).await?;
     let db = SwarmDb::new(&config.database_url).await?;
     let rows = db
         .get_all_active_agents()
@@ -147,26 +161,43 @@ async fn ps_command(cli: &Cli) -> Result<()> {
 }
 
 async fn release_command(cli: &Cli, agent_id: u32) -> Result<()> {
-    let config = load_config(cli.config.clone(), cli.claude_mode).await?;
-    let _db = SwarmDb::new(&config.database_url).await?;
+    let config = load_runtime_config_with_overrides(cli).await?;
+    let db = SwarmDb::new(&config.database_url).await?;
     let repo_id = RepoId::from_current_dir()
         .ok_or_else(|| SwarmError::ConfigError("Not in a git repo".to_string()))?;
     let agent = AgentId::new(repo_id, agent_id);
+    let released_bead = db.release_agent(&agent).await?;
     emit_output(
         &cli.output,
         "release",
-        json!({"agent": agent.to_string(), "status": "not_implemented"}),
+        json!({
+            "agent": agent.to_string(),
+            "status": "released",
+            "released_bead": released_bead.map(|bead| bead.value().to_string())
+        }),
     );
     Ok(())
 }
 
 async fn init_db_command(
     output: &OutputFormat,
-    url: String,
+    config_path: Option<PathBuf>,
+    claude_mode: bool,
+    database_url: Option<String>,
+    database_url_pass: Option<String>,
+    url: Option<String>,
     schema: PathBuf,
     seed_agents: u32,
 ) -> Result<()> {
-    let db = SwarmDb::new(&url).await?;
+    let runtime_config = load_runtime_config_with_overrides_args(
+        config_path,
+        claude_mode,
+        database_url,
+        database_url_pass,
+    )
+    .await?;
+    let resolved_url = url.unwrap_or(runtime_config.database_url);
+    let db = SwarmDb::new(&resolved_url).await?;
     let schema_sql = tokio::fs::read_to_string(&schema).await.map_err(|e| {
         SwarmError::ConfigError(format!("Failed to read schema {}: {}", schema.display(), e))
     })?;
@@ -175,19 +206,54 @@ async fn init_db_command(
     emit_output(
         output,
         "init-db",
-        json!({"database_url": url, "schema": schema.display().to_string(), "seed_agents": seed_agents}),
+        json!({"database_url": resolved_url, "schema": schema.display().to_string(), "seed_agents": seed_agents}),
     );
     Ok(())
 }
 
 async fn monitor_command(cli: &Cli, view: crate::cli::MonitorView, watch_ms: u64) -> Result<()> {
-    let config = load_config(cli.config.clone(), cli.claude_mode).await?;
+    let config = load_runtime_config_with_overrides(cli).await?;
     let db = SwarmDb::new(&config.database_url).await?;
     if watch_ms == 0 {
         render_monitor_view(&db, &view, &cli.output).await
     } else {
         watch_monitor_recursive(&db, &view, &cli.output, watch_ms).await
     }
+}
+
+async fn load_runtime_config_with_overrides(cli: &Cli) -> Result<crate::config::Config> {
+    load_runtime_config_with_overrides_args(
+        cli.config.clone(),
+        cli.claude_mode,
+        cli.database_url.clone(),
+        cli.database_url_pass.clone(),
+    )
+    .await
+}
+
+async fn load_runtime_config_with_overrides_args(
+    config_path: Option<PathBuf>,
+    claude_mode: bool,
+    database_url: Option<String>,
+    database_url_pass: Option<String>,
+) -> Result<crate::config::Config> {
+    let mut config = load_config(config_path, claude_mode).await?;
+
+    let effective_url = match (&database_url, &database_url_pass) {
+        (Some(url), _) if !url.trim().is_empty() => Some(url.clone()),
+        (_, Some(entry)) if !entry.trim().is_empty() => Some(database_url_from_pass(entry).await?),
+        _ => None,
+    };
+
+    if let Some(url) = effective_url {
+        config.database_url = url;
+    }
+
+    if config.database_url.trim().is_empty() {
+        config.database_url = default_database_url_for_cli();
+    }
+
+    Ok(config)
 }
 
 async fn spawn_prompts_command(
@@ -213,84 +279,4 @@ async fn spawn_prompts_command(
         json!({"count": count, "out_dir": out_dir.display().to_string()}),
     );
     Ok(())
-}
-
-fn register_agents_recursive<'a>(
-    db: &'a SwarmDb,
-    repo_id: RepoId,
-    next: u32,
-    count: u32,
-) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
-    Box::pin(async move {
-        if next > count {
-            Ok(())
-        } else {
-            db.register_agent(&AgentId::new(repo_id.clone(), next))
-                .await?;
-            register_agents_recursive(db, repo_id, next.saturating_add(1), count).await
-        }
-    })
-}
-
-fn write_prompts_recursive<'a>(
-    template_text: &'a str,
-    out_dir: &'a PathBuf,
-    next: u32,
-    count: u32,
-) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
-    Box::pin(async move {
-        if next > count {
-            Ok(())
-        } else {
-            let path = out_dir.join(format!("agent_{:02}.md", next));
-            tokio::fs::write(&path, template_text.replace("{N}", &next.to_string()))
-                .await
-                .map_err(SwarmError::IoError)?;
-            write_prompts_recursive(template_text, out_dir, next.saturating_add(1), count).await
-        }
-    })
-}
-
-fn collect_progress_rows<'a>(
-    db: &'a SwarmDb,
-    repos: Vec<(RepoId, String)>,
-    idx: usize,
-    acc: Vec<serde_json::Value>,
-) -> Pin<Box<dyn Future<Output = Result<Vec<serde_json::Value>>> + Send + 'a>> {
-    Box::pin(async move {
-        match repos.get(idx) {
-            None => Ok(acc),
-            Some((repo_id, name)) => match db.get_progress(repo_id).await {
-                Ok(progress) => {
-                    let mut next_acc = acc;
-                    next_acc.push(json!({
-                        "repo": repo_id.value(),
-                        "name": name,
-                        "working": progress.working,
-                        "idle": progress.idle,
-                        "done": progress.completed,
-                        "errors": progress.errors,
-                    }));
-                    collect_progress_rows(db, repos, idx + 1, next_acc).await
-                }
-                Err(_) => collect_progress_rows(db, repos, idx + 1, acc).await,
-            },
-        }
-    })
-}
-
-fn watch_monitor_recursive<'a>(
-    db: &'a SwarmDb,
-    view: &'a crate::cli::MonitorView,
-    output: &'a OutputFormat,
-    watch_ms: u64,
-) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
-    Box::pin(async move {
-        if *output == OutputFormat::Text {
-            print!("\x1B[2J\x1B[1;1H");
-        }
-        render_monitor_view(db, view, output).await?;
-        tokio::time::sleep(tokio::time::Duration::from_millis(watch_ms)).await;
-        watch_monitor_recursive(db, view, output, watch_ms).await
-    })
 }

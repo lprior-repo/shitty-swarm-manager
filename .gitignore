@@ -6,6 +6,12 @@
 # Dependency directories
 /node_modules/
 
+# Tooling caches and local indexes
+.codanna/
+.codannaignore
+.fastembed_cache
+.moon/cache/
+
 # Environment and secrets
 .env
 .env.*

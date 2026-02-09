@@ -8,6 +8,8 @@ use tracing::info;
 
 use crate::error::{Result, SwarmError};
 
+pub use crate::types::{AgentMessage, StageArtifact};
+
 #[derive(Clone)]
 pub struct SwarmDb {
     pool: PgPool,
@@ -29,6 +31,11 @@ impl SwarmDb {
 
         info!("Connected to PostgreSQL swarm database");
         Ok(Self { pool })
+    }
+
+    /// Create a new SwarmDb with an existing pool (for testing).
+    pub fn new_with_pool(pool: PgPool) -> Self {
+        Self { pool }
     }
 
     fn pool(&self) -> &PgPool {

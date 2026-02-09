@@ -19,11 +19,11 @@ createdb swarm_db
 
 # Option B: Docker (recommended for isolation)
 docker run -d \
-  --name oya-swarm-db \
+  --name shitty-swarm-manager-db \
   -p 5432:5432 \
-  -e POSTGRES_USER=oya \
-  -e POSTGRES_PASSWORD=oya \
-  -e POSTGRES_DB=swarm_db \
+  -e POSTGRES_USER=shitty_swarm_manager \
+  -e POSTGRES_PASSWORD=shitty_swarm_manager \
+  -e POSTGRES_DB=shitty_swarm_manager_db \
   postgres:16
 ```
 
@@ -31,22 +31,44 @@ docker run -d \
 
 ```bash
 swarm init-db
+
+# Or use the helper script (starts container, loads schema, seeds agents)
+./.agents/init_postgres_swarm.sh
+
+# Optional: target a specific connection/schema
+swarm init-db \
+  --url postgresql://shitty_swarm_manager:shitty_swarm_manager@localhost:5432/shitty_swarm_manager_db \
+  --schema crates/swarm-coordinator/schema.sql \
+  --seed-agents 12
 ```
 
 This creates:
-- `bead_claims` table (tracks bead assignments)
-- `agent_state` table (12 agents, idle state)
-- `stage_history` table (audit log)
-- Views for monitoring
+- `bead_backlog` (pending/in_progress/completed/blocked queue)
+- `bead_claims` (current claim owner + claim status)
+- `agent_state` (agent lifecycle + retries + feedback)
+- `stage_history` (per-stage execution history)
+- `stage_artifacts` (typed artifact storage per stage run)
+- `agent_messages` (message passing between stages/agents)
+- Monitoring and artifact/message views (`v_active_agents`, `v_swarm_progress`, `v_feedback_required`, `v_bead_artifacts`, `v_unread_messages`)
 
-### 3. Ensure Beads Exist
+### 3. Ensure Backlog Beads Exist
 
 ```bash
-# Check available beads
-br list --status pending --priority p0
+# Check available P0 backlog rows in Postgres
+psql -h localhost -U shitty_swarm_manager -d shitty_swarm_manager_db -c "
+SELECT bead_id, status, priority, created_at
+FROM bead_backlog
+WHERE status = 'pending' AND priority = 'p0'
+ORDER BY created_at
+LIMIT 12;
+"
 
-# Or query directly
-sqlite3 .beads/beads.db "SELECT id, title FROM beads WHERE status = 'pending' AND priority = 'p0' LIMIT 12;"
+# Seed test backlog rows if empty
+psql -h localhost -U shitty_swarm_manager -d shitty_swarm_manager_db -c "
+INSERT INTO bead_backlog (bead_id, priority, status)
+VALUES ('test-1', 'p0', 'pending'), ('test-2', 'p0', 'pending'), ('test-3', 'p0', 'pending')
+ON CONFLICT (bead_id) DO NOTHING;
+"
 ```
 
 ### 4. Launch the Swarm
@@ -81,24 +103,42 @@ swarm spawn-prompts --count 12
 
 ```bash
 swarm monitor --view active
+
+# Script form
+./.agents/monitor.sh
 ```
 
 ### Check Progress
 
 ```bash
 swarm monitor --view progress
+
+# Script form
+./.agents/progress.sh
 ```
 
 ### View Failures Requiring Feedback
 
 ```bash
 swarm monitor --view failures
+
+# Script form
+./.agents/failures.sh
+```
+
+### View Unread Inter-Agent Messages
+
+```bash
+swarm monitor --view messages
+
+# Script form
+./.agents/messages.sh
 ```
 
 ### Get Specific Agent State
 
 ```sql
-psql -h localhost -U oya -d swarm_db -c "
+psql -h localhost -U shitty_swarm_manager -d shitty_swarm_manager_db -c "
 SELECT
     agent_id,
     bead_id,
@@ -114,7 +154,7 @@ WHERE agent_id = 1;
 ### View Stage History for a Bead
 
 ```sql
-psql -h localhost -U oya -d swarm_db -c "
+psql -h localhost -U shitty_swarm_manager -d shitty_swarm_manager_db -c "
 SELECT
     stage,
     attempt_number,
@@ -127,6 +167,52 @@ WHERE bead_id = 'your-bead-id'
 ORDER BY started_at;
 "
 ```
+
+### DB Sanity Check (end-to-end)
+
+After a smoke run:
+
+```bash
+swarm smoke --id 1
+```
+
+Run these checks to verify claims, stage history, artifacts, and messages:
+
+```sql
+-- 1) Agent and claim state
+SELECT agent_id, bead_id, current_stage, status, implementation_attempt
+FROM agent_state
+WHERE agent_id = 1;
+
+SELECT bead_id, claimed_by, status, claimed_at
+FROM bead_claims
+ORDER BY claimed_at DESC
+LIMIT 5;
+
+-- 2) Stage history for recent bead(s)
+SELECT bead_id, stage, attempt_number, status, started_at, completed_at
+FROM stage_history
+ORDER BY started_at DESC
+LIMIT 20;
+
+-- 3) Stored stage artifacts
+SELECT bead_id, stage, artifact_type, LENGTH(content) AS bytes, created_at
+FROM v_bead_artifacts
+ORDER BY created_at DESC
+LIMIT 30;
+
+-- 4) Unread inter-agent messages
+SELECT id, from_agent_id, to_agent_id, bead_id, message_type, subject, created_at
+FROM v_unread_messages
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+Expected outcomes:
+- `stage_history` has one row per executed stage attempt.
+- `v_bead_artifacts` contains at least `stage_log` plus stage-specific artifacts.
+- `v_unread_messages` shows coordination messages (`contract_ready`, `implementation_ready`, etc.) until read.
+- `agent_state` and `bead_claims` reflect the latest stage/ownership transitions.
 
 ## Architecture
 
@@ -181,21 +267,53 @@ Each agent:
 - Feedback logged to `stage_history` table
 - Agent moves to next available bead (if any)
 
-## Database Schema
+## PostgreSQL Schema
 
 Key tables:
+- `bead_backlog`: queue of beads eligible for claiming
 - `bead_claims`: bead_id, claimed_by, claimed_at, status
 - `agent_state`: agent_id, bead_id, current_stage, status, implementation_attempt, feedback
 - `stage_history`: agent_id, bead_id, stage, attempt_number, status, feedback, timestamps
-- `pipeline_config`: max_agents=12, max_implementation_attempts=3, claim_label=p0
+- `stage_artifacts`: stage_history_id, artifact_type, content, metadata, content_hash
+- `agent_messages`: from/to agent routing, message_type, subject/body, read status
+- `swarm_config`: max_agents=12, max_implementation_attempts=3, claim_label=p0
 
-## Environment Variables
+Core DB functions:
+- `claim_next_p0_bead(agent_id)`
+- `store_stage_artifact(stage_history_id, artifact_type, content, metadata)`
+- `send_agent_message(from_repo_id, from_agent_id, to_repo_id, to_agent_id, bead_id, message_type, subject, body, metadata)`
+- `get_unread_messages(repo_id, agent_id, bead_id)`
+- `mark_messages_read(repo_id, agent_id, message_ids)`
+
+## Configuration
 
 ```bash
-export SWARM_DB=swarm_db      # Database name
-export SWARM_USER=oya         # Database user
-export SWARM_HOST=localhost   # Database host
-export SWARM_PORT=5432        # Database port
+# Runtime DB URL (used by swarm commands)
+DATABASE_URL=postgresql://shitty_swarm_manager:shitty_swarm_manager@localhost:5432/shitty_swarm_manager_db
+
+# Optional: dedicated test DB URL for ignored DB integration tests
+SWARM_TEST_DATABASE_URL=postgresql://shitty_swarm_manager:shitty_swarm_manager@localhost:5432/shitty_swarm_manager_test_db
+```
+
+Or set `.swarm/config.toml`:
+
+```toml
+database_url = "postgresql://shitty_swarm_manager:shitty_swarm_manager@localhost:5432/shitty_swarm_manager_db"
+rust_contract_cmd = "br show {bead_id}"
+implement_cmd = "jj status"
+qa_enforcer_cmd = "moon run :quick"
+red_queen_cmd = "moon run :test"
+```
+
+CLI DB override options (available on all commands):
+
+```bash
+# Explicit URL override
+swarm status --database-url "postgresql://shitty_swarm_manager:shitty_swarm_manager@localhost:5437/shitty_swarm_manager_db"
+
+# Pull URL from pass entry (expects connection_url: ... or first line postgres URL)
+swarm status --database-url-pass infra/shitty-swarm-manager/postgres
+swarm init-db --database-url-pass infra/shitty-swarm-manager/postgres
 ```
 
 ## Troubleshooting
@@ -206,16 +324,28 @@ export SWARM_PORT=5432        # Database port
 pg_isready -h localhost -p 5432
 
 # Check database exists
-psql -h localhost -U oya -d postgres -c "\l" | grep swarm_db
+psql -h localhost -U shitty_swarm_manager -d postgres -c "\l" | grep shitty_swarm_manager_db
+
+# Recreate schema if needed
+swarm init-db --url postgresql://shitty_swarm_manager:shitty_swarm_manager@localhost:5432/shitty_swarm_manager_db
 ```
 
 ### No beads available
 ```bash
-# Check beads exist
-sqlite3 .beads/beads.db "SELECT COUNT(*) FROM beads WHERE status = 'pending' AND priority = 'p0';"
+# Check Postgres backlog has pending p0 beads
+psql -h localhost -U shitty_swarm_manager -d shitty_swarm_manager_db -c "
+SELECT COUNT(*)
+FROM bead_backlog
+WHERE status = 'pending' AND priority = 'p0';
+"
 
 # Add test beads if needed
-br new --slug test-bead-{1..12} --priority p0
+psql -h localhost -U shitty_swarm_manager -d shitty_swarm_manager_db -c "
+INSERT INTO bead_backlog (bead_id, priority, status)
+SELECT format('test-%s', g), 'p0', 'pending'
+FROM generate_series(1, 12) AS g
+ON CONFLICT (bead_id) DO NOTHING;
+"
 ```
 
 ### Agent stuck in error state
@@ -242,12 +372,19 @@ WHERE bead_id = '<bead_id>';
 # Stop agents (Ctrl+C or kill Task processes)
 
 # Drop database
-psql -h localhost -U oya -d postgres -c "DROP DATABASE IF EXISTS swarm_db;"
+psql -h localhost -U shitty_swarm_manager -d postgres -c "DROP DATABASE IF EXISTS shitty_swarm_manager_db;"
 
 # Or reset for next run
-psql -h localhost -U oya -d swarm_db -c "
-TRUNCATE bead_claims, stage_history;
-UPDATE agent_state SET bead_id = NULL, current_stage = NULL, status = 'idle', feedback = NULL, implementation_attempt = 0;
+psql -h localhost -U shitty_swarm_manager -d shitty_swarm_manager_db -c "
+TRUNCATE agent_messages, stage_artifacts, stage_history, bead_claims, bead_backlog RESTART IDENTITY;
+UPDATE agent_state
+SET bead_id = NULL,
+    current_stage = NULL,
+    stage_started_at = NULL,
+    status = 'idle',
+    feedback = NULL,
+    implementation_attempt = 0,
+    last_update = NOW();
 "
 
 # Clean up workspaces

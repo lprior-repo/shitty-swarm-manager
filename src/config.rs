@@ -123,7 +123,16 @@ impl StageCommands {
 }
 
 fn default_database_url() -> String {
-    "postgresql://oya:oya@localhost:5432/swarm_db".to_string()
+    std::env::var("DATABASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            "postgresql://shitty_swarm_manager:shitty_swarm_manager@localhost:5432/shitty_swarm_manager_db".to_string()
+        })
+}
+
+pub fn default_database_url_for_cli() -> String {
+    default_database_url()
 }
 
 #[cfg(test)]
