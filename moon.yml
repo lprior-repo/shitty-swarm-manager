@@ -4,6 +4,12 @@ type: "application"
 language: "rust"
 
 tasks:
+  fmt-check:
+    command: "cargo fmt --check"
+
+  clippy:
+    command: "cargo clippy --lib --bins -- -D warnings -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic"
+
   check:
     command: "cargo check --all-targets"
 
@@ -11,7 +17,8 @@ tasks:
     command: "cargo test"
 
   db-test:
-    command: "cargo test db::write_ops::tests:: -- --ignored --nocapture --test-threads=1"
+    command: >-
+      bash -lc 'DB_URL="${SWARM_TEST_DATABASE_URL:-${DATABASE_URL:-}}"; if [ -z "$DB_URL" ]; then printf "Skipping db-test: SWARM_TEST_DATABASE_URL or DATABASE_URL not set\n"; exit 0; fi; PGCONNECT_TIMEOUT=3 psql "$DB_URL" -c "SELECT 1" >/dev/null 2>&1 || { printf "db-test preflight failed: cannot reach database from configured URL\n"; exit 3; }; cargo test db::write_ops::tests:: -- --ignored --nocapture --test-threads=1'
 
   build:
     command: "cargo build --release"
@@ -20,7 +27,15 @@ tasks:
     command: "cargo fmt"
 
   quick:
-    command: "cargo fmt --check && cargo check --all-targets"
+    deps:
+      - fmt-check
+      - check
+      - clippy
 
   ci:
-    command: "cargo fmt --check && cargo check --all-targets && cargo test"
+    deps:
+      - fmt-check
+      - clippy
+      - check
+      - test
+      - db-test
