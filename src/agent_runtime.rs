@@ -5,21 +5,25 @@ use crate::agent_runtime_support::{
 use crate::config::StageCommands;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 use std::time::Instant;
 use tracing::{error, info, warn};
 
 use serde_json::json;
 use swarm::{
     stage_executors::execute_stage_rust, AgentId, ArtifactType, BeadId, MessageType, Result, Stage,
-    StageResult, SwarmDb, SwarmError,
+    StageResult, SwarmDb,
 };
+
+const MIN_POLL_BACKOFF: Duration = Duration::from_millis(250);
+const MAX_POLL_BACKOFF: Duration = Duration::from_secs(5);
 
 pub async fn run_agent(
     db: &SwarmDb,
     agent_id: &AgentId,
     stage_commands: &StageCommands,
 ) -> Result<()> {
-    run_agent_recursive(db, agent_id, stage_commands).await
+    run_agent_loop(db, agent_id, stage_commands).await
 }
 
 pub async fn run_smoke_once(db: &SwarmDb, agent_id: &AgentId) -> Result<()> {
@@ -44,42 +48,102 @@ pub async fn run_smoke_once(db: &SwarmDb, agent_id: &AgentId) -> Result<()> {
     }
 }
 
-fn run_agent_recursive<'a>(
-    db: &'a SwarmDb,
-    agent_id: &'a AgentId,
-    stage_commands: &'a StageCommands,
-) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
-    Box::pin(async move {
+async fn run_agent_loop(
+    db: &SwarmDb,
+    agent_id: &AgentId,
+    stage_commands: &StageCommands,
+) -> Result<()> {
+    let mut poll_backoff = MIN_POLL_BACKOFF;
+
+    loop {
         match db.get_agent_state(agent_id).await? {
             None => {
                 error!("Agent {} not registered", agent_id);
-                Ok(())
+                return Ok(());
             }
             Some(state) => match state.status {
                 swarm::AgentStatus::Idle => match db.claim_next_bead(agent_id).await? {
                     Some(bead_id) => {
                         info!("Agent {} claimed bead {}", agent_id, bead_id);
-                        run_agent_recursive(db, agent_id, stage_commands).await
+                        poll_backoff = MIN_POLL_BACKOFF;
                     }
                     None => {
                         info!("Agent {} found no available beads", agent_id);
-                        Ok(())
+                        tokio::time::sleep(poll_backoff).await;
+                        poll_backoff = next_poll_backoff(poll_backoff);
                     }
                 },
                 swarm::AgentStatus::Done => {
                     info!("Agent {} completed work", agent_id);
-                    Ok(())
+                    return Ok(());
                 }
                 swarm::AgentStatus::Working | swarm::AgentStatus::Waiting => {
-                    process_work_state(db, agent_id, stage_commands, state).await
+                    let progressed =
+                        process_work_state(db, agent_id, stage_commands, state).await?;
+                    if progressed {
+                        poll_backoff = apply_poll_backoff(progressed, poll_backoff);
+                    } else {
+                        tokio::time::sleep(poll_backoff).await;
+                        poll_backoff = apply_poll_backoff(progressed, poll_backoff);
+                    }
                 }
                 _ => {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                    run_agent_recursive(db, agent_id, stage_commands).await
+                    tokio::time::sleep(poll_backoff).await;
+                    poll_backoff = apply_poll_backoff(false, poll_backoff);
                 }
             },
-        }
-    })
+        };
+    }
+}
+
+fn apply_poll_backoff(progressed: bool, current: Duration) -> Duration {
+    if progressed {
+        MIN_POLL_BACKOFF
+    } else {
+        next_poll_backoff(current)
+    }
+}
+
+fn next_poll_backoff(current: Duration) -> Duration {
+    let doubled_ms = current.as_millis().saturating_mul(2);
+    let bounded_ms = doubled_ms.min(MAX_POLL_BACKOFF.as_millis());
+    Duration::from_millis(bounded_ms as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_poll_backoff, next_poll_backoff, MAX_POLL_BACKOFF, MIN_POLL_BACKOFF};
+    use std::time::Duration;
+
+    #[test]
+    fn when_idle_polling_backoff_doubles_until_cap() {
+        let after_first_idle = next_poll_backoff(MIN_POLL_BACKOFF);
+        let after_second_idle = next_poll_backoff(after_first_idle);
+
+        assert_eq!(after_first_idle, Duration::from_millis(500));
+        assert_eq!(after_second_idle, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn when_backoff_reaches_cap_it_stays_bounded() {
+        let at_cap = next_poll_backoff(MAX_POLL_BACKOFF);
+        let above_cap_input = next_poll_backoff(Duration::from_secs(7));
+
+        assert_eq!(at_cap, MAX_POLL_BACKOFF);
+        assert_eq!(above_cap_input, MAX_POLL_BACKOFF);
+    }
+
+    #[test]
+    fn when_progress_resets_backoff_it_restarts_from_minimum() {
+        let mut backoff = MIN_POLL_BACKOFF;
+        backoff = next_poll_backoff(backoff);
+        backoff = next_poll_backoff(backoff);
+
+        assert_eq!(backoff, Duration::from_secs(1));
+
+        let reset_backoff = apply_poll_backoff(true, backoff);
+        assert_eq!(reset_backoff, Duration::from_millis(250));
+    }
 }
 
 async fn process_work_state(
@@ -87,16 +151,16 @@ async fn process_work_state(
     agent_id: &AgentId,
     stage_commands: &StageCommands,
     state: swarm::AgentState,
-) -> Result<()> {
+) -> Result<bool> {
     if state.implementation_attempt >= 3 {
         return match state.bead_id {
             Some(bead_id) => {
                 let reason = "Max implementation attempts (3) exceeded";
                 db.mark_bead_blocked(agent_id, &bead_id, reason).await?;
                 warn!("Agent {} blocked bead {}: {}", agent_id, bead_id, reason);
-                Ok(())
+                Ok(true)
             }
-            None => Ok(()),
+            None => Ok(false),
         };
     }
 
@@ -117,17 +181,9 @@ async fn process_work_state(
 
         let attempt = state.implementation_attempt.saturating_add(1);
         let started = Instant::now();
-        db.record_stage_started(agent_id, &bead_id, stage, attempt)
-            .await?;
-
         let stage_history_id = db
-            .get_stage_history_id(agent_id, &bead_id, stage, attempt)
-            .await?
-            .ok_or_else(|| {
-                SwarmError::DatabaseError(
-                    "Missing started stage_history row for artifact storage".to_string(),
-                )
-            })?;
+            .record_stage_started(agent_id, &bead_id, stage, attempt)
+            .await?;
 
         if !feedback_messages.is_empty() {
             let feedback_payload = feedback_messages.join("\n\n");
@@ -247,9 +303,11 @@ async fn process_work_state(
 
         let unread_message_ids = unread_messages.iter().map(|m| m.id).collect::<Vec<_>>();
         db.mark_messages_read(agent_id, &unread_message_ids).await?;
+
+        return Ok(true);
     }
 
-    run_agent_recursive(db, agent_id, stage_commands).await
+    Ok(false)
 }
 
 fn run_smoke_stages_recursive<'a>(

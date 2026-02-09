@@ -46,7 +46,7 @@ impl SwarmDb {
         bead_id: &BeadId,
         stage: Stage,
         attempt: u32,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         let mut tx = self
             .pool()
             .begin()
@@ -58,15 +58,16 @@ impl SwarmDb {
             .await
             .map_err(|e| SwarmError::DatabaseError(format!("Failed to acquire tx conn: {}", e)))?;
 
-        sqlx::query(
+        let stage_history_id = sqlx::query_scalar::<_, i64>(
             "INSERT INTO stage_history (agent_id, bead_id, stage, attempt_number, status)
-             VALUES ($1, $2, $3, $4, 'started')",
+             VALUES ($1, $2, $3, $4, 'started')
+             RETURNING id",
         )
         .bind(agent_id.number() as i32)
         .bind(bead_id.value())
         .bind(stage.as_str())
         .bind(attempt as i32)
-        .execute(&mut *conn)
+        .fetch_one(&mut *conn)
         .await
         .map_err(|e| SwarmError::DatabaseError(format!("Failed to record stage start: {}", e)))?;
 
@@ -84,6 +85,7 @@ impl SwarmDb {
         tx.commit()
             .await
             .map_err(|e| SwarmError::DatabaseError(format!("Failed to commit tx: {}", e)))
+            .map(|_| stage_history_id)
     }
 
     pub async fn record_stage_complete(

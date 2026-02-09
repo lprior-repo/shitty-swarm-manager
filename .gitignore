@@ -46,3 +46,6 @@ tmp/
 # Python cache artifacts
 __pycache__/
 *.pyc
+
+# bv (beads viewer) local config and caches
+.bv/

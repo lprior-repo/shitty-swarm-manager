@@ -3,7 +3,7 @@ use crate::db::SwarmDb;
 use crate::error::{Result, SwarmError};
 use crate::types::{
     AgentId, AgentMessage, AgentState, AgentStatus, ArtifactType, AvailableAgent, BeadId,
-    MessageType, ProgressSummary, RepoId, Stage, StageArtifact, SwarmConfig,
+    MessageType, ProgressSummary, RepoId, StageArtifact, SwarmConfig,
 };
 use sqlx::FromRow;
 
@@ -389,33 +389,5 @@ impl SwarmDb {
                 })
                 .collect::<Result<Vec<_>>>()
         })
-    }
-
-    pub async fn get_stage_history_id(
-        &self,
-        agent_id: &AgentId,
-        bead_id: &BeadId,
-        stage: Stage,
-        attempt: u32,
-    ) -> Result<Option<i64>> {
-        sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT id
-             FROM stage_history
-             WHERE agent_id = $1
-               AND bead_id = $2
-               AND stage = $3
-               AND attempt_number = $4
-               AND status = 'started'
-             ORDER BY started_at DESC
-             LIMIT 1",
-        )
-        .bind(agent_id.number() as i32)
-        .bind(bead_id.value())
-        .bind(stage.as_str())
-        .bind(attempt as i32)
-        .fetch_optional(self.pool())
-        .await
-        .map_err(|e| SwarmError::DatabaseError(format!("Failed to get stage history id: {}", e)))
-        .map(|row| row.flatten())
     }
 }

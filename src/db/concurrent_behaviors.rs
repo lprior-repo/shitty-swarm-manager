@@ -227,16 +227,10 @@ mod concurrent_operations {
                     .unwrap_or_else(|e| panic!("insert bead failed: {}", e));
                 db.claim_next_bead(&agent_id).await
                     .unwrap_or_else(|e| panic!("claim failed: {}", e));
-                db.record_stage_started(&agent_id, &bead_id, Stage::RustContract, 1).await
-                    .unwrap_or_else(|e| panic!("stage start failed: {}", e));
-
-                let stage_history_id = sqlx::query_scalar::<_, i64>(
-                    "SELECT id FROM stage_history WHERE agent_id = $1 AND bead_id = $2 ORDER BY id DESC LIMIT 1")
-                    .bind(agent_id.number() as i32)
-                    .bind(bead_id.value())
-                    .fetch_one(db.pool())
+                let stage_history_id = db
+                    .record_stage_started(&agent_id, &bead_id, Stage::RustContract, 1)
                     .await
-                    .unwrap_or_else(|e| panic!("get history id failed: {}", e));
+                    .unwrap_or_else(|e| panic!("stage start failed: {}", e));
 
                 let artifact_count = 50;
 

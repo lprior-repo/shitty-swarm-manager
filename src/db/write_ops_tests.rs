@@ -307,18 +307,10 @@ async fn stage_artifact_store_is_deduplicated_by_hash_and_type() {
     db.claim_next_bead(&agent_id)
         .await
         .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
-    db.record_stage_started(&agent_id, &bead_id, Stage::RustContract, 1)
+    let stage_history_id = db
+        .record_stage_started(&agent_id, &bead_id, Stage::RustContract, 1)
         .await
         .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
-
-    let stage_history_id = sqlx::query_scalar::<_, i64>(
-        "SELECT id FROM stage_history WHERE agent_id = $1 AND bead_id = $2 ORDER BY id DESC LIMIT 1",
-    )
-    .bind(agent_id.number() as i32)
-    .bind(bead_id.value())
-    .fetch_one(db.pool())
-    .await
-    .unwrap_or_else(|e| panic!("failed to fetch stage_history id: {}", e));
 
     let first_id = db
         .store_stage_artifact(
@@ -352,6 +344,53 @@ async fn stage_artifact_store_is_deduplicated_by_hash_and_type() {
 
     assert_eq!(first_id, duplicate_id);
     assert_ne!(first_id, second_type_id);
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
+async fn record_stage_started_returns_stage_history_id_for_immediate_artifact_writes() {
+    let db = test_db().await;
+    setup_schema(&db).await;
+    reset_runtime_tables(&db).await;
+
+    let agent_id = AgentId::new(RepoId::new("local"), 1);
+    let bead_id = BeadId::new(unique_bead("bead-stage-id"));
+
+    db.seed_idle_agents(1)
+        .await
+        .unwrap_or_else(|e| panic!("seed_idle_agents failed: {}", e));
+    sqlx::query(
+        "INSERT INTO bead_backlog (bead_id, priority, status) VALUES ($1, 'p0', 'pending')",
+    )
+    .bind(bead_id.value())
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("insert backlog failed: {}", e));
+    db.claim_next_bead(&agent_id)
+        .await
+        .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
+
+    let stage_history_id = db
+        .record_stage_started(&agent_id, &bead_id, Stage::Implement, 1)
+        .await
+        .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
+
+    let persisted_id = sqlx::query_scalar::<_, i64>(
+        "SELECT id
+         FROM stage_history
+         WHERE agent_id = $1 AND bead_id = $2 AND stage = $3 AND attempt_number = $4
+         ORDER BY id DESC
+         LIMIT 1",
+    )
+    .bind(agent_id.number() as i32)
+    .bind(bead_id.value())
+    .bind(Stage::Implement.as_str())
+    .bind(1_i32)
+    .fetch_one(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("fetch stage_history id failed: {}", e));
+
+    assert_eq!(stage_history_id, persisted_id);
 }
 
 #[tokio::test]
