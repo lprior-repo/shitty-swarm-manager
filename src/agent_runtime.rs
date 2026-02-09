@@ -166,7 +166,7 @@ async fn process_work_state(
 
     if let (Some(stage), Some(bead_id)) = (state.current_stage, state.bead_id) {
         let unread_messages = db.get_unread_messages(agent_id, Some(&bead_id)).await?;
-        let feedback_messages = unread_messages
+        let feedback_messages: Vec<String> = unread_messages
             .iter()
             .filter(|m| {
                 matches!(
@@ -177,7 +177,7 @@ async fn process_work_state(
                 )
             })
             .map(|m| format!("[{}] {}", m.message_type.as_str(), m.body))
-            .collect::<Vec<_>>();
+            .collect();
 
         let attempt = state.implementation_attempt.saturating_add(1);
         let started = Instant::now();
@@ -196,7 +196,8 @@ async fn process_work_state(
             .await?;
         }
 
-        let rust_result = execute_stage_rust(db, stage, &bead_id, agent_id, stage_history_id).await;
+        let rust_result =
+            execute_stage_rust(db, stage, &bead_id, agent_id, stage_history_id, None).await;
         let (result, used_fallback) = match &rust_result {
             StageResult::Error(err) => {
                 warn!(
@@ -215,9 +216,7 @@ async fn process_work_state(
         let status = result.as_str();
         let is_success = result.is_success();
 
-        let result_message = result
-            .message()
-            .map_or_else(String::new, std::string::ToString::to_string);
+        let result_message = result.message().map_or_else(String::new, |s| s.to_string());
 
         if used_fallback {
             db.store_stage_artifact(
@@ -245,14 +244,15 @@ async fn process_work_state(
             .await?;
         }
 
-        let stage_artifacts = db
-            .get_stage_artifacts(stage_history_id)
-            .await
-            .unwrap_or_else(|_| Vec::new());
-        let artifact_types = stage_artifacts
+        let stage_artifacts_result = db.get_stage_artifacts(stage_history_id).await;
+        let stage_artifacts = stage_artifacts_result
+            .into_iter()
+            .flat_map(|artifacts| artifacts.into_iter())
+            .collect::<Vec<_>>();
+        let artifact_types: Vec<String> = stage_artifacts
             .iter()
             .map(|artifact| artifact.artifact_type.as_str().to_string())
-            .collect::<Vec<_>>();
+            .collect();
         let message_body = build_full_message_body(
             stage,
             &status,
@@ -287,8 +287,7 @@ async fn process_work_state(
                 Some(agent_id),
                 Some(&bead_id),
                 message_type,
-                &subject,
-                &body,
+                (&subject, &body),
                 Some(json!({
                     "stage": stage.as_str(),
                     "status": status,

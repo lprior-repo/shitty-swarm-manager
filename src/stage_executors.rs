@@ -4,9 +4,10 @@
 //! pipeline stage, replacing shell commands with proper Rust code.
 
 use crate::error::{Result, SwarmError};
+use crate::gate_cache::GateExecutionCache;
 use crate::skill_execution::{store_skill_artifacts, SkillOutput};
 use crate::stage_executor_content::{contract_document_and_artifacts, implementation_scaffold};
-use crate::types::{ArtifactType, Stage, StageArtifact};
+use crate::types::{ArtifactType, Stage};
 use crate::{AgentId, BeadId, SwarmDb};
 use std::collections::HashMap;
 use tokio::process::Command;
@@ -21,6 +22,7 @@ pub async fn execute_stage_rust(
     bead_id: &BeadId,
     agent_id: &AgentId,
     stage_history_id: i64,
+    cache: Option<&GateExecutionCache>,
 ) -> crate::types::StageResult {
     if stage == Stage::Done {
         return crate::types::StageResult::Passed;
@@ -29,8 +31,8 @@ pub async fn execute_stage_rust(
     let stage_output = match stage {
         Stage::RustContract => execute_rust_contract_stage(bead_id, agent_id).await,
         Stage::Implement => execute_implement_stage(bead_id, agent_id, db).await,
-        Stage::QaEnforcer => execute_qa_stage(bead_id, agent_id, db).await,
-        Stage::RedQueen => execute_red_queen_stage(bead_id, agent_id, db).await,
+        Stage::QaEnforcer => execute_qa_stage(bead_id, agent_id, db, cache).await,
+        Stage::RedQueen => execute_red_queen_stage(bead_id, agent_id, db, cache).await,
         Stage::Done => Ok(success_output(
             "Done stage does not produce artifacts".to_string(),
         )),
@@ -124,20 +126,38 @@ fn error_output(message: String) -> SkillOutput {
     }
 }
 
-async fn run_moon_task(task: &str) -> Result<SkillOutput> {
+async fn run_moon_task(task: &str, cache: Option<&GateExecutionCache>) -> Result<SkillOutput> {
+    if let Some(cache) = cache {
+        if let Some((_success, exit_code, stdout, stderr)) = cache.get(task).await {
+            return Ok(SkillOutput::from_shell_output(stdout, stderr, exit_code));
+        }
+    }
+
     let output = Command::new("moon")
         .args(["run", task])
         .output()
         .await
         .map_err(SwarmError::IoError)?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    Ok(SkillOutput::from_shell_output(
-        stdout,
-        stderr,
-        output.status.code(),
-    ))
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let exit_code = output.status.code();
+    let success = exit_code.is_none_or(|code| code == 0);
+
+    if let Some(cache) = cache {
+        cache
+            .put(
+                task.to_string(),
+                success,
+                exit_code,
+                stdout.clone(),
+                stderr.clone(),
+            )
+            .await
+            .ok();
+    }
+
+    Ok(SkillOutput::from_shell_output(stdout, stderr, exit_code))
 }
 
 /// Execute the rust-contract stage.
@@ -171,26 +191,20 @@ async fn execute_implement_stage(
     agent_id: &AgentId,
     db: &SwarmDb,
 ) -> Result<SkillOutput> {
-    let contract_artifacts: Vec<StageArtifact> = db
-        .get_bead_artifacts_by_type(bead_id, ArtifactType::ContractDocument)
+    let maybe_contract_artifact = db
+        .get_first_bead_artifact_by_type(bead_id, ArtifactType::ContractDocument)
         .await?;
 
-    if contract_artifacts.is_empty() {
-        return Ok(failure_output(
-            "Missing contract artifact; cannot generate implementation context".to_string(),
-        ));
-    }
-
-    let contract_context = match contract_artifacts.first() {
-        Some(artifact) => artifact.content.as_str(),
+    let contract_context = match maybe_contract_artifact {
+        Some(artifact) => artifact.content,
         None => {
             return Ok(failure_output(
-                "Contract artifact lookup returned no first artifact".to_string(),
+                "Missing contract artifact; cannot generate implementation context".to_string(),
             ));
         }
     };
 
-    let implementation_code = implementation_scaffold(bead_id, contract_context);
+    let implementation_code = implementation_scaffold(bead_id, &contract_context);
 
     tracing::info!(
         "Agent {} generated implementation artifact for bead {}",
@@ -219,18 +233,18 @@ async fn execute_qa_stage(
     bead_id: &BeadId,
     agent_id: &AgentId,
     db: &SwarmDb,
+    cache: Option<&GateExecutionCache>,
 ) -> Result<SkillOutput> {
-    let impl_artifacts: Vec<StageArtifact> = db
-        .get_bead_artifacts_by_type(bead_id, ArtifactType::ImplementationCode)
-        .await?;
-
-    if impl_artifacts.is_empty() {
+    if !db
+        .bead_has_artifact_type(bead_id, ArtifactType::ImplementationCode)
+        .await?
+    {
         return Ok(failure_output(
             "No implementation artifact found for QA stage".to_string(),
         ));
     }
 
-    let mut output = run_moon_task(":quick").await?;
+    let mut output = run_moon_task(":quick", cache).await?;
     output.extract_qa_artifacts();
 
     if output.success {
@@ -254,18 +268,18 @@ async fn execute_red_queen_stage(
     bead_id: &BeadId,
     agent_id: &AgentId,
     db: &SwarmDb,
+    cache: Option<&GateExecutionCache>,
 ) -> Result<SkillOutput> {
-    let test_artifacts: Vec<StageArtifact> = db
-        .get_bead_artifacts_by_type(bead_id, ArtifactType::TestResults)
-        .await?;
-
-    if test_artifacts.is_empty() {
+    if !db
+        .bead_has_artifact_type(bead_id, ArtifactType::TestResults)
+        .await?
+    {
         return Ok(failure_output(
             "No QA test_results artifact found for red-queen stage".to_string(),
         ));
     }
 
-    let mut output = run_moon_task(":test").await?;
+    let mut output = run_moon_task(":test", cache).await?;
     output.extract_red_queen_artifacts();
 
     if output.success {

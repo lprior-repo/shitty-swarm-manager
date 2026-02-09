@@ -1,4 +1,4 @@
-use crate::db::mappers::{parse_agent_state, parse_swarm_config, to_u32_i32};
+use crate::db::mappers::{parse_agent_state, parse_swarm_config, to_u32_i32, AgentStateFields};
 use crate::db::SwarmDb;
 use crate::error::{Result, SwarmError};
 use crate::types::{
@@ -91,7 +91,100 @@ struct AgentMessageRow {
     read: bool,
 }
 
+#[derive(FromRow)]
+struct CommandAuditRow {
+    seq: i64,
+    t: chrono::DateTime<chrono::Utc>,
+    cmd: String,
+    args: serde_json::Value,
+    ok: bool,
+    ms: i32,
+    error_code: Option<String>,
+}
+
+#[derive(FromRow)]
+struct ResourceLockRow {
+    resource: String,
+    agent: String,
+    since: chrono::DateTime<chrono::Utc>,
+    until_at: chrono::DateTime<chrono::Utc>,
+}
+
 impl SwarmDb {
+    pub async fn get_command_history(
+        &self,
+        limit: i64,
+    ) -> Result<
+        Vec<(
+            i64,
+            i64,
+            String,
+            serde_json::Value,
+            bool,
+            u64,
+            Option<String>,
+        )>,
+    > {
+        sqlx::query("DELETE FROM resource_locks WHERE until_at <= NOW()")
+            .execute(self.pool())
+            .await
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to cleanup locks: {}", e)))?;
+
+        sqlx::query_as::<_, CommandAuditRow>(
+            "SELECT seq, t, cmd, args, ok, ms, error_code
+             FROM command_audit
+             ORDER BY seq DESC
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to load command history: {}", e)))
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| {
+                    (
+                        row.seq,
+                        row.t.timestamp_millis(),
+                        row.cmd,
+                        row.args,
+                        row.ok,
+                        row.ms as u64,
+                        row.error_code,
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+    }
+
+    pub async fn list_active_resource_locks(&self) -> Result<Vec<(String, String, i64, i64)>> {
+        sqlx::query("DELETE FROM resource_locks WHERE until_at <= NOW()")
+            .execute(self.pool())
+            .await
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to cleanup locks: {}", e)))?;
+
+        sqlx::query_as::<_, ResourceLockRow>(
+            "SELECT resource, agent, since, until_at
+             FROM resource_locks
+             ORDER BY since ASC",
+        )
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to load resource locks: {}", e)))
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| {
+                    (
+                        row.resource,
+                        row.agent,
+                        row.since.timestamp_millis(),
+                        row.until_at.timestamp_millis(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+    }
+
     pub async fn get_agent_state(&self, agent_id: &AgentId) -> Result<Option<AgentState>> {
         sqlx::query_as::<_, AgentStateRow>(
             "SELECT bead_id, current_stage, stage_started_at, status, last_update, implementation_attempt, feedback
@@ -106,13 +199,15 @@ impl SwarmDb {
                     .map(|row| {
                         parse_agent_state(
                             agent_id,
-                            row.bead_id,
-                            row.current_stage,
-                            row.stage_started_at,
-                            row.status,
-                            row.last_update,
-                            row.implementation_attempt,
-                            row.feedback,
+                            AgentStateFields {
+                                bead_id: row.bead_id,
+                                stage_str: row.current_stage,
+                                stage_started_at: row.stage_started_at,
+                                status_str: row.status,
+                                last_update: row.last_update,
+                                implementation_attempt: row.implementation_attempt,
+                                feedback: row.feedback,
+                            },
                         )
                     })
                     .transpose()
@@ -311,6 +406,67 @@ impl SwarmDb {
                         })
                 })
                 .collect::<Result<Vec<_>>>()
+        })
+    }
+
+    pub async fn get_first_bead_artifact_by_type(
+        &self,
+        bead_id: &BeadId,
+        artifact_type: ArtifactType,
+    ) -> Result<Option<StageArtifact>> {
+        sqlx::query_as::<_, StageArtifactRow>(
+            "SELECT sa.id, sa.stage_history_id, sa.artifact_type, sa.content, sa.metadata, sa.created_at, sa.content_hash
+             FROM stage_artifacts sa
+             JOIN stage_history sh ON sa.stage_history_id = sh.id
+             WHERE sh.bead_id = $1 AND sa.artifact_type = $2
+             ORDER BY sa.created_at ASC
+             LIMIT 1",
+        )
+        .bind(bead_id.value())
+        .bind(artifact_type.as_str())
+        .fetch_optional(self.pool())
+        .await
+        .map_err(|e| {
+            SwarmError::DatabaseError(format!("Failed to get first bead artifact by type: {}", e))
+        })
+        .and_then(|maybe_row| {
+            maybe_row
+                .map(|row| {
+                    ArtifactType::try_from(row.artifact_type.as_str())
+                        .map_err(SwarmError::DatabaseError)
+                        .map(|mapped_type| StageArtifact {
+                            id: row.id,
+                            stage_history_id: row.stage_history_id,
+                            artifact_type: mapped_type,
+                            content: row.content,
+                            metadata: row.metadata,
+                            created_at: row.created_at,
+                            content_hash: row.content_hash,
+                        })
+                })
+                .transpose()
+        })
+    }
+
+    pub async fn bead_has_artifact_type(
+        &self,
+        bead_id: &BeadId,
+        artifact_type: ArtifactType,
+    ) -> Result<bool> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM stage_artifacts sa
+                 JOIN stage_history sh ON sa.stage_history_id = sh.id
+                 WHERE sh.bead_id = $1 AND sa.artifact_type = $2
+             )",
+        )
+        .bind(bead_id.value())
+        .bind(artifact_type.as_str())
+        .fetch_one(self.pool())
+        .await
+        .map_err(|e| {
+            SwarmError::DatabaseError(format!("Failed to check bead artifact existence: {}", e))
         })
     }
 

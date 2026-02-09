@@ -356,6 +356,71 @@ async fn record_stage_started_returns_stage_history_id_for_immediate_artifact_wr
     let agent_id = AgentId::new(RepoId::new("local"), 1);
     let bead_id = BeadId::new(unique_bead("bead-stage-id"));
 
+    let seed_result = db.seed_idle_agents(1).await;
+    assert!(
+        seed_result.is_ok(),
+        "seed_idle_agents failed: {:?}",
+        seed_result
+    );
+
+    let insert_backlog_result = sqlx::query(
+        "INSERT INTO bead_backlog (bead_id, priority, status) VALUES ($1, 'p0', 'pending')",
+    )
+    .bind(bead_id.value())
+    .execute(db.pool())
+    .await;
+    assert!(
+        insert_backlog_result.is_ok(),
+        "insert backlog failed: {:?}",
+        insert_backlog_result
+    );
+
+    let claim_result = db.claim_next_bead(&agent_id).await;
+    assert!(
+        claim_result.is_ok(),
+        "claim_next_bead failed: {:?}",
+        claim_result
+    );
+
+    let stage_history_id_result = db
+        .record_stage_started(&agent_id, &bead_id, Stage::Implement, 1)
+        .await;
+    let stage_history_id = match stage_history_id_result {
+        Ok(id) => id,
+        Err(err) => panic!("record_stage_started failed: {}", err),
+    };
+
+    let persisted_id_result = sqlx::query_scalar::<_, i64>(
+        "SELECT id
+         FROM stage_history
+         WHERE agent_id = $1 AND bead_id = $2 AND stage = $3 AND attempt_number = $4
+         ORDER BY id DESC
+         LIMIT 1",
+    )
+    .bind(agent_id.number() as i32)
+    .bind(bead_id.value())
+    .bind(Stage::Implement.as_str())
+    .bind(1_i32)
+    .fetch_one(db.pool())
+    .await;
+    let persisted_id = match persisted_id_result {
+        Ok(id) => id,
+        Err(err) => panic!("fetch stage_history id failed: {}", err),
+    };
+
+    assert_eq!(stage_history_id, persisted_id);
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
+async fn artifact_lookup_helpers_avoid_overfetch_and_preserve_ordering() {
+    let db = test_db().await;
+    setup_schema(&db).await;
+    reset_runtime_tables(&db).await;
+
+    let agent_id = AgentId::new(RepoId::new("local"), 1);
+    let bead_id = BeadId::new(unique_bead("bead-artifact-helper"));
+
     db.seed_idle_agents(1)
         .await
         .unwrap_or_else(|e| panic!("seed_idle_agents failed: {}", e));
@@ -370,27 +435,57 @@ async fn record_stage_started_returns_stage_history_id_for_immediate_artifact_wr
         .await
         .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
 
-    let stage_history_id = db
-        .record_stage_started(&agent_id, &bead_id, Stage::Implement, 1)
+    let first_stage_history_id = db
+        .record_stage_started(&agent_id, &bead_id, Stage::RustContract, 1)
         .await
-        .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
+        .unwrap_or_else(|e| panic!("record_stage_started first failed: {}", e));
 
-    let persisted_id = sqlx::query_scalar::<_, i64>(
-        "SELECT id
-         FROM stage_history
-         WHERE agent_id = $1 AND bead_id = $2 AND stage = $3 AND attempt_number = $4
-         ORDER BY id DESC
-         LIMIT 1",
+    db.store_stage_artifact(
+        first_stage_history_id,
+        ArtifactType::ContractDocument,
+        "first-contract",
+        None,
     )
-    .bind(agent_id.number() as i32)
-    .bind(bead_id.value())
-    .bind(Stage::Implement.as_str())
-    .bind(1_i32)
-    .fetch_one(db.pool())
     .await
-    .unwrap_or_else(|e| panic!("fetch stage_history id failed: {}", e));
+    .unwrap_or_else(|e| panic!("store first contract failed: {}", e));
 
-    assert_eq!(stage_history_id, persisted_id);
+    let second_stage_history_id = db
+        .record_stage_started(&agent_id, &bead_id, Stage::RustContract, 2)
+        .await
+        .unwrap_or_else(|e| panic!("record_stage_started second failed: {}", e));
+
+    db.store_stage_artifact(
+        second_stage_history_id,
+        ArtifactType::ContractDocument,
+        "second-contract",
+        None,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("store second contract failed: {}", e));
+
+    let has_contract = db
+        .bead_has_artifact_type(&bead_id, ArtifactType::ContractDocument)
+        .await
+        .unwrap_or_else(|e| panic!("bead_has_artifact_type failed: {}", e));
+    let has_test_results = db
+        .bead_has_artifact_type(&bead_id, ArtifactType::TestResults)
+        .await
+        .unwrap_or_else(|e| panic!("bead_has_artifact_type missing failed: {}", e));
+
+    assert!(has_contract);
+    assert!(!has_test_results);
+
+    let first_contract = db
+        .get_first_bead_artifact_by_type(&bead_id, ArtifactType::ContractDocument)
+        .await
+        .unwrap_or_else(|e| panic!("get_first_bead_artifact_by_type failed: {}", e));
+
+    assert_eq!(
+        first_contract
+            .as_ref()
+            .map(|artifact| artifact.content.as_str()),
+        Some("first-contract")
+    );
 }
 
 #[tokio::test]
@@ -414,8 +509,7 @@ async fn message_send_receive_and_mark_read_round_trip_works() {
             Some(&to_agent),
             Some(&bead_id),
             MessageType::QaFailed,
-            "qa failed",
-            "3 tests failed",
+            ("qa failed", "3 tests failed"),
             None,
         )
         .await
@@ -440,6 +534,83 @@ async fn message_send_receive_and_mark_read_round_trip_works() {
         .unwrap_or_else(|e| panic!("get_unread_messages after mark failed: {}", e));
 
     assert!(unread_after.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
+async fn mark_messages_read_updates_requested_ids_in_single_bulk_call() {
+    let db = test_db().await;
+    setup_schema(&db).await;
+    reset_runtime_tables(&db).await;
+
+    let from_agent = AgentId::new(RepoId::new("local"), 1);
+    let to_agent = AgentId::new(RepoId::new("local"), 2);
+    let other_agent = AgentId::new(RepoId::new("local"), 3);
+    let bead_id = BeadId::new(unique_bead("bead-msg-bulk"));
+
+    db.seed_idle_agents(3)
+        .await
+        .unwrap_or_else(|e| panic!("seed_idle_agents failed: {}", e));
+
+    let first_id = db
+        .send_agent_message(
+            &from_agent,
+            Some(&to_agent),
+            Some(&bead_id),
+            MessageType::QaFailed,
+            ("qa failed 1", "first"),
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("send first message failed: {}", e));
+
+    let second_id = db
+        .send_agent_message(
+            &from_agent,
+            Some(&to_agent),
+            Some(&bead_id),
+            MessageType::QaFailed,
+            ("qa failed 2", "second"),
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("send second message failed: {}", e));
+
+    let other_agent_message_id = db
+        .send_agent_message(
+            &from_agent,
+            Some(&other_agent),
+            Some(&bead_id),
+            MessageType::QaFailed,
+            ("qa failed 3", "third"),
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("send third message failed: {}", e));
+
+    db.mark_messages_read(&to_agent, &[first_id, second_id, other_agent_message_id])
+        .await
+        .unwrap_or_else(|e| panic!("mark_messages_read failed: {}", e));
+
+    let target_unread = db
+        .get_unread_messages(&to_agent, Some(&bead_id))
+        .await
+        .unwrap_or_else(|e| panic!("get_unread_messages target failed: {}", e));
+    assert!(
+        target_unread.is_empty(),
+        "target agent messages should be read"
+    );
+
+    let other_unread = db
+        .get_unread_messages(&other_agent, Some(&bead_id))
+        .await
+        .unwrap_or_else(|e| panic!("get_unread_messages other failed: {}", e));
+    assert_eq!(
+        other_unread.len(),
+        1,
+        "other agent message should remain unread"
+    );
+    assert_eq!(other_unread[0].id, other_agent_message_id);
 }
 
 #[tokio::test]

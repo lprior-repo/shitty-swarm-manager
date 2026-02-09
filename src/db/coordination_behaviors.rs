@@ -33,8 +33,7 @@ mod agent_coordination {
                     Some(&to_agent),
                     Some(&bead_id),
                     MessageType::QaFailed,
-                    "QA found issues",
-                    "3 tests failed, 2 warnings",
+                    ("QA found issues", "3 tests failed, 2 warnings"),
                     None,
                 ).await.unwrap_or_else(|e| panic!("send failed: {}", e));
 
@@ -83,8 +82,7 @@ mod agent_coordination {
                     Some(&to_agent),
                     None,
                     MessageType::QaFailed,
-                    "Metadata test",
-                    "Checking metadata storage",
+                    ("Metadata test", "Checking metadata storage"),
                     Some(metadata.clone()),
                 ).await.unwrap_or_else(|e| panic!("send failed: {}", e));
 
@@ -120,8 +118,7 @@ mod agent_coordination {
                     None,  // No specific recipient
                     None,
                     MessageType::Coordination,
-                    "Swarm update",
-                    "All agents: pause work",
+                    ("Swarm update", "All agents: pause work"),
                     None,
                 ).await.unwrap_or_else(|e| panic!("send failed: {}", e));
 
@@ -156,12 +153,12 @@ mod agent_coordination {
 
                 let msg_id_1 = db.send_agent_message(
                     &from_agent, Some(&to_agent), Some(&bead_id),
-                    MessageType::QaFailed, "Fail 1", "details", None
+                    MessageType::QaFailed, ("Fail 1", "details"), None
                 ).await.unwrap_or_else(|e| panic!("send 1 failed: {}", e));
 
                 let msg_id_2 = db.send_agent_message(
                     &from_agent, Some(&to_agent), Some(&bead_id),
-                    MessageType::ImplementationRetry, "Retry", "try again", None
+                    MessageType::ImplementationRetry, ("Retry", "try again"), None
                 ).await.unwrap_or_else(|e| panic!("send 2 failed: {}", e));
 
                 // Verify both are unread

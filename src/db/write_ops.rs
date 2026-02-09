@@ -17,6 +17,101 @@ enum StageTransition {
 }
 
 impl SwarmDb {
+    pub async fn record_command_audit(
+        &self,
+        cmd: &str,
+        rid: Option<&str>,
+        args: serde_json::Value,
+        ok: bool,
+        ms: u64,
+        error_code: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO command_audit (cmd, rid, args, ok, ms, error_code)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(cmd)
+        .bind(rid)
+        .bind(args)
+        .bind(ok)
+        .bind(ms as i32)
+        .bind(error_code)
+        .execute(self.pool())
+        .await
+        .map(|_| ())
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to write command audit: {}", e)))
+    }
+
+    pub async fn acquire_resource_lock(
+        &self,
+        resource: &str,
+        agent: &str,
+        ttl_ms: i64,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let mut tx = self
+            .pool()
+            .begin()
+            .await
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to begin tx: {}", e)))?;
+
+        let conn = tx
+            .acquire()
+            .await
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to acquire tx conn: {}", e)))?;
+
+        sqlx::query("DELETE FROM resource_locks WHERE until_at <= NOW()")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to cleanup locks: {}", e)))?;
+
+        let acquired = sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+            "INSERT INTO resource_locks (resource, agent, until_at)
+             VALUES ($1, $2, NOW() + ($3 * INTERVAL '1 millisecond'))
+             ON CONFLICT (resource) DO NOTHING
+             RETURNING until_at",
+        )
+        .bind(resource)
+        .bind(agent)
+        .bind(ttl_ms)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to acquire lock: {}", e)))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to commit tx: {}", e)))
+            .map(|_| acquired)
+    }
+
+    pub async fn unlock_resource(&self, resource: &str, agent: &str) -> Result<bool> {
+        sqlx::query("DELETE FROM resource_locks WHERE resource = $1 AND agent = $2")
+            .bind(resource)
+            .bind(agent)
+            .execute(self.pool())
+            .await
+            .map(|result| result.rows_affected() > 0)
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to unlock resource: {}", e)))
+    }
+
+    pub async fn write_broadcast(&self, from_agent: &str, msg: &str) -> Result<i64> {
+        sqlx::query("DELETE FROM resource_locks WHERE until_at <= NOW()")
+            .execute(self.pool())
+            .await
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to cleanup locks: {}", e)))?;
+
+        sqlx::query("INSERT INTO broadcast_log (from_agent, msg) VALUES ($1, $2)")
+            .bind(from_agent)
+            .bind(msg)
+            .execute(self.pool())
+            .await
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to write broadcast: {}", e)))?;
+
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(DISTINCT agent) FROM resource_locks")
+            .fetch_one(self.pool())
+            .await
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to count agents: {}", e)))
+    }
+
     pub async fn register_repo(&self, _repo_id: &RepoId, _name: &str, _path: &str) -> Result<()> {
         info!("Repository registration skipped for single-repo coordinator");
         Ok(())
@@ -161,10 +256,10 @@ impl SwarmDb {
         to_agent: Option<&AgentId>,
         bead_id: Option<&BeadId>,
         message_type: MessageType,
-        subject: &str,
-        body: &str,
+        content: (&str, &str),
         metadata: Option<serde_json::Value>,
     ) -> Result<i64> {
+        let (subject, body) = content;
         let to_repo_id = to_agent.map(|agent| agent.repo_id().value().to_string());
         let to_agent_id = to_agent.map(|agent| agent.number() as i32);
 

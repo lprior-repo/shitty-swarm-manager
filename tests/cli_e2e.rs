@@ -1,67 +1,67 @@
 use assert_cmd::Command;
 use serde_json::Value;
-use std::path::PathBuf;
 
 fn swarm_command() -> Command {
     Command::new(assert_cmd::cargo::cargo_bin!("swarm"))
 }
 
-fn parse_json_output(raw: &[u8]) -> Value {
+fn parse_line_json(raw: &[u8]) -> Value {
     let text = String::from_utf8_lossy(raw).trim().to_string();
     serde_json::from_str::<Value>(&text)
-        .unwrap_or_else(|e| panic!("expected JSON output, got '{}': {}", text, e))
+        .unwrap_or_else(|err| panic!("expected JSON output, got '{}': {}", text, err))
 }
 
 #[test]
-fn init_defaults_to_json_output() {
-    let assert = swarm_command().arg("init").assert().success();
-
-    let output = assert.get_output();
-    let json = parse_json_output(&output.stdout);
-
-    assert_eq!(json["command"], "init");
-    assert_eq!(json["status"], "ok");
-    assert_eq!(json["payload"]["message"], "Swarm CLI ready");
-}
-
-#[test]
-fn init_supports_text_output_override() {
+fn help_command_returns_protocol_envelope() {
     let assert = swarm_command()
-        .args(["init", "--output", "text"])
+        .write_stdin("{\"cmd\":\"?\",\"rid\":\"r-1\"}\n")
         .assert()
         .success();
 
-    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
-    assert!(stdout.contains("Swarm CLI ready"));
-    assert!(!stdout.contains("\"status\":\"ok\""));
+    let json = parse_line_json(&assert.get_output().stdout);
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["rid"], "r-1");
+    assert!(json["t"].is_i64());
+    assert!(json["ms"].is_i64());
+    assert!(json["d"]["commands"].is_object());
+    assert!(json["state"]["total"].is_number());
 }
 
 #[test]
-fn spawn_prompts_errors_are_structured_json_by_default() {
-    let temp_dir =
-        tempfile::tempdir().unwrap_or_else(|e| panic!("failed to create tempdir: {}", e));
-    let missing_template: PathBuf = temp_dir.path().join("missing_template.md");
-    let out_dir: PathBuf = temp_dir.path().join("generated");
-
+fn invalid_command_returns_structured_error() {
     let assert = swarm_command()
-        .args([
-            "spawn-prompts",
-            "--template",
-            missing_template.to_string_lossy().as_ref(),
-            "--out-dir",
-            out_dir.to_string_lossy().as_ref(),
-            "--count",
-            "1",
-        ])
+        .write_stdin("{\"cmd\":\"nope\"}\n")
         .assert()
-        .failure()
-        .code(2);
+        .success();
 
-    let stderr_json = parse_json_output(&assert.get_output().stderr);
-    assert_eq!(stderr_json["status"], "error");
-    assert_eq!(stderr_json["error"]["kind"], "config_error");
-    assert_eq!(stderr_json["error"]["exit_code"], 2);
-    assert!(stderr_json["error"]["message"]
-        .as_str()
-        .map_or(false, |msg| msg.contains("Failed to read template")));
+    let json = parse_line_json(&assert.get_output().stdout);
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["err"]["code"], "INVALID");
+    assert!(json["fix"].is_string());
+}
+
+#[test]
+fn dry_run_lock_uses_standard_dry_shape() {
+    let assert = swarm_command()
+        .write_stdin("{\"cmd\":\"lock\",\"resource\":\"res_abc\",\"agent\":\"agent-1\",\"ttl_ms\":30000,\"dry\":true}\n")
+        .assert()
+        .success();
+
+    let json = parse_line_json(&assert.get_output().stdout);
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["d"]["dry"], true);
+    assert!(json["d"]["would_do"].is_array());
+    assert!(json["d"]["estimated_ms"].is_number());
+}
+
+#[test]
+fn batch_partial_success_reports_summary() {
+    let payload = "{\"cmd\":\"batch\",\"ops\":[{\"cmd\":\"?\"},{\"cmd\":\"definitely-invalid\"}],\"dry\":false}\n";
+    let assert = swarm_command().write_stdin(payload).assert().success();
+    let json = parse_line_json(&assert.get_output().stdout);
+
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["d"]["summary"]["total"], 2);
+    assert_eq!(json["d"]["summary"]["pass"], 1);
+    assert_eq!(json["d"]["summary"]["fail"], 1);
 }

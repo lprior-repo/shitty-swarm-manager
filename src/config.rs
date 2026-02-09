@@ -47,27 +47,27 @@ pub fn parse_config_content(content: &str) -> (Option<String>, StageCommands) {
     let mut database_url = None;
     let mut stage_commands = StageCommands::default();
 
-    content
+    for line in content
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .for_each(|line| {
-            database_url = parse_key_value(line, "database_url")
-                .map(str::to_string)
-                .or(database_url.clone());
-            stage_commands.rust_contract = parse_key_value(line, "rust_contract_cmd")
-                .map(str::to_string)
-                .unwrap_or_else(|| stage_commands.rust_contract.clone());
-            stage_commands.implement = parse_key_value(line, "implement_cmd")
-                .map(str::to_string)
-                .unwrap_or_else(|| stage_commands.implement.clone());
-            stage_commands.qa_enforcer = parse_key_value(line, "qa_enforcer_cmd")
-                .map(str::to_string)
-                .unwrap_or_else(|| stage_commands.qa_enforcer.clone());
-            stage_commands.red_queen = parse_key_value(line, "red_queen_cmd")
-                .map(str::to_string)
-                .unwrap_or_else(|| stage_commands.red_queen.clone());
-        });
+    {
+        if let Some(value) = parse_key_value(line, "database_url") {
+            database_url = Some(value.to_string());
+        }
+        if let Some(value) = parse_key_value(line, "rust_contract_cmd") {
+            stage_commands.rust_contract = value.to_string();
+        }
+        if let Some(value) = parse_key_value(line, "implement_cmd") {
+            stage_commands.implement = value.to_string();
+        }
+        if let Some(value) = parse_key_value(line, "qa_enforcer_cmd") {
+            stage_commands.qa_enforcer = value.to_string();
+        }
+        if let Some(value) = parse_key_value(line, "red_queen_cmd") {
+            stage_commands.red_queen = value.to_string();
+        }
+    }
 
     (database_url, stage_commands)
 }

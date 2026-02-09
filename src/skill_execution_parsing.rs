@@ -21,7 +21,7 @@ pub fn parse_test_results(output: &str) -> TestResults {
     let result_line = output.lines().find(|line| line.contains("test result:"));
     let (passed, failed) = result_line
         .and_then(|line| {
-            let normalized = line.replace(';', "").replace('.', "");
+            let normalized = line.replace([';', '.'], "");
             let words: Vec<&str> = normalized.split_whitespace().collect();
             let passed = words
                 .iter()

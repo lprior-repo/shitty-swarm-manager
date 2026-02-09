@@ -1,27 +1,34 @@
 use crate::error::{Result, SwarmError};
 use crate::types::{AgentState, AgentStatus, BeadId, Stage, SwarmConfig, SwarmStatus};
 
+pub struct AgentStateFields {
+    pub bead_id: Option<String>,
+    pub stage_str: Option<String>,
+    pub stage_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub status_str: String,
+    pub last_update: chrono::DateTime<chrono::Utc>,
+    pub implementation_attempt: i32,
+    pub feedback: Option<String>,
+}
+
 pub fn parse_agent_state(
     agent_id: &crate::types::AgentId,
-    bead_id: Option<String>,
-    stage_str: Option<String>,
-    stage_started_at: Option<chrono::DateTime<chrono::Utc>>,
-    status_str: String,
-    last_update: chrono::DateTime<chrono::Utc>,
-    implementation_attempt: i32,
-    feedback: Option<String>,
+    fields: AgentStateFields,
 ) -> Result<AgentState> {
-    let status = AgentStatus::try_from(status_str.as_str()).map_err(SwarmError::DatabaseError)?;
+    let status =
+        AgentStatus::try_from(fields.status_str.as_str()).map_err(SwarmError::DatabaseError)?;
 
     Ok(AgentState {
         agent_id: agent_id.clone(),
-        bead_id: bead_id.map(BeadId::new),
-        current_stage: stage_str.and_then(|s| Stage::try_from(s.as_str()).ok()),
-        stage_started_at,
+        bead_id: fields.bead_id.map(BeadId::new),
+        current_stage: fields
+            .stage_str
+            .and_then(|s| Stage::try_from(s.as_str()).ok()),
+        stage_started_at: fields.stage_started_at,
         status,
-        last_update,
-        implementation_attempt: to_u32_i32(implementation_attempt),
-        feedback,
+        last_update: fields.last_update,
+        implementation_attempt: to_u32_i32(fields.implementation_attempt),
+        feedback: fields.feedback,
     })
 }
 
@@ -46,7 +53,11 @@ pub fn parse_swarm_config(
 }
 
 pub fn to_u32_i32(value: i32) -> u32 {
-    u32::try_from(value).map_or_else(|_| 0, |v| v)
+    if value < 0 {
+        0
+    } else {
+        value as u32
+    }
 }
 
 #[cfg(test)]

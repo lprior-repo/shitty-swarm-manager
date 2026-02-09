@@ -4,6 +4,7 @@ use crate::error::{Result, SwarmError};
 use crate::skill_execution_parsing::{parse_test_results, TestResults};
 use crate::types::{ArtifactType, Stage};
 use crate::SwarmDb;
+use futures_util::future::try_join_all;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -37,7 +38,7 @@ pub struct SkillInvocationMetadata {
 impl SkillOutput {
     /// Create a new skill output from shell command execution.
     pub fn from_shell_output(stdout: String, stderr: String, exit_code: Option<i32>) -> Self {
-        let success = exit_code.map_or(true, |code| code == 0);
+        let success = exit_code.is_none_or(|code| code == 0);
         let full_log = match (stdout.is_empty(), stderr.is_empty()) {
             (true, _) => stderr,
             (_, true) => stdout.clone(),
@@ -126,19 +127,6 @@ pub async fn store_skill_artifacts(
     stage: Stage,
     output: &SkillOutput,
 ) -> Result<()> {
-    // Store stage log (full output)
-    db.store_stage_artifact(
-        stage_history_id,
-        ArtifactType::StageLog,
-        &output.full_log,
-        Some(serde_json::json!({
-            "exit_code": output.exit_code,
-            "success": output.success,
-        })),
-    )
-    .await?;
-
-    // Store skill invocation metadata
     let skill_name = match stage {
         Stage::RustContract => "rust-contract",
         Stage::Implement => "functional-rust-generator",
@@ -147,94 +135,67 @@ pub async fn store_skill_artifacts(
         Stage::Done => return Ok(()),
     };
 
-    db.store_stage_artifact(
-        stage_history_id,
-        ArtifactType::SkillInvocation,
-        &format!("Skill: {}", skill_name),
-        Some(serde_json::json!({
-            "skill_name": skill_name,
-        })),
-    )
-    .await?;
+    let mut pending_artifacts: Vec<(ArtifactType, String, Option<serde_json::Value>)> = vec![
+        (
+            ArtifactType::StageLog,
+            output.full_log.clone(),
+            Some(serde_json::json!({
+                "exit_code": output.exit_code,
+                "success": output.success,
+            })),
+        ),
+        (
+            ArtifactType::SkillInvocation,
+            format!("Skill: {}", skill_name),
+            Some(serde_json::json!({
+                "skill_name": skill_name,
+            })),
+        ),
+    ];
 
-    // Store stage-specific artifacts
     match stage {
         Stage::RustContract => {
             if let Some(ref contract) = output.contract_document {
-                db.store_stage_artifact(
-                    stage_history_id,
-                    ArtifactType::ContractDocument,
-                    contract,
-                    None,
-                )
-                .await?;
+                pending_artifacts.push((ArtifactType::ContractDocument, contract.clone(), None));
             }
         }
         Stage::Implement => {
             if let Some(ref impl_code) = output.implementation_code {
-                db.store_stage_artifact(
-                    stage_history_id,
-                    ArtifactType::ImplementationCode,
-                    impl_code,
-                    None,
-                )
-                .await?;
+                pending_artifacts.push((ArtifactType::ImplementationCode, impl_code.clone(), None));
             }
             if let Some(ref files) = output.modified_files {
                 let files_json = serde_json::to_string(files).map_err(|e| {
                     SwarmError::DatabaseError(format!("Failed to serialize files: {}", e))
                 })?;
-                db.store_stage_artifact(
-                    stage_history_id,
-                    ArtifactType::ModifiedFiles,
-                    &files_json,
-                    None,
-                )
-                .await?;
+                pending_artifacts.push((ArtifactType::ModifiedFiles, files_json, None));
             }
         }
         Stage::QaEnforcer => {
             if !output.success {
-                db.store_stage_artifact(
-                    stage_history_id,
+                pending_artifacts.push((
                     ArtifactType::FailureDetails,
-                    &output.feedback,
+                    output.feedback.clone(),
                     None,
-                )
-                .await?;
+                ));
             }
             if let Some(ref test_results) = output.test_results {
                 let results_json = serde_json::to_string(test_results).map_err(|e| {
                     SwarmError::DatabaseError(format!("Failed to serialize test results: {}", e))
                 })?;
-                db.store_stage_artifact(
-                    stage_history_id,
-                    ArtifactType::TestResults,
-                    &results_json,
-                    None,
-                )
-                .await?;
+                pending_artifacts.push((ArtifactType::TestResults, results_json, None));
             }
         }
         Stage::RedQueen => {
             if !output.success {
                 if let Some(ref report) = output.adversarial_report {
-                    db.store_stage_artifact(
-                        stage_history_id,
-                        ArtifactType::AdversarialReport,
-                        report,
-                        None,
-                    )
-                    .await?;
+                    pending_artifacts.push((ArtifactType::AdversarialReport, report.clone(), None));
                 }
             } else {
-                db.store_stage_artifact(
-                    stage_history_id,
+                pending_artifacts.push((
                     ArtifactType::QualityGateReport,
-                    &output.full_log,
+                    output.full_log.clone(),
                     None,
-                )
-                .await?;
+                ));
             }
         }
         Stage::Done => {}
@@ -246,9 +207,19 @@ pub async fn store_skill_artifacts(
             Err(_) => continue,
         };
 
-        db.store_stage_artifact(stage_history_id, artifact_type, value, None)
-            .await?;
+        pending_artifacts.push((artifact_type, value.clone(), None));
     }
+
+    let store_futures =
+        pending_artifacts
+            .into_iter()
+            .map(|(artifact_type, content, metadata)| async move {
+                db.store_stage_artifact(stage_history_id, artifact_type, &content, metadata)
+                    .await
+                    .map(|_| ())
+            });
+
+    try_join_all(store_futures).await?;
 
     Ok(())
 }

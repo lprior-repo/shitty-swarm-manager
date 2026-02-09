@@ -30,16 +30,14 @@ docker run -d \
 ### 2. Initialize Database
 
 ```bash
-swarm init-db
+echo '{"cmd":"init-db"}' | swarm
 
-# Or use the helper script (starts container, loads schema, seeds agents)
-./.agents/init_postgres_swarm.sh
+# Or use native bootstrap + local DB initialization commands
+echo '{"cmd":"bootstrap"}' | swarm
+echo '{"cmd":"init-local-db"}' | swarm
 
 # Optional: target a specific connection/schema
-swarm init-db \
-  --url postgresql://shitty_swarm_manager:shitty_swarm_manager@localhost:5432/shitty_swarm_manager_db \
-  --schema crates/swarm-coordinator/schema.sql \
-  --seed-agents 12
+echo '{"cmd":"init-db","url":"postgresql://shitty_swarm_manager:shitty_swarm_manager@localhost:5432/shitty_swarm_manager_db","schema":"crates/swarm-coordinator/schema.sql","seed_agents":12}' | swarm
 ```
 
 This creates:
@@ -76,7 +74,7 @@ ON CONFLICT (bead_id) DO NOTHING;
 Single-agent smoke check first:
 
 ```bash
-swarm smoke --id 1
+echo '{"cmd":"smoke","id":1}' | swarm
 ```
 
 **From Claude Code**, spawn 12 agents in parallel:
@@ -93,46 +91,174 @@ Task(
 
 Or use the prepared launcher:
 ```bash
-swarm spawn-prompts --count 12
+echo '{"cmd":"spawn-prompts","count":12}' | swarm
 # Uses .agents/agent_prompt.md and writes .agents/generated/agent_01.md ... agent_12.md
 ```
 
+## AI-Native Operator Guide
+
+This CLI is designed to be machine-operated first and human-operated second.
+
+### Output Contract (Global)
+
+All `swarm` commands emit **single-line JSON output** (JSONL-compatible).
+Treat each emitted line as a structured record and parse by keys.
+
+If you are building automations, controllers, or agent workers, use this section as the default contract.
+
+### Design Principles
+
+1. **Deterministic state over hidden behavior**
+   - Every meaningful action should map to a visible database transition.
+2. **JSONL-native interfaces**
+    - Commands emit single-line JSON records by default (JSONL-compatible).
+    - Commands return a single JSON object per line.
+3. **Safe-by-default execution**
+    - Use `"dry": true` before side-effecting commands when running in unknown environments.
+4. **Resumability and auditability**
+   - Stage outcomes and artifacts must be queryable after failure.
+
+### Minimal Reliable Agent Loop
+
+Use this baseline flow for robust autonomous execution:
+
+```bash
+# 1) Environment sanity
+echo '{"cmd":"doctor"}' | swarm
+
+# 2) Optional preflight plan (no side effects)
+echo '{"cmd":"agent","id":1,"dry":true}' | swarm
+
+# 3) Real execution
+echo '{"cmd":"agent","id":1}' | swarm
+
+# 4) Verification
+echo '{"cmd":"status"}' | swarm
+echo '{"cmd":"monitor","view":"progress"}' | swarm
+```
+
+### Operator Patterns by Phase
+
+**Bootstrapping a fresh environment**
+
+```bash
+echo '{"cmd":"init-db"}' | swarm
+echo '{"cmd":"register","count":12}' | swarm
+echo '{"cmd":"spawn-prompts","count":12}' | swarm
+```
+
+**Smoke test before parallel fan-out**
+
+```bash
+echo '{"cmd":"smoke","id":1}' | swarm
+echo '{"cmd":"monitor","view":"active"}' | swarm
+```
+
+**During active swarm execution**
+
+```bash
+echo '{"cmd":"monitor","view":"progress","watch_ms":1000}' | swarm
+```
+
+**Recovery / intervention**
+
+```bash
+echo '{"cmd":"release","agent_id":3}' | swarm
+echo '{"cmd":"status"}' | swarm
+```
+
+### AI Integration Rules
+
+- Treat command output as API responses, not logs.
+- Parse keys, do not pattern-match free text.
+- Retry based on explicit failure state, not assumptions.
+- Never infer completion without checking `status`/monitor views.
+- Prefer idempotent checks (`doctor`, `status`, `monitor`) between mutations.
+- Default output is already machine-readable JSONL-style single-line JSON; keep parsing strict.
+
+### First Invocation Handshake (Agent Boot Sequence)
+
+When an AI agent is invoked for the first time in a session, run this exact sequence before any mutating command.
+
+Output expectation for every command below: single-line JSON by default.
+
+```bash
+# 1) Confirm toolchain and environment health
+echo '{"cmd":"doctor"}' | swarm
+
+# 2) Confirm reachable coordinator state
+echo '{"cmd":"status"}' | swarm
+echo '{"cmd":"monitor","view":"active"}' | swarm
+
+# 3) Preview intended action without side effects
+echo '{"cmd":"agent","id":1,"dry":true}' | swarm
+
+# 4) Execute for real only after successful dry-run
+echo '{"cmd":"agent","id":1}' | swarm
+
+# 5) Verify postconditions
+echo '{"cmd":"monitor","view":"progress"}' | swarm
+echo '{"cmd":"monitor","view":"failures"}' | swarm
+```
+
+Interpretation rules for this boot sequence:
+- If `doctor` reports unhealthy checks, stop and fix those checks first.
+- If `dry_run` payload differs from intended action, do not proceed until corrected.
+- If post-run failures exist, loop through retry workflow rather than declaring success.
+
+### Strong Recommendation for Prompt Templates
+
+Use `.agents/agent_prompt.md` as the canonical template for generated agents.
+It is written to be explicit for low-context agents and includes:
+- deterministic stage order
+- retry behavior
+- completion criteria
+- machine-friendly reporting style
+
+Generate fresh prompts whenever process rules change:
+
+```bash
+echo '{"cmd":"spawn-prompts","template":".agents/agent_prompt.md","out_dir":".agents/generated","count":12}' | swarm
+```
+
+### Native Rust Operations (Protocol Commands)
+
+All operational helpers are first-class `swarm` protocol commands:
+
+- `{"cmd":"init-local-db"}`
+- `{"cmd":"monitor","view":"active","watch_ms":2000}`
+- `{"cmd":"monitor","view":"progress"}`
+- `{"cmd":"monitor","view":"failures"}`
+- `{"cmd":"monitor","view":"messages"}`
+- `{"cmd":"spawn-prompts","count":12}`
+
 ## Monitoring
+
+Output contract for this section: each command defaults to single-line JSON (JSONL-compatible).
 
 ### Check Active Agents
 
 ```bash
-swarm monitor --view active
-
-# Script form
-./.agents/monitor.sh
+echo '{"cmd":"monitor","view":"active"}' | swarm
+echo '{"cmd":"monitor","view":"active","watch_ms":2000}' | swarm
 ```
 
 ### Check Progress
 
 ```bash
-swarm monitor --view progress
-
-# Script form
-./.agents/progress.sh
+echo '{"cmd":"monitor","view":"progress"}' | swarm
 ```
 
 ### View Failures Requiring Feedback
 
 ```bash
-swarm monitor --view failures
-
-# Script form
-./.agents/failures.sh
+echo '{"cmd":"monitor","view":"failures"}' | swarm
 ```
 
 ### View Unread Inter-Agent Messages
 
 ```bash
-swarm monitor --view messages
-
-# Script form
-./.agents/messages.sh
+echo '{"cmd":"monitor","view":"messages"}' | swarm
 ```
 
 ### Get Specific Agent State
@@ -173,7 +299,7 @@ ORDER BY started_at;
 After a smoke run:
 
 ```bash
-swarm smoke --id 1
+echo '{"cmd":"smoke","id":1}' | swarm
 ```
 
 Run these checks to verify claims, stage history, artifacts, and messages:
@@ -305,15 +431,10 @@ qa_enforcer_cmd = "moon run :quick"
 red_queen_cmd = "moon run :test"
 ```
 
-CLI DB override options (available on all commands):
+Protocol DB override options (available on all commands):
 
 ```bash
-# Explicit URL override
-swarm status --database-url "postgresql://shitty_swarm_manager:shitty_swarm_manager@localhost:5437/shitty_swarm_manager_db"
-
-# Pull URL from pass entry (expects connection_url: ... or first line postgres URL)
-swarm status --database-url-pass infra/shitty-swarm-manager/postgres
-swarm init-db --database-url-pass infra/shitty-swarm-manager/postgres
+echo '{"cmd":"status","database_url":"postgresql://shitty_swarm_manager:shitty_swarm_manager@localhost:5437/shitty_swarm_manager_db"}' | swarm
 ```
 
 ## Troubleshooting
@@ -327,7 +448,7 @@ pg_isready -h localhost -p 5432
 psql -h localhost -U shitty_swarm_manager -d postgres -c "\l" | grep shitty_swarm_manager_db
 
 # Recreate schema if needed
-swarm init-db --url postgresql://shitty_swarm_manager:shitty_swarm_manager@localhost:5432/shitty_swarm_manager_db
+echo '{"cmd":"init-db","url":"postgresql://shitty_swarm_manager:shitty_swarm_manager@localhost:5432/shitty_swarm_manager_db"}' | swarm
 ```
 
 ### No beads available

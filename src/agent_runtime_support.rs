@@ -35,15 +35,15 @@ pub fn stage_failure_message_type(stage: Stage) -> Option<MessageType> {
     }
 }
 
-fn preferred_message_artifact_types(stage: Stage, is_success: bool) -> Vec<ArtifactType> {
+fn preferred_message_artifact_types(stage: Stage, is_success: bool) -> &'static [ArtifactType] {
     match (stage, is_success) {
-        (Stage::RustContract, _) => vec![ArtifactType::ContractDocument],
-        (Stage::Implement, _) => vec![ArtifactType::ImplementationCode],
-        (Stage::QaEnforcer, true) => vec![ArtifactType::TestOutput, ArtifactType::TestResults],
-        (Stage::QaEnforcer, false) => vec![ArtifactType::FailureDetails, ArtifactType::TestOutput],
-        (Stage::RedQueen, true) => vec![ArtifactType::QualityGateReport],
-        (Stage::RedQueen, false) => vec![ArtifactType::AdversarialReport],
-        (Stage::Done, _) => vec![ArtifactType::StageLog],
+        (Stage::RustContract, _) => &[ArtifactType::ContractDocument],
+        (Stage::Implement, _) => &[ArtifactType::ImplementationCode],
+        (Stage::QaEnforcer, true) => &[ArtifactType::TestOutput, ArtifactType::TestResults],
+        (Stage::QaEnforcer, false) => &[ArtifactType::FailureDetails, ArtifactType::TestOutput],
+        (Stage::RedQueen, true) => &[ArtifactType::QualityGateReport],
+        (Stage::RedQueen, false) => &[ArtifactType::AdversarialReport],
+        (Stage::Done, _) => &[ArtifactType::StageLog],
     }
 }
 
@@ -60,11 +60,11 @@ pub fn build_full_message_body(
         artifacts
             .iter()
             .find(|artifact| artifact.artifact_type == *wanted_type && !artifact.content.is_empty())
-            .map(|artifact| artifact.content.clone())
+            .map(|artifact| artifact.content.as_str())
     });
 
     match preferred_content {
-        Some(content) => content,
+        Some(content) => content.to_owned(),
         None => {
             if !result_message.is_empty() {
                 result_message.to_string()
@@ -137,14 +137,10 @@ pub async fn run_shell_command(command: &str) -> Result<CommandOutput> {
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let message = if output.status.success() {
-        stdout
-    } else if stderr.is_empty() {
-        stdout
-    } else if stdout.is_empty() {
-        stderr
-    } else {
-        format!("{}\n{}", stdout, stderr)
+    let message = match (stdout.is_empty(), stderr.is_empty()) {
+        (true, _) => stderr,
+        (_, true) => stdout,
+        _ => format!("{}\n{}", stdout, stderr),
     };
 
     Ok(CommandOutput {

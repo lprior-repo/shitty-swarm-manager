@@ -83,21 +83,17 @@ This includes but is not limited to:
 
 If clippy reports warnings or errors, fix the **code**, not the lint rules.
 
-### Build System: Cargo
+### Build System: Moon
 
-This project uses standard Cargo for builds:
+This project uses Moon for builds:
 
 ```bash
 # Development
-cargo build                   # Debug build
-cargo build --release         # Release build
-cargo test                    # Run tests
-cargo clippy                  # Lint checks
-cargo fmt                     # Format code
-
-# Quick iteration
-cargo check                   # Fast type check (no compilation)
-cargo clippy -- -D warnings   # Strict linting
+moon run :build      # Release build
+moon run :test       # Run tests
+moon run :quick      # Format + lint check
+moon run :fmt-fix    # Auto-fix formatting
+moon run :check      # Fast type check
 ```
 
 ### Code Quality
@@ -115,12 +111,8 @@ cargo clippy -- -D warnings   # Strict linting
 src/
 ├── main.rs              # Binary entry point
 ├── lib.rs               # Library exports
-├── cli.rs               # CLI argument parsing (clap)
-├── commands.rs          # Command handlers
 ├── config.rs            # Configuration loading
 ├── agent_runtime.rs     # Agent execution logic
-├── monitor.rs           # Monitoring/dashboard
-├── output.rs            # Output formatting
 ├── types.rs             # Type definitions
 ├── error.rs             # Error types
 └── db/                  # Database layer
@@ -136,21 +128,10 @@ src/
 - **AgentStatus**: Agent lifecycle states (idle, active, failed, etc.)
 - **SwarmDb**: Database abstraction layer
 
-### CLI Commands
+### Protocol Commands
 
-```bash
-swarm init                          # Initialize workspace
-swarm register [count]              # Register N agents (default: 12)
-swarm agent -i <id>                 # Show agent details
-swarm status [-a]                   # Show swarm status
-swarm ps [-a]                       # List all agents
-swarm dashboard [-r ms]             # Launch dashboard
-swarm release -i <agent_id>         # Release an agent
-swarm init-db [-u url] [-s schema]  # Initialize database
-swarm monitor [-v view]             # Monitor swarm activity
-swarm spawn-prompts [-n count]      # Generate agent prompts
-swarm smoke -i <id>                 # Run smoke test
-```
+This CLI operates as a JSONL protocol. Each line is a JSON object with a `cmd` field.
+See `ai_cli_protocol.cue` for the full schema and supported commands.
 
 ## Database
 
@@ -171,28 +152,26 @@ swarm smoke -i <id>                 # Run smoke test
 ### Quick Iteration Loop
 ```bash
 # Edit code...
-cargo check              # Fast type check
-cargo clippy             # Lint checks
+moon run :check           # Fast type check
+moon run :quick           # Format + lint check
 ```
 
 ### Before Committing
 ```bash
-cargo fmt                # Format code
-cargo test               # Run tests
-cargo clippy -- -D warnings  # Strict linting
+moon run :fmt-fix         # Auto-fix formatting
+moon run :test            # Run tests
+moon run :quick           # Format + lint check
 ```
 
 ### Running Tests
 ```bash
-cargo test               # All tests
-cargo test --test integration  # Integration tests only
+moon run :test            # All tests
 ```
 
 ## Key Dependencies
 
 - **tokio**: Async runtime
 - **sqlx**: Database queries with compile-time verification
-- **clap**: CLI argument parsing
 - **tracing**: Structured logging
 - **serde/serde_json**: Serialization
 - **anyhow/thiserror**: Error handling
@@ -204,25 +183,29 @@ cargo test --test integration  # Integration tests only
 
 1. **Run quality gates** (if code changed):
    ```bash
-   cargo fmt
-   cargo clippy -- -D warnings
-   cargo test
+   moon run :fmt-fix
+   moon run :quick
+   moon run :test
    ```
 
 2. **Commit changes**:
    ```bash
-   git add .
-   git commit -m "description"
-   git push
+   jj commit -m "description"
+   br sync --flush-only
+   git add .beads/
+   git commit -m "sync beads"
+   jj git fetch
+   jj git push
+   jj status
    ```
 
 3. **Verify build**:
    ```bash
-   cargo build --release
+   moon run :build
    ```
 
 **CRITICAL RULES:**
-- Always use `cargo` for builds (not Moon or other tools)
+- Always use Moon for builds (not cargo)
 - Zero panics/panics - use `Result<T, Error>` everywhere
 - DO NOT modify clippy/lint configuration
 - Test before committing

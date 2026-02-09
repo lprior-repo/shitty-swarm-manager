@@ -144,6 +144,32 @@ CREATE TABLE IF NOT EXISTS swarm_config (
     CHECK (id)
 );
 
+CREATE TABLE IF NOT EXISTS command_audit (
+    seq BIGSERIAL PRIMARY KEY,
+    t TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    cmd TEXT NOT NULL,
+    rid TEXT,
+    args JSONB NOT NULL DEFAULT '{}'::JSONB,
+    ok BOOLEAN NOT NULL,
+    ms INTEGER NOT NULL CHECK (ms >= 0),
+    error_code TEXT,
+    changes JSONB
+);
+
+CREATE TABLE IF NOT EXISTS resource_locks (
+    resource TEXT PRIMARY KEY,
+    agent TEXT NOT NULL,
+    since TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    until_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS broadcast_log (
+    id BIGSERIAL PRIMARY KEY,
+    from_agent TEXT NOT NULL,
+    msg TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 INSERT INTO swarm_config (id)
 VALUES (TRUE)
 ON CONFLICT (id) DO NOTHING;
@@ -152,14 +178,21 @@ CREATE INDEX IF NOT EXISTS idx_bead_backlog_claim ON bead_backlog(status, priori
 CREATE INDEX IF NOT EXISTS idx_bead_claims_status ON bead_claims(status, claimed_at);
 CREATE INDEX IF NOT EXISTS idx_agent_state_status ON agent_state(status, last_update DESC);
 CREATE INDEX IF NOT EXISTS idx_stage_history_lookup ON stage_history(bead_id, stage, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_stage_history_bead_id ON stage_history(bead_id, id);
 CREATE INDEX IF NOT EXISTS idx_stage_history_failed ON stage_history(status, completed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_stage_artifacts_history ON stage_artifacts(stage_history_id);
+CREATE INDEX IF NOT EXISTS idx_stage_artifacts_history_created ON stage_artifacts(stage_history_id, created_at ASC);
 CREATE INDEX IF NOT EXISTS idx_stage_artifacts_type ON stage_artifacts(artifact_type);
+CREATE INDEX IF NOT EXISTS idx_stage_artifacts_type_history_created ON stage_artifacts(artifact_type, stage_history_id, created_at ASC);
 CREATE INDEX IF NOT EXISTS idx_stage_artifacts_hash ON stage_artifacts(content_hash);
 CREATE INDEX IF NOT EXISTS idx_agent_messages_to ON agent_messages(to_repo_id, to_agent_id, read);
 CREATE INDEX IF NOT EXISTS idx_agent_messages_from ON agent_messages(from_repo_id, from_agent_id);
 CREATE INDEX IF NOT EXISTS idx_agent_messages_bead ON agent_messages(bead_id);
 CREATE INDEX IF NOT EXISTS idx_agent_messages_unread ON agent_messages(to_repo_id, to_agent_id) WHERE read = FALSE;
+CREATE INDEX IF NOT EXISTS idx_command_audit_t ON command_audit(t DESC);
+CREATE INDEX IF NOT EXISTS idx_command_audit_cmd ON command_audit(cmd, t DESC);
+CREATE INDEX IF NOT EXISTS idx_command_audit_ok ON command_audit(ok, t DESC);
+CREATE INDEX IF NOT EXISTS idx_resource_locks_until ON resource_locks(until_at);
 
 CREATE OR REPLACE FUNCTION set_agent_last_update()
 RETURNS TRIGGER AS $$
