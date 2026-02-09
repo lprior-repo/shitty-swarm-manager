@@ -3,5 +3,5 @@ pub mod error;
 pub mod types;
 
 pub use db::SwarmDb;
-pub use error::{SwarmError, Result};
+pub use error::{Result, SwarmError};
 pub use types::*;

@@ -1,0 +1,26 @@
+$schema: "https://moonrepo.dev/schemas/project.json"
+
+type: "application"
+language: "rust"
+
+tasks:
+  check:
+    command: "cargo check --all-targets"
+
+  test:
+    command: "cargo test"
+
+  db-test:
+    command: "cargo test db::write_ops::tests:: -- --ignored --nocapture --test-threads=1"
+
+  build:
+    command: "cargo build --release"
+
+  fmt-fix:
+    command: "cargo fmt"
+
+  quick:
+    command: "cargo fmt --check && cargo check --all-targets"
+
+  ci:
+    command: "cargo fmt --check && cargo check --all-targets && cargo test"

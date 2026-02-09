@@ -30,8 +30,7 @@ docker run -d \
 ### 2. Initialize Database
 
 ```bash
-cd /home/lewis/src/oya
-.agents/init_postgres_swarm.sh
+swarm init-db
 ```
 
 This creates:
@@ -52,6 +51,12 @@ sqlite3 .beads/beads.db "SELECT id, title FROM beads WHERE status = 'pending' AN
 
 ### 4. Launch the Swarm
 
+Single-agent smoke check first:
+
+```bash
+swarm smoke --id 1
+```
+
 **From Claude Code**, spawn 12 agents in parallel:
 
 ```python
@@ -66,28 +71,28 @@ Task(
 
 Or use the prepared launcher:
 ```bash
-.agents/launch_swarm.sh
-# Then manually launch each agent using Task tool
+swarm spawn-prompts --count 12
+# Uses .agents/agent_prompt.md and writes .agents/generated/agent_01.md ... agent_12.md
 ```
 
 ## Monitoring
 
 ### Check Active Agents
 
-```sql
-psql -h localhost -U oya -d swarm_db -c "SELECT * FROM v_active_agents;"
+```bash
+swarm monitor --view active
 ```
 
 ### Check Progress
 
-```sql
-psql -h localhost -U oya -d swarm_db -c "SELECT * FROM v_swarm_progress;"
+```bash
+swarm monitor --view progress
 ```
 
 ### View Failures Requiring Feedback
 
-```sql
-psql -h localhost -U oya -d swarm_db -c "SELECT * FROM v_feedback_required;"
+```bash
+swarm monitor --view failures
 ```
 
 ### Get Specific Agent State

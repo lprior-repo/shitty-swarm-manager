@@ -1,0 +1,42 @@
+# Build outputs
+/target/
+**/*.rs.bk
+*.pdb
+
+# Dependency directories
+/node_modules/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# IDE/editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Runtime state and local config
+.swarm/
+config.toml
+
+# Logs and temp artifacts
+*.log
+logs/
+tmp/
+*.tmp
+
+# Python cache artifacts
+__pycache__/
+*.pyc

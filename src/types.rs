@@ -46,7 +46,7 @@ impl fmt::Display for RepoId {
 }
 
 /// Agent identifier (repo-scoped)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AgentId {
     repo_id: RepoId,
     number: u32,
@@ -99,30 +99,30 @@ impl fmt::Display for BeadId {
 /// Pipeline stage
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Stage {
-    Contract,
+    RustContract,
     Implement,
-    Test,
-    Qa,
+    QaEnforcer,
+    RedQueen,
     Done,
 }
 
 impl Stage {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Contract => "contract",
+            Self::RustContract => "rust-contract",
             Self::Implement => "implement",
-            Self::Test => "test",
-            Self::Qa => "qa",
+            Self::QaEnforcer => "qa-enforcer",
+            Self::RedQueen => "red-queen",
             Self::Done => "done",
         }
     }
 
     pub fn next(&self) -> Option<Self> {
         match self {
-            Self::Contract => Some(Self::Implement),
-            Self::Implement => Some(Self::Test),
-            Self::Test => Some(Self::Qa),
-            Self::Qa => Some(Self::Done),
+            Self::RustContract => Some(Self::Implement),
+            Self::Implement => Some(Self::QaEnforcer),
+            Self::QaEnforcer => Some(Self::RedQueen),
+            Self::RedQueen => Some(Self::Done),
             Self::Done => None,
         }
     }
@@ -139,10 +139,10 @@ impl TryFrom<&str> for Stage {
 
     fn try_from(s: &str) -> Result<Self, Self::Error> {
         match s {
-            "contract" => Ok(Self::Contract),
+            "rust-contract" => Ok(Self::RustContract),
             "implement" => Ok(Self::Implement),
-            "test" => Ok(Self::Test),
-            "qa" => Ok(Self::Qa),
+            "qa-enforcer" => Ok(Self::QaEnforcer),
+            "red-queen" => Ok(Self::RedQueen),
             "done" => Ok(Self::Done),
             _ => Err(format!("Unknown stage: {}", s)),
         }
@@ -180,7 +180,7 @@ impl fmt::Display for AgentStatus {
 impl TryFrom<&str> for AgentStatus {
     type Error = String;
 
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
+    fn try_from(s: &str) -> std::result::Result<Self, String> {
         match s {
             "idle" => Ok(Self::Idle),
             "working" => Ok(Self::Working),
@@ -311,7 +311,7 @@ impl SwarmStatus {
 impl TryFrom<&str> for SwarmStatus {
     type Error = String;
 
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
+    fn try_from(s: &str) -> std::result::Result<Self, String> {
         match s {
             "initializing" => Ok(Self::Initializing),
             "running" => Ok(Self::Running),
@@ -343,4 +343,65 @@ pub struct AvailableAgent {
     pub implementation_attempt: u32,
     pub max_implementation_attempts: u32,
     pub max_agents: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AgentStatus, ClaimStatus, Stage, StageResult, SwarmStatus};
+
+    #[test]
+    fn stage_progression_and_string_roundtrip_work() {
+        assert_eq!(Stage::RustContract.as_str(), "rust-contract");
+        assert_eq!(Stage::RustContract.next(), Some(Stage::Implement));
+        assert_eq!(Stage::Implement.next(), Some(Stage::QaEnforcer));
+        assert_eq!(Stage::QaEnforcer.next(), Some(Stage::RedQueen));
+        assert_eq!(Stage::RedQueen.next(), Some(Stage::Done));
+        assert_eq!(Stage::Done.next(), None);
+        assert_eq!(Stage::try_from("red-queen"), Ok(Stage::RedQueen));
+    }
+
+    #[test]
+    fn status_parsing_handles_valid_and_invalid_values() {
+        assert_eq!(AgentStatus::try_from("idle"), Ok(AgentStatus::Idle));
+        assert_eq!(SwarmStatus::try_from("running"), Ok(SwarmStatus::Running));
+        assert!(AgentStatus::try_from("bogus").is_err());
+        assert!(SwarmStatus::try_from("bogus").is_err());
+    }
+
+    #[test]
+    fn stage_result_helpers_match_semantics() {
+        let passed = StageResult::Passed;
+        let failed = StageResult::Failed("oops".to_string());
+        let errored = StageResult::Error("boom".to_string());
+
+        assert_eq!(passed.as_str(), "passed");
+        assert!(passed.message().is_none());
+        assert!(passed.is_success());
+
+        assert_eq!(failed.as_str(), "failed");
+        assert_eq!(failed.message(), Some("oops"));
+        assert!(!failed.is_success());
+
+        assert_eq!(errored.as_str(), "error");
+        assert_eq!(errored.message(), Some("boom"));
+        assert!(!errored.is_success());
+    }
+
+    #[test]
+    fn claim_status_roundtrip_and_invalid_value() {
+        assert_eq!(ClaimStatus::InProgress.as_str(), "in_progress");
+        assert_eq!(ClaimStatus::Completed.as_str(), "completed");
+        assert_eq!(ClaimStatus::Blocked.as_str(), "blocked");
+
+        assert_eq!(
+            ClaimStatus::try_from("in_progress"),
+            Ok(ClaimStatus::InProgress)
+        );
+        assert_eq!(
+            ClaimStatus::try_from("completed"),
+            Ok(ClaimStatus::Completed)
+        );
+        assert_eq!(ClaimStatus::try_from("blocked"), Ok(ClaimStatus::Blocked));
+        assert!(ClaimStatus::try_from("invalid").is_err());
+    }
 }
