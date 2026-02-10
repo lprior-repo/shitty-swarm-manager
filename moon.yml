@@ -23,6 +23,11 @@ tasks:
   build:
     command: "cargo build --release"
 
+  install:
+    command: "cp target/release/swarm ~/.local/bin/swarm && chmod +x ~/.local/bin/swarm"
+    deps:
+      - build
+
   fmt-fix:
     command: "cargo fmt"
 
