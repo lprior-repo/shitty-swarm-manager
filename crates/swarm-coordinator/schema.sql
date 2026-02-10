@@ -4,6 +4,14 @@ BEGIN;
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
+CREATE TABLE IF NOT EXISTS repos (
+    id SERIAL PRIMARY KEY,
+    repo_id TEXT NOT NULL UNIQUE,
+    name TEXT,
+    path TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS bead_backlog (
     bead_id TEXT PRIMARY KEY,
     priority TEXT NOT NULL DEFAULT 'p0',
