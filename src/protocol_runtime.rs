@@ -1,6 +1,5 @@
 use crate::agent_runtime::{run_agent, run_smoke_once};
 use crate::config::{default_database_url_for_cli, load_config};
-use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -688,27 +687,32 @@ async fn handle_register(
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
 
-    let register_results = futures_util::future::join_all((1..=count).map(|idx| {
-        let db = db.clone();
-        let repo_id = repo_id.clone();
-        let rid = request.rid.clone();
-        async move {
-            db.register_agent(&AgentId::new(repo_id, idx))
-                .await
-                .map_err(|e| to_protocol_failure(e, rid))
-        }
-    }))
-    .await;
-
-    // Verify all registrations succeeded functionally
-    register_results
-        .into_iter()
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    register_agents_recursive(&db, &repo_id, 1, count, request.rid.clone()).await?;
 
     Ok(CommandSuccess {
         data: json!({"repo": repo_id.value(), "count": count}),
         next: "swarm status".to_string(),
         state: minimal_state_for_request(request).await,
+    })
+}
+
+fn register_agents_recursive<'a>(
+    db: &'a SwarmDb,
+    repo_id: &'a RepoId,
+    next: u32,
+    count: u32,
+    rid: Option<String>,
+) -> Pin<Box<dyn Future<Output = std::result::Result<(), Box<ProtocolEnvelope>>> + Send + 'a>> {
+    Box::pin(async move {
+        if next > count {
+            Ok(())
+        } else {
+            db.register_agent(&AgentId::new(repo_id.clone(), next))
+                .await
+                .map_err(|e| to_protocol_failure(e, rid.clone()))?;
+
+            register_agents_recursive(db, repo_id, next.saturating_add(1), count, rid).await
+        }
     })
 }
 
@@ -1051,18 +1055,36 @@ async fn handle_spawn_prompts(
         .await
         .map_err(SwarmError::IoError)
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
-    for idx in 1..=count {
-        let file = format!("{}/agent_{:02}.md", out_dir, idx);
-        fs::write(file, template_text.replace("{N}", &idx.to_string()))
-            .await
-            .map_err(SwarmError::IoError)
-            .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
-    }
+
+    spawn_prompts_recursive(out_dir, &template_text, 1, count, request.rid.clone()).await?;
 
     Ok(CommandSuccess {
         data: json!({"count": count, "out_dir": out_dir}),
         next: "swarm monitor --view active".to_string(),
         state: minimal_state_for_request(request).await,
+    })
+}
+
+fn spawn_prompts_recursive<'a>(
+    out_dir: &'a str,
+    template_text: &'a str,
+    next: u32,
+    count: u32,
+    rid: Option<String>,
+) -> Pin<Box<dyn Future<Output = std::result::Result<(), Box<ProtocolEnvelope>>> + Send + 'a>> {
+    Box::pin(async move {
+        if next > count {
+            Ok(())
+        } else {
+            let file = format!("{}/agent_{:02}.md", out_dir, next);
+            fs::write(file, template_text.replace("{N}", &next.to_string()))
+                .await
+                .map_err(SwarmError::IoError)
+                .map_err(|e| to_protocol_failure(e, rid.clone()))?;
+
+            spawn_prompts_recursive(out_dir, template_text, next.saturating_add(1), count, rid)
+                .await
+        }
     })
 }
 
@@ -1165,36 +1187,8 @@ async fn handle_load_profile(
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
 
-    #[derive(Default)]
-    struct LoadStats {
-        success: u64,
-        empty: u64,
-        timeout: u64,
-        error: u64,
-    }
-
-    let iterations = (0..rounds).flat_map(|_| 1..=agents);
-    let stats = futures_util::stream::iter(iterations)
-        .fold(LoadStats::default(), |mut acc, agent_num| {
-            let db = db.clone();
-            let timeout_dur = tokio::time::Duration::from_millis(timeout_ms);
-            async move {
-                let claim = tokio::time::timeout(
-                    timeout_dur,
-                    db.claim_next_bead(&AgentId::new(RepoId::new("local"), agent_num)),
-                )
-                .await;
-
-                match claim {
-                    Ok(Ok(Some(_))) => acc.success = acc.success.saturating_add(1),
-                    Ok(Ok(None)) => acc.empty = acc.empty.saturating_add(1),
-                    Ok(Err(_)) => acc.error = acc.error.saturating_add(1),
-                    Err(_) => acc.timeout = acc.timeout.saturating_add(1),
-                };
-                acc
-            }
-        })
-        .await;
+    let stats =
+        load_profile_recursive(&db, 0, rounds, agents, timeout_ms, LoadStats::default()).await?;
 
     Ok(CommandSuccess {
         data: json!({
@@ -1208,6 +1202,94 @@ async fn handle_load_profile(
         next: "swarm status".to_string(),
         state: minimal_state_for_request(request).await,
     })
+}
+
+fn load_profile_recursive<'a>(
+    db: &'a SwarmDb,
+    current_round: u32,
+    total_rounds: u32,
+    agents_per_round: u32,
+    timeout_ms: u64,
+    stats: LoadStats,
+) -> Pin<Box<dyn Future<Output = std::result::Result<LoadStats, Box<ProtocolEnvelope>>> + Send + 'a>>
+{
+    Box::pin(async move {
+        if current_round >= total_rounds {
+            Ok(stats)
+        } else {
+            let round_stats = load_profile_round_recursive(
+                db,
+                1,
+                agents_per_round,
+                timeout_ms,
+                LoadStats::default(),
+            )
+            .await?;
+
+            let next_stats = LoadStats {
+                success: stats.success.saturating_add(round_stats.success),
+                empty: stats.empty.saturating_add(round_stats.empty),
+                timeout: stats.timeout.saturating_add(round_stats.timeout),
+                error: stats.error.saturating_add(round_stats.error),
+            };
+
+            load_profile_recursive(
+                db,
+                current_round.saturating_add(1),
+                total_rounds,
+                agents_per_round,
+                timeout_ms,
+                next_stats,
+            )
+            .await
+        }
+    })
+}
+
+fn load_profile_round_recursive<'a>(
+    db: &'a SwarmDb,
+    agent_num: u32,
+    total_agents: u32,
+    timeout_ms: u64,
+    mut stats: LoadStats,
+) -> Pin<Box<dyn Future<Output = std::result::Result<LoadStats, Box<ProtocolEnvelope>>> + Send + 'a>>
+{
+    Box::pin(async move {
+        if agent_num > total_agents {
+            Ok(stats)
+        } else {
+            let timeout_dur = tokio::time::Duration::from_millis(timeout_ms);
+            let claim = tokio::time::timeout(
+                timeout_dur,
+                db.claim_next_bead(&AgentId::new(RepoId::new("local"), agent_num)),
+            )
+            .await;
+
+            match claim {
+                Ok(Ok(Some(_))) => stats.success = stats.success.saturating_add(1),
+                Ok(Ok(None)) => stats.empty = stats.empty.saturating_add(1),
+                Ok(Err(_)) => stats.error = stats.error.saturating_add(1),
+                Err(_) => stats.timeout = stats.timeout.saturating_add(1),
+            };
+
+            load_profile_round_recursive(
+                db,
+                agent_num.saturating_add(1),
+                total_agents,
+                timeout_ms,
+                stats,
+            )
+            .await
+        }
+    })
+}
+
+#[derive(Default, Clone, Copy)]
+struct LoadStats {
+    success: u64,
+    empty: u64,
+    timeout: u64,
+    error: u64,
 }
 
 async fn handle_bootstrap(
@@ -1412,11 +1494,12 @@ fn now_ms() -> i64 {
 }
 
 fn standard_errors() -> Value {
-    let mut errors = serde_json::Map::new();
-    for (code, desc, fix) in ERROR_CODES {
-        errors.insert(code.to_string(), json!({"desc": desc, "fix": fix}));
-    }
-    Value::Object(errors)
+    Value::Object(
+        ERROR_CODES
+            .iter()
+            .map(|(code, desc, fix)| (code.to_string(), json!({"desc": desc, "fix": fix})))
+            .collect(),
+    )
 }
 
 fn dry_flag(request: &ProtocolRequest) -> bool {
