@@ -23,7 +23,74 @@ pub async fn run_agent(
     agent_id: &AgentId,
     stage_commands: &StageCommands,
 ) -> Result<()> {
-    run_agent_loop(db, agent_id, stage_commands).await
+    run_agent_loop_recursive(db, agent_id, stage_commands, MIN_POLL_BACKOFF).await
+}
+
+fn run_agent_loop_recursive<'a>(
+    db: &'a SwarmDb,
+    agent_id: &'a AgentId,
+    stage_commands: &'a StageCommands,
+    poll_backoff: Duration,
+) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        match db.get_agent_state(agent_id).await? {
+            None => {
+                error!("Agent {} not registered", agent_id);
+                Ok(())
+            }
+            Some(state) => match state.status {
+                swarm::AgentStatus::Idle => match db.claim_next_bead(agent_id).await? {
+                    Some(bead_id) => {
+                        info!("Agent {} claimed bead {}", agent_id, bead_id);
+                        run_agent_loop_recursive(db, agent_id, stage_commands, MIN_POLL_BACKOFF)
+                            .await
+                    }
+                    None => {
+                        info!("Agent {} found no available beads", agent_id);
+                        tokio::time::sleep(poll_backoff).await;
+                        run_agent_loop_recursive(
+                            db,
+                            agent_id,
+                            stage_commands,
+                            next_poll_backoff(poll_backoff),
+                        )
+                        .await
+                    }
+                },
+                swarm::AgentStatus::Done => {
+                    info!("Agent {} completed work", agent_id);
+                    Ok(())
+                }
+                swarm::AgentStatus::Working | swarm::AgentStatus::Waiting => {
+                    let progressed =
+                        process_work_state(db, agent_id, stage_commands, state).await?;
+                    if progressed {
+                        run_agent_loop_recursive(db, agent_id, stage_commands, MIN_POLL_BACKOFF)
+                            .await
+                    } else {
+                        tokio::time::sleep(poll_backoff).await;
+                        run_agent_loop_recursive(
+                            db,
+                            agent_id,
+                            stage_commands,
+                            next_poll_backoff(poll_backoff),
+                        )
+                        .await
+                    }
+                }
+                _ => {
+                    tokio::time::sleep(poll_backoff).await;
+                    run_agent_loop_recursive(
+                        db,
+                        agent_id,
+                        stage_commands,
+                        next_poll_backoff(poll_backoff),
+                    )
+                    .await
+                }
+            },
+        }
+    })
 }
 
 pub async fn run_smoke_once(db: &SwarmDb, agent_id: &AgentId) -> Result<()> {
@@ -48,62 +115,6 @@ pub async fn run_smoke_once(db: &SwarmDb, agent_id: &AgentId) -> Result<()> {
     }
 }
 
-async fn run_agent_loop(
-    db: &SwarmDb,
-    agent_id: &AgentId,
-    stage_commands: &StageCommands,
-) -> Result<()> {
-    let mut poll_backoff = MIN_POLL_BACKOFF;
-
-    loop {
-        match db.get_agent_state(agent_id).await? {
-            None => {
-                error!("Agent {} not registered", agent_id);
-                return Ok(());
-            }
-            Some(state) => match state.status {
-                swarm::AgentStatus::Idle => match db.claim_next_bead(agent_id).await? {
-                    Some(bead_id) => {
-                        info!("Agent {} claimed bead {}", agent_id, bead_id);
-                        poll_backoff = MIN_POLL_BACKOFF;
-                    }
-                    None => {
-                        info!("Agent {} found no available beads", agent_id);
-                        tokio::time::sleep(poll_backoff).await;
-                        poll_backoff = next_poll_backoff(poll_backoff);
-                    }
-                },
-                swarm::AgentStatus::Done => {
-                    info!("Agent {} completed work", agent_id);
-                    return Ok(());
-                }
-                swarm::AgentStatus::Working | swarm::AgentStatus::Waiting => {
-                    let progressed =
-                        process_work_state(db, agent_id, stage_commands, state).await?;
-                    if progressed {
-                        poll_backoff = apply_poll_backoff(progressed, poll_backoff);
-                    } else {
-                        tokio::time::sleep(poll_backoff).await;
-                        poll_backoff = apply_poll_backoff(progressed, poll_backoff);
-                    }
-                }
-                _ => {
-                    tokio::time::sleep(poll_backoff).await;
-                    poll_backoff = apply_poll_backoff(false, poll_backoff);
-                }
-            },
-        };
-    }
-}
-
-fn apply_poll_backoff(progressed: bool, current: Duration) -> Duration {
-    if progressed {
-        MIN_POLL_BACKOFF
-    } else {
-        next_poll_backoff(current)
-    }
-}
-
 fn next_poll_backoff(current: Duration) -> Duration {
     let doubled_ms = current.as_millis().saturating_mul(2);
     let bounded_ms = doubled_ms.min(MAX_POLL_BACKOFF.as_millis());
@@ -112,7 +123,7 @@ fn next_poll_backoff(current: Duration) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_poll_backoff, next_poll_backoff, MAX_POLL_BACKOFF, MIN_POLL_BACKOFF};
+    use super::{next_poll_backoff, MAX_POLL_BACKOFF, MIN_POLL_BACKOFF};
     use std::time::Duration;
 
     #[test]
@@ -131,18 +142,6 @@ mod tests {
 
         assert_eq!(at_cap, MAX_POLL_BACKOFF);
         assert_eq!(above_cap_input, MAX_POLL_BACKOFF);
-    }
-
-    #[test]
-    fn when_progress_resets_backoff_it_restarts_from_minimum() {
-        let mut backoff = MIN_POLL_BACKOFF;
-        backoff = next_poll_backoff(backoff);
-        backoff = next_poll_backoff(backoff);
-
-        assert_eq!(backoff, Duration::from_secs(1));
-
-        let reset_backoff = apply_poll_backoff(true, backoff);
-        assert_eq!(reset_backoff, Duration::from_millis(250));
     }
 }
 

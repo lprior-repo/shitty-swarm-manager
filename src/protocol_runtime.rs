@@ -1,5 +1,6 @@
 use crate::agent_runtime::{run_agent, run_smoke_once};
 use crate::config::{default_database_url_for_cli, load_config};
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -31,72 +32,81 @@ struct BatchAcc {
 
 pub async fn run_protocol_loop() -> std::result::Result<(), SwarmError> {
     let stdin = BufReader::new(tokio::io::stdin());
-    let mut lines = stdin.lines();
-    let mut stdout = tokio::io::stdout();
+    let lines = stdin.lines();
+    run_protocol_loop_recursive(lines).await
+}
 
-    loop {
-        let line_opt = lines.next_line().await.map_err(SwarmError::IoError)?;
-        match line_opt {
+fn run_protocol_loop_recursive(
+    mut lines: tokio::io::Lines<BufReader<tokio::io::Stdin>>,
+) -> Pin<Box<dyn Future<Output = std::result::Result<(), SwarmError>> + Send>> {
+    Box::pin(async move {
+        match lines.next_line().await.map_err(SwarmError::IoError)? {
             Some(line) if !line.trim().is_empty() => {
-                let started = Instant::now();
-                let maybe_rid = parse_rid(&line);
-                let parsed = serde_json::from_str::<ProtocolRequest>(&line).map_err(|err| {
-                    ProtocolEnvelope::error(
-                        maybe_rid.clone(),
-                        code::INVALID.to_string(),
-                        format!("Invalid request JSON: {}", err),
-                    )
-                    .with_fix("Ensure request is valid JSON with a 'cmd' field. Example: echo '{\"cmd\":\"doctor\"}' | swarm".to_string())
-                    .with_ctx(json!({"line": line}))
-                });
-
-                let (envelope, audit_cmd, audit_args) = match parsed {
-                    Ok(request) => {
-                        let command_name = request.cmd.clone();
-                        let command_args = Value::Object(request.args.clone());
-                        let rid = request.rid.clone();
-                        let result = execute_request(request).await;
-                        let env = match result {
-                            Ok(success) => ProtocolEnvelope::success(rid, success.data)
-                                .with_next(success.next)
-                                .with_state(success.state),
-                            Err(failure) => *failure,
-                        };
-                        (
-                            env.with_ms(started.elapsed().as_millis() as i64),
-                            command_name,
-                            command_args,
-                        )
-                    }
-                    Err(env) => (
-                        env.with_ms(started.elapsed().as_millis() as i64),
-                        "invalid".to_string(),
-                        json!({"raw": line}),
-                    ),
-                };
-
-                let response_text =
-                    serde_json::to_string(&envelope).map_err(SwarmError::SerializationError)?;
-                stdout
-                    .write_all(response_text.as_bytes())
-                    .await
-                    .map_err(SwarmError::IoError)?;
-                stdout.write_all(b"\n").await.map_err(SwarmError::IoError)?;
-
-                let _ = audit_request(
-                    &audit_cmd,
-                    maybe_rid.as_deref(),
-                    audit_args,
-                    envelope.ok,
-                    started.elapsed().as_millis() as u64,
-                    envelope.err.as_ref().map(|e| e.code.as_str()),
-                )
-                .await;
+                process_protocol_line(&line).await?;
+                run_protocol_loop_recursive(lines).await
             }
-            Some(_) => {}
-            None => return Ok(()),
+            Some(_) => run_protocol_loop_recursive(lines).await,
+            None => Ok(()),
         }
-    }
+    })
+}
+
+async fn process_protocol_line(line: &str) -> std::result::Result<(), SwarmError> {
+    let mut stdout = tokio::io::stdout();
+    let started = Instant::now();
+    let maybe_rid = parse_rid(line);
+    let parsed = serde_json::from_str::<ProtocolRequest>(line).map_err(|err| {
+        ProtocolEnvelope::error(
+            maybe_rid.clone(),
+            code::INVALID.to_string(),
+            format!("Invalid request JSON: {}", err),
+        )
+        .with_fix("Ensure request is valid JSON with a 'cmd' field. Example: echo '{\"cmd\":\"doctor\"}' | swarm".to_string())
+        .with_ctx(json!({"line": line}))
+    });
+
+    let (envelope, audit_cmd, audit_args) = match parsed {
+        Ok(request) => {
+            let command_name = request.cmd.clone();
+            let command_args = Value::Object(request.args.clone());
+            let rid = request.rid.clone();
+            let result = execute_request(request).await;
+            let env = match result {
+                Ok(success) => ProtocolEnvelope::success(rid, success.data)
+                    .with_next(success.next)
+                    .with_state(success.state),
+                Err(failure) => *failure,
+            };
+            (
+                env.with_ms(started.elapsed().as_millis() as i64),
+                command_name,
+                command_args,
+            )
+        }
+        Err(env) => (
+            env.with_ms(started.elapsed().as_millis() as i64),
+            "invalid".to_string(),
+            json!({"raw": line}),
+        ),
+    };
+
+    let response_text = serde_json::to_string(&envelope).map_err(SwarmError::SerializationError)?;
+    stdout
+        .write_all(response_text.as_bytes())
+        .await
+        .map_err(SwarmError::IoError)?;
+    stdout.write_all(b"\n").await.map_err(SwarmError::IoError)?;
+
+    let _ = audit_request(
+        &audit_cmd,
+        maybe_rid.as_deref(),
+        audit_args,
+        envelope.ok,
+        started.elapsed().as_millis() as u64,
+        envelope.err.as_ref().map(|e| e.code.as_str()),
+    )
+    .await;
+    Ok(())
 }
 
 async fn execute_request(
@@ -677,11 +687,23 @@ async fn handle_register(
     db.register_repo(&repo_id, repo_id.value(), ".")
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
-    for idx in 1..=count {
-        db.register_agent(&AgentId::new(repo_id.clone(), idx))
-            .await
-            .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
-    }
+
+    let register_results = futures_util::future::join_all((1..=count).map(|idx| {
+        let db = db.clone();
+        let repo_id = repo_id.clone();
+        let rid = request.rid.clone();
+        async move {
+            db.register_agent(&AgentId::new(repo_id, idx))
+                .await
+                .map_err(|e| to_protocol_failure(e, rid))
+        }
+    }))
+    .await;
+
+    // Verify all registrations succeeded functionally
+    register_results
+        .into_iter()
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
     Ok(CommandSuccess {
         data: json!({"repo": repo_id.value(), "count": count}),
@@ -1143,34 +1165,45 @@ async fn handle_load_profile(
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
 
-    let mut successful_claims = 0_u64;
-    let mut empty_claims = 0_u64;
-    let mut timeout_count = 0_u64;
-    let mut error_count = 0_u64;
-    for _round in 0..rounds {
-        for agent_num in 1..=agents {
-            let claim = tokio::time::timeout(
-                tokio::time::Duration::from_millis(timeout_ms),
-                db.claim_next_bead(&AgentId::new(RepoId::new("local"), agent_num)),
-            )
-            .await;
-            match claim {
-                Ok(Ok(Some(_))) => successful_claims = successful_claims.saturating_add(1),
-                Ok(Ok(None)) => empty_claims = empty_claims.saturating_add(1),
-                Ok(Err(_)) => error_count = error_count.saturating_add(1),
-                Err(_) => timeout_count = timeout_count.saturating_add(1),
-            }
-        }
+    #[derive(Default)]
+    struct LoadStats {
+        success: u64,
+        empty: u64,
+        timeout: u64,
+        error: u64,
     }
+
+    let iterations = (0..rounds).flat_map(|_| 1..=agents);
+    let stats = futures_util::stream::iter(iterations)
+        .fold(LoadStats::default(), |mut acc, agent_num| {
+            let db = db.clone();
+            let timeout_dur = tokio::time::Duration::from_millis(timeout_ms);
+            async move {
+                let claim = tokio::time::timeout(
+                    timeout_dur,
+                    db.claim_next_bead(&AgentId::new(RepoId::new("local"), agent_num)),
+                )
+                .await;
+
+                match claim {
+                    Ok(Ok(Some(_))) => acc.success = acc.success.saturating_add(1),
+                    Ok(Ok(None)) => acc.empty = acc.empty.saturating_add(1),
+                    Ok(Err(_)) => acc.error = acc.error.saturating_add(1),
+                    Err(_) => acc.timeout = acc.timeout.saturating_add(1),
+                };
+                acc
+            }
+        })
+        .await;
 
     Ok(CommandSuccess {
         data: json!({
             "agents": agents,
             "rounds": rounds,
-            "timeouts": timeout_count,
-            "errors": error_count,
-            "successful_claims": successful_claims,
-            "empty_claims": empty_claims,
+            "timeouts": stats.timeout,
+            "errors": stats.error,
+            "successful_claims": stats.success,
+            "empty_claims": stats.empty,
         }),
         next: "swarm status".to_string(),
         state: minimal_state_for_request(request).await,
