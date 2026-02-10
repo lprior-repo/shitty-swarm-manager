@@ -1,3 +1,5 @@
+#![allow(clippy::branches_sharing_code)]
+
 use crate::agent_runtime_support::{
     build_full_message_body, execute_stage, stage_failure_message_type, stage_primary_artifact,
     stage_success_message_type,
@@ -39,8 +41,8 @@ fn run_agent_loop_recursive<'a>(
                 Ok(())
             }
             Some(state) => match state.status {
-                swarm::AgentStatus::Idle => match db.claim_next_bead(agent_id).await? {
-                    Some(bead_id) => {
+                swarm::AgentStatus::Idle => {
+                    if let Some(bead_id) = db.claim_next_bead(agent_id).await? {
                         info!("Agent {} claimed bead {}", agent_id, bead_id);
                         crate::agent_runtime_support::create_workspace(
                             agent_id.number(),
@@ -49,8 +51,7 @@ fn run_agent_loop_recursive<'a>(
                         .await?;
                         run_agent_loop_recursive(db, agent_id, stage_commands, MIN_POLL_BACKOFF)
                             .await
-                    }
-                    None => {
+                    } else {
                         info!("Agent {} found no available beads", agent_id);
                         tokio::time::sleep(poll_backoff).await;
                         run_agent_loop_recursive(
@@ -61,7 +62,7 @@ fn run_agent_loop_recursive<'a>(
                         )
                         .await
                     }
-                },
+                }
                 swarm::AgentStatus::Done => {
                     info!("Agent {} completed work", agent_id);
                     Ok(())
@@ -83,7 +84,7 @@ fn run_agent_loop_recursive<'a>(
                         .await
                     }
                 }
-                _ => {
+                swarm::AgentStatus::Error => {
                     tokio::time::sleep(poll_backoff).await;
                     run_agent_loop_recursive(
                         db,
@@ -100,30 +101,27 @@ fn run_agent_loop_recursive<'a>(
 
 pub async fn run_smoke_once(db: &SwarmDb, agent_id: &AgentId) -> Result<()> {
     let maybe_bead = db.claim_next_bead(agent_id).await?;
-    match maybe_bead {
-        Some(bead_id) => {
-            println!("Running smoke pipeline for bead {}", bead_id);
-            let stages = [
-                Stage::RustContract,
-                Stage::Implement,
-                Stage::QaEnforcer,
-                Stage::RedQueen,
-            ];
-            run_smoke_stages_recursive(db, agent_id, &bead_id, &stages, 0).await?;
-            println!("Smoke pipeline completed for bead {}", bead_id);
-            Ok(())
-        }
-        None => {
-            println!("No pending p0 beads available for smoke run.");
-            Ok(())
-        }
+    if let Some(bead_id) = maybe_bead {
+        println!("Running smoke pipeline for bead {bead_id}");
+        let stages = [
+            Stage::RustContract,
+            Stage::Implement,
+            Stage::QaEnforcer,
+            Stage::RedQueen,
+        ];
+        run_smoke_stages_recursive(db, agent_id, &bead_id, &stages, 0).await?;
+        println!("Smoke pipeline completed for bead {bead_id}");
+        Ok(())
+    } else {
+        println!("No pending p0 beads available for smoke run.");
+        Ok(())
     }
 }
 
 fn next_poll_backoff(current: Duration) -> Duration {
     let doubled_ms = current.as_millis().saturating_mul(2);
     let bounded_ms = doubled_ms.min(MAX_POLL_BACKOFF.as_millis());
-    Duration::from_millis(bounded_ms as u64)
+    Duration::from_millis(u64::try_from(bounded_ms).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]
@@ -150,6 +148,7 @@ mod tests {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn process_work_state(
     db: &SwarmDb,
     agent_id: &AgentId,
@@ -221,7 +220,9 @@ async fn process_work_state(
         let status = result.as_str();
         let is_success = result.is_success();
 
-        let result_message = result.message().map_or_else(String::new, |s| s.to_string());
+        let result_message = result
+            .message()
+            .map_or_else(String::new, ToString::to_string);
 
         if used_fallback {
             db.store_stage_artifact(
@@ -252,7 +253,7 @@ async fn process_work_state(
         let stage_artifacts_result = db.get_stage_artifacts(stage_history_id).await;
         let stage_artifacts = stage_artifacts_result
             .into_iter()
-            .flat_map(|artifacts| artifacts.into_iter())
+            .flat_map(IntoIterator::into_iter)
             .collect::<Vec<_>>();
         let artifact_types: Vec<String> = stage_artifacts
             .iter()
@@ -273,7 +274,7 @@ async fn process_work_state(
             stage,
             attempt,
             result.clone(),
-            started.elapsed().as_millis() as u64,
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         )
         .await?;
 
@@ -349,7 +350,7 @@ fn run_smoke_stages_recursive<'a>(
                             stage,
                             1,
                             StageResult::Passed,
-                            started.elapsed().as_millis() as u64,
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                         )
                         .await?;
                         run_smoke_stages_recursive(db, agent_id, bead_id, stages, idx + 1).await

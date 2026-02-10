@@ -37,10 +37,9 @@ pub fn parse_swarm_config(
     max_attempts: i32,
     claim_label: String,
     swarm_started_at: Option<chrono::DateTime<chrono::Utc>>,
-    status_str: String,
+    status_str: &str,
 ) -> Result<SwarmConfig> {
-    let swarm_status =
-        SwarmStatus::try_from(status_str.as_str()).map_err(SwarmError::DatabaseError)?;
+    let swarm_status = SwarmStatus::try_from(status_str).map_err(SwarmError::DatabaseError)?;
 
     Ok(SwarmConfig {
         repo_id: crate::types::RepoId::new("local"),
@@ -52,11 +51,11 @@ pub fn parse_swarm_config(
     })
 }
 
-pub fn to_u32_i32(value: i32) -> u32 {
+pub const fn to_u32_i32(value: i32) -> u32 {
     if value < 0 {
         0
     } else {
-        value as u32
+        value.cast_unsigned()
     }
 }
 

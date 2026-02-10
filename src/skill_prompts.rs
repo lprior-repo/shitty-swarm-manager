@@ -75,6 +75,7 @@ You are an adversarial tester. Your goal is to "break" the code by finding subtl
 - The code is resilient to adversarial inputs.
 - A detailed report of the inspection is produced."#;
 
+#[must_use]
 pub fn get_skill_prompt(skill_name: &str) -> Option<String> {
     match skill_name {
         "rust-contract" => Some(RUST_CONTRACT_SKILL.to_string()),

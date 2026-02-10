@@ -11,7 +11,8 @@ pub enum Stage {
 }
 
 impl Stage {
-    pub fn as_str(&self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::RustContract => "rust-contract",
             Self::Implement => "implement",
@@ -21,7 +22,8 @@ impl Stage {
         }
     }
 
-    pub fn next(&self) -> Option<Self> {
+    #[must_use]
+    pub const fn next(&self) -> Option<Self> {
         match self {
             Self::RustContract => Some(Self::Implement),
             Self::Implement => Some(Self::QaEnforcer),
@@ -48,7 +50,7 @@ impl TryFrom<&str> for Stage {
             "qa-enforcer" => Ok(Self::QaEnforcer),
             "red-queen" => Ok(Self::RedQueen),
             "done" => Ok(Self::Done),
-            _ => Err(format!("Unknown stage: {}", s)),
+            _ => Err(format!("Unknown stage: {s}")),
         }
     }
 }
@@ -62,6 +64,7 @@ pub enum StageResult {
 }
 
 impl StageResult {
+    #[must_use]
     pub fn as_str(&self) -> String {
         match self {
             Self::Started => "started".to_string(),
@@ -71,6 +74,7 @@ impl StageResult {
         }
     }
 
+    #[must_use]
     pub fn message(&self) -> Option<&str> {
         match self {
             Self::Failed(msg) | Self::Error(msg) => Some(msg),
@@ -78,7 +82,8 @@ impl StageResult {
         }
     }
 
-    pub fn is_success(&self) -> bool {
+    #[must_use]
+    pub const fn is_success(&self) -> bool {
         matches!(self, Self::Passed)
     }
 }

@@ -281,6 +281,7 @@ Use global overrides (`--database-url`, `--database-url-pass`) when environment 
 
 Move exactly one bead from `pending` to terminal state (`completed` or `blocked`) through a fully auditable, retry-safe, AI-readable pipeline."#;
 
+#[must_use]
 pub fn get_agent_prompt(agent_id: u32) -> String {
     AGENT_PROMPT_TEMPLATE
         .replace("#{N}", &agent_id.to_string())

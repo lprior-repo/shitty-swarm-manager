@@ -21,6 +21,11 @@ pub struct GateExecutionCache {
 }
 
 impl GateExecutionCache {
+    /// Creates a new gate execution cache for the given source directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::ConfigError` if the source directory does not exist.
     pub fn new<P: AsRef<Path>>(source_dir: P) -> Result<Self> {
         let source_dir = source_dir.as_ref().to_path_buf();
         if !source_dir.exists() {
@@ -45,10 +50,10 @@ impl GateExecutionCache {
         for path in files {
             match tokio::fs::read(&path).await {
                 Ok(contents) => {
-                    let rel = path
-                        .strip_prefix(&self.source_dir)
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+                    let rel = path.strip_prefix(&self.source_dir).map_or_else(
+                        |_| path.to_string_lossy().into_owned(),
+                        |p| p.to_string_lossy().into_owned(),
+                    );
                     hasher.update(rel.as_bytes());
                     hasher.update(&contents);
                 }
@@ -85,9 +90,7 @@ impl GateExecutionCache {
 
     fn path_has_allowed_extension(&self, path: &Path) -> bool {
         path.extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| self.extensions.contains(&ext))
-            .unwrap_or(false)
+            .is_some_and(|ext| ext.to_str().is_some_and(|e| self.extensions.contains(&e)))
     }
 
     pub async fn get(&self, task_name: &str) -> Option<(bool, Option<i32>, String, String)> {
@@ -107,6 +110,11 @@ impl GateExecutionCache {
         })
     }
 
+    /// Stores a gate execution result in the cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::DatabaseError` if the fingerprint calculation fails.
     pub async fn put(
         &self,
         task_name: String,
@@ -124,8 +132,7 @@ impl GateExecutionCache {
             stderr,
         };
 
-        let mut entries = self.entries.write().await;
-        entries.insert(task_name.clone(), entry);
+        self.entries.write().await.insert(task_name.clone(), entry);
         debug!("Cached result for task {}", task_name);
         Ok(())
     }

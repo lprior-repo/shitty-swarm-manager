@@ -1,6 +1,7 @@
 use crate::BeadId;
 use std::collections::HashMap;
 
+#[must_use]
 pub fn contract_document_and_artifacts(bead_id: &BeadId) -> (String, HashMap<String, String>) {
     let requirements = format!(
         "- Implement bead {bead_id}\n- Preserve deterministic stage transitions\n- Persist artifacts for downstream stages"
@@ -29,7 +30,7 @@ pub fn contract_document_and_artifacts(bead_id: &BeadId) -> (String, HashMap<Str
         "Successful artifact handoff between stages and readable full message payloads".to_string();
 
     let contract_document = format!(
-        r#"# Contract for {bead_id}
+        r"# Contract for {bead_id}
 
 ## Goal
 Deliver the bead with explicit behavior boundaries and failure semantics.
@@ -73,7 +74,7 @@ Deliver the bead with explicit behavior boundaries and failure semantics.
 
 ## Success Metrics
 {success_metrics}
-"#
+"
     );
 
     let artifacts = [
@@ -94,6 +95,7 @@ Deliver the bead with explicit behavior boundaries and failure semantics.
     (contract_document, artifacts)
 }
 
+#[must_use]
 pub fn implementation_scaffold(bead_id: &BeadId, contract_context: &str) -> String {
     format!(
         r#"// Implementation scaffold for {bead_id}

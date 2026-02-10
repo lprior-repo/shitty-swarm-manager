@@ -111,6 +111,11 @@ struct ResourceLockRow {
 }
 
 impl SwarmDb {
+    /// Retrieves command audit history.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::DatabaseError` if the database query fails.
     pub async fn get_command_history(
         &self,
         limit: i64,
@@ -149,7 +154,7 @@ impl SwarmDb {
                         row.cmd,
                         row.args,
                         row.ok,
-                        row.ms as u64,
+                        u64::from(row.ms.cast_unsigned()),
                         row.error_code,
                     )
                 })
@@ -157,6 +162,11 @@ impl SwarmDb {
         })
     }
 
+    /// Lists active resource locks in the database.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::DatabaseError` if the database query fails.
     pub async fn list_active_resource_locks(&self) -> Result<Vec<(String, String, i64, i64)>> {
         sqlx::query("DELETE FROM resource_locks WHERE until_at <= NOW()")
             .execute(self.pool())
@@ -185,12 +195,18 @@ impl SwarmDb {
         })
     }
 
+    /// Retrieves the current state of a specific agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::DatabaseError` if the database query fails.
     pub async fn get_agent_state(&self, agent_id: &AgentId) -> Result<Option<AgentState>> {
+        let agent_id_number = agent_id.number();
         sqlx::query_as::<_, AgentStateRow>(
             "SELECT bead_id, current_stage, stage_started_at, status, last_update, implementation_attempt, feedback
              FROM agent_state WHERE agent_id = $1",
         )
-            .bind(agent_id.number() as i32)
+            .bind(agent_id_number.cast_signed())
             .fetch_optional(self.pool())
             .await
             .map_err(|e| SwarmError::DatabaseError(format!("Failed to get agent state: {e}")))
@@ -214,6 +230,11 @@ impl SwarmDb {
             })
     }
 
+    /// Gets a list of available agents for a repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::DatabaseError` if the database query fails.
     pub async fn get_available_agents(&self, repo_id: &RepoId) -> Result<Vec<AvailableAgent>> {
         let local_repo = repo_id.clone();
         sqlx::query_as::<_, AvailableAgentRow>(
@@ -241,6 +262,11 @@ impl SwarmDb {
             })
     }
 
+    /// Retrieves the current progress summary for the swarm.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::DatabaseError` if the database query fails.
     pub async fn get_progress(&self, _repo_id: &RepoId) -> Result<ProgressSummary> {
         sqlx::query_as::<_, ProgressRow>(
             "SELECT done_agents, working_agents, waiting_agents, error_agents, idle_agents, total_agents
@@ -250,15 +276,20 @@ impl SwarmDb {
             .await
             .map_err(|e| SwarmError::DatabaseError(format!("Failed to get progress: {e}")))
             .map(|row| ProgressSummary {
-                completed: row.done as u64,
-                working: row.working as u64,
-                waiting: row.waiting as u64,
-                errors: row.error as u64,
-                idle: row.idle as u64,
-                total_agents: row.total as u64,
+                completed: row.done.cast_unsigned(),
+                working: row.working.cast_unsigned(),
+                waiting: row.waiting.cast_unsigned(),
+                errors: row.error.cast_unsigned(),
+                idle: row.idle.cast_unsigned(),
+                total_agents: row.total.cast_unsigned(),
             })
     }
 
+    /// Retrieves the swarm configuration for a repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::DatabaseError` if the database query fails.
     pub async fn get_config(&self, _repo_id: &RepoId) -> Result<SwarmConfig> {
         sqlx::query_as::<_, SwarmConfigRow>(
             "SELECT max_agents, max_implementation_attempts, claim_label, swarm_started_at, swarm_status
@@ -273,15 +304,25 @@ impl SwarmDb {
                     row.max_implementation_attempts,
                     row.claim_label,
                     row.swarm_started_at,
-                    row.swarm_status,
+                    &row.swarm_status,
                 )
             })
     }
 
-    pub async fn list_repos(&self) -> Result<Vec<(RepoId, String)>> {
+    /// Lists all registered repositories.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::DatabaseError` if the database query fails.
+    pub fn list_repos(&self) -> Result<Vec<(RepoId, String)>> {
         Ok(vec![(RepoId::new("local"), "local".to_string())])
     }
 
+    /// Gets all active agents across all repositories.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::DatabaseError` if the database query fails.
     pub async fn get_all_active_agents(
         &self,
     ) -> Result<Vec<(RepoId, u32, Option<String>, String)>> {
@@ -305,15 +346,26 @@ impl SwarmDb {
         })
     }
 
+    /// Claims the next available bead for an agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::DatabaseError` if the database query fails.
     pub async fn claim_next_bead(&self, agent_id: &AgentId) -> Result<Option<BeadId>> {
+        let claim_agent_id = agent_id.number();
         sqlx::query_scalar::<_, Option<String>>("SELECT claim_next_p0_bead($1)")
-            .bind(agent_id.number() as i32)
+            .bind(claim_agent_id.cast_signed())
             .fetch_one(self.pool())
             .await
             .map_err(|e| SwarmError::DatabaseError(format!("Failed to claim next bead: {e}")))
             .map(|value| value.map(BeadId::new))
     }
 
+    /// Retrieves beads that require feedback from agents.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::DatabaseError` if the database query fails.
     pub async fn get_feedback_required(
         &self,
     ) -> Result<Vec<(String, u32, String, u32, Option<String>, Option<String>)>> {
@@ -341,6 +393,11 @@ impl SwarmDb {
         })
     }
 
+    /// Retrieves all artifacts for a specific stage history.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::DatabaseError` if the database query fails.
     pub async fn get_stage_artifacts(&self, stage_history_id: i64) -> Result<Vec<StageArtifact>> {
         sqlx::query_as::<_, StageArtifactRow>(
             "SELECT id, stage_history_id, artifact_type, content, metadata, created_at, content_hash
@@ -371,6 +428,11 @@ impl SwarmDb {
         })
     }
 
+    /// Retrieves artifacts of a specific type for a bead.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::DatabaseError` if the database query fails.
     pub async fn get_bead_artifacts_by_type(
         &self,
         bead_id: &BeadId,
@@ -409,6 +471,11 @@ impl SwarmDb {
         })
     }
 
+    /// Retrieves the first artifact of a specific type for a bead.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::DatabaseError` if the database query fails.
     pub async fn get_first_bead_artifact_by_type(
         &self,
         bead_id: &BeadId,
@@ -448,6 +515,11 @@ impl SwarmDb {
         })
     }
 
+    /// Checks if a bead has any artifacts of a specific type.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::DatabaseError` if the database query fails.
     pub async fn bead_has_artifact_type(
         &self,
         bead_id: &BeadId,
@@ -470,6 +542,11 @@ impl SwarmDb {
         })
     }
 
+    /// Retrieves unread messages for an agent, optionally filtered by bead.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::DatabaseError` if the database query fails.
     pub async fn get_unread_messages(
         &self,
         agent_id: &AgentId,
@@ -481,7 +558,7 @@ impl SwarmDb {
              FROM get_unread_messages($1, $2, $3)",
         )
         .bind(agent_id.repo_id().value())
-        .bind(agent_id.number() as i32)
+        .bind(agent_id.number().cast_signed())
         .bind(bead_id.map(BeadId::value))
         .fetch_all(self.pool())
         .await
@@ -511,6 +588,11 @@ impl SwarmDb {
         })
     }
 
+    /// Retrieves all unread messages across the system.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::DatabaseError` if the database query fails.
     pub async fn get_all_unread_messages(&self) -> Result<Vec<AgentMessage>> {
         sqlx::query_as::<_, AgentMessageRow>(
             "SELECT id, from_repo_id, from_agent_id, to_repo_id, to_agent_id, bead_id, message_type,

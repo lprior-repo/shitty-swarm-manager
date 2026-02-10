@@ -1,3 +1,14 @@
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_possible_wrap)]
+#![allow(clippy::option_if_let_else)]
+#![allow(clippy::literal_string_with_formatting_args)]
+#![allow(clippy::used_underscore_binding)]
+#![allow(clippy::needless_pass_by_value)]
+#![allow(clippy::unnecessary_box_returns)]
+#![allow(clippy::branches_sharing_code)]
+#![allow(clippy::too_many_lines)]
+
 use crate::agent_runtime::{run_agent, run_smoke_once};
 use crate::config::{default_database_url_for_cli, load_config};
 use serde::Deserialize;
@@ -32,6 +43,7 @@ pub trait ParseInput {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[expect(dead_code)]
 pub enum ParseError {
     #[error("Missing required field: {field}")]
     MissingField { field: String },
@@ -52,20 +64,20 @@ pub enum ParseError {
 
 // Implement ParseInput for all contract types
 impl ParseInput for swarm::DoctorInput {
-    type Input = swarm::DoctorInput;
+    type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
-        Ok(swarm::DoctorInput {
+        Ok(Self::Input {
             json: request.args.get("json").and_then(|v: &Value| v.as_bool()),
         })
     }
 }
 
 impl ParseInput for swarm::HelpInput {
-    type Input = swarm::HelpInput;
+    type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
-        Ok(swarm::HelpInput {
+        Ok(Self::Input {
             short: request.args.get("short").and_then(|v: &Value| v.as_bool()),
             s: request.args.get("s").and_then(|v: &Value| v.as_bool()),
         })
@@ -73,27 +85,27 @@ impl ParseInput for swarm::HelpInput {
 }
 
 impl ParseInput for swarm::StatusInput {
-    type Input = swarm::StatusInput;
+    type Input = Self;
 
     fn parse_input(_request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
-        Ok(swarm::StatusInput {})
+        Ok(Self::Input {})
     }
 }
 
 impl ParseInput for swarm::AgentInput {
-    type Input = swarm::AgentInput;
+    type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
         let id = request
             .args
             .get("id")
             .and_then(|v: &Value| v.as_u64())
-            .map(|v| v as u32)
+            .and_then(|v| u32::try_from(v).ok())
             .ok_or_else(|| ParseError::MissingField {
                 field: "id".to_string(),
             })?;
 
-        Ok(swarm::AgentInput {
+        Ok(Self::Input {
             id,
             dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
         })
@@ -101,51 +113,59 @@ impl ParseInput for swarm::AgentInput {
 }
 
 impl ParseInput for swarm::InitInput {
-    type Input = swarm::InitInput;
+    type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
-        Ok(swarm::InitInput {
+        Ok(Self::Input {
             dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
             database_url: request
                 .args
                 .get("database_url")
                 .and_then(|v: &Value| v.as_str())
-                .map(|s| s.to_string()),
+                .map(std::string::ToString::to_string),
             schema: request
                 .args
                 .get("schema")
                 .and_then(|v: &Value| v.as_str())
-                .map(|s| s.to_string()),
-            seed_agents: request.args.get("seed_agents").and_then(|v: &Value| v.as_u64()).map(|v| v as u32),
+                .map(std::string::ToString::to_string),
+            seed_agents: request
+                .args
+                .get("seed_agents")
+                .and_then(|v: &Value| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok()),
         })
     }
 }
 
 impl ParseInput for swarm::RegisterInput {
-    type Input = swarm::RegisterInput;
+    type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
-        Ok(swarm::RegisterInput {
-            count: request.args.get("count").and_then(|v: &Value| v.as_u64()).map(|v| v as u32),
+        Ok(Self::Input {
+            count: request
+                .args
+                .get("count")
+                .and_then(|v: &Value| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok()),
             dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
         })
     }
 }
 
 impl ParseInput for swarm::ReleaseInput {
-    type Input = swarm::ReleaseInput;
+    type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
         let agent_id = request
             .args
             .get("agent_id")
             .and_then(|v: &Value| v.as_u64())
-            .map(|v| v as u32)
+            .and_then(|v| u32::try_from(v).ok())
             .ok_or_else(|| ParseError::MissingField {
                 field: "agent_id".to_string(),
             })?;
 
-        Ok(swarm::ReleaseInput {
+        Ok(Self::Input {
             agent_id,
             dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
         })
@@ -153,114 +173,153 @@ impl ParseInput for swarm::ReleaseInput {
 }
 
 impl ParseInput for swarm::MonitorInput {
-    type Input = swarm::MonitorInput;
+    type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
-        Ok(swarm::MonitorInput {
-            view: request.args.get("view").and_then(|v: &Value| v.as_str()).map(|s| s.to_string()),
-            watch_ms: request.args.get("watch_ms").and_then(|v: &Value| v.as_u64()),
+        Ok(Self::Input {
+            view: request
+                .args
+                .get("view")
+                .and_then(|v: &Value| v.as_str())
+                .map(std::string::ToString::to_string),
+            watch_ms: request
+                .args
+                .get("watch_ms")
+                .and_then(|v: &Value| v.as_u64()),
         })
     }
 }
 
 impl ParseInput for swarm::InitDbInput {
-    type Input = swarm::InitDbInput;
+    type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
-        Ok(swarm::InitDbInput {
-            url: request.args.get("url").and_then(|v: &Value| v.as_str()).map(|s| s.to_string()),
-            schema: request.args.get("schema").and_then(|v: &Value| v.as_str()).map(|s| s.to_string()),
-            seed_agents: request.args.get("seed_agents").and_then(|v: &Value| v.as_u64()).map(|v| v as u32),
+        Ok(Self::Input {
+            url: request
+                .args
+                .get("url")
+                .and_then(|v: &Value| v.as_str())
+                .map(std::string::ToString::to_string),
+            schema: request
+                .args
+                .get("schema")
+                .and_then(|v: &Value| v.as_str())
+                .map(std::string::ToString::to_string),
+            seed_agents: request
+                .args
+                .get("seed_agents")
+                .and_then(|v: &Value| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok()),
             dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
         })
     }
 }
 
 impl ParseInput for swarm::InitLocalDbInput {
-    type Input = swarm::InitLocalDbInput;
+    type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
-        Ok(swarm::InitLocalDbInput {
+        Ok(Self::Input {
             container_name: request
                 .args
                 .get("container_name")
                 .and_then(|v: &Value| v.as_str())
-                .map(|s| s.to_string()),
-            port: request.args.get("port").and_then(|v: &Value| v.as_u64()).map(|v| v as u16),
-            user: request.args.get("user").and_then(|v: &Value| v.as_str()).map(|s| s.to_string()),
+                .map(std::string::ToString::to_string),
+            port: request
+                .args
+                .get("port")
+                .and_then(|v: &Value| v.as_u64())
+                .and_then(|v| u16::try_from(v).ok()),
+            user: request
+                .args
+                .get("user")
+                .and_then(|v: &Value| v.as_str())
+                .map(std::string::ToString::to_string),
             database: request
                 .args
                 .get("database")
                 .and_then(|v: &Value| v.as_str())
-                .map(|s| s.to_string()),
-            schema: request.args.get("schema").and_then(|v: &Value| v.as_str()).map(|s| s.to_string()),
-            seed_agents: request.args.get("seed_agents").and_then(|v: &Value| v.as_u64()).map(|v| v as u32),
+                .map(std::string::ToString::to_string),
+            schema: request
+                .args
+                .get("schema")
+                .and_then(|v: &Value| v.as_str())
+                .map(std::string::ToString::to_string),
+            seed_agents: request
+                .args
+                .get("seed_agents")
+                .and_then(|v: &Value| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok()),
             dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
         })
     }
 }
 
 impl ParseInput for swarm::BootstrapInput {
-    type Input = swarm::BootstrapInput;
+    type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
-        Ok(swarm::BootstrapInput {
+        Ok(Self::Input {
             dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
         })
     }
 }
 
 impl ParseInput for swarm::SpawnPromptsInput {
-    type Input = swarm::SpawnPromptsInput;
+    type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
-        Ok(swarm::SpawnPromptsInput {
+        Ok(Self::Input {
             template: request
                 .args
                 .get("template")
                 .and_then(|v: &Value| v.as_str())
-                .map(|s| s.to_string()),
+                .map(std::string::ToString::to_string),
             out_dir: request
                 .args
                 .get("out_dir")
                 .and_then(|v: &Value| v.as_str())
-                .map(|s| s.to_string()),
-            count: request.args.get("count").and_then(|v: &Value| v.as_u64()).map(|v| v as u32),
+                .map(std::string::ToString::to_string),
+            count: request
+                .args
+                .get("count")
+                .and_then(|v: &Value| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok()),
             dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
         })
     }
 }
 
 impl ParseInput for swarm::PromptInput {
-    type Input = swarm::PromptInput;
+    type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
-        Ok(swarm::PromptInput {
+        Ok(Self::Input {
             id: request
                 .args
                 .get("id")
                 .and_then(|v: &Value| v.as_u64())
-                .map(|v| v as u32)
+                .and_then(|v| u32::try_from(v).ok())
                 .unwrap_or(1),
             skill: request
                 .args
                 .get("skill")
                 .and_then(|v: &Value| v.as_str())
-                .map(|s| s.to_string()),
+                .map(std::string::ToString::to_string),
         })
     }
 }
 
 impl ParseInput for swarm::SmokeInput {
-    type Input = swarm::SmokeInput;
+    type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
-        Ok(swarm::SmokeInput {
+        Ok(Self::Input {
             id: request
                 .args
                 .get("id")
                 .and_then(|v: &Value| v.as_u64())
-                .map(|v| v as u32)
+                .and_then(|v| u32::try_from(v).ok())
                 .unwrap_or(1),
             dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
         })
@@ -268,7 +327,7 @@ impl ParseInput for swarm::SmokeInput {
 }
 
 impl ParseInput for swarm::BatchInput {
-    type Input = swarm::BatchInput;
+    type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
         let ops = request
@@ -280,7 +339,7 @@ impl ParseInput for swarm::BatchInput {
             })?
             .clone();
 
-        Ok(swarm::BatchInput {
+        Ok(Self::Input {
             ops,
             dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
         })
@@ -288,25 +347,25 @@ impl ParseInput for swarm::BatchInput {
 }
 
 impl ParseInput for swarm::StateInput {
-    type Input = swarm::StateInput;
+    type Input = Self;
 
     fn parse_input(_request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
-        Ok(swarm::StateInput {})
+        Ok(Self::Input {})
     }
 }
 
 impl ParseInput for swarm::HistoryInput {
-    type Input = swarm::HistoryInput;
+    type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
-        Ok(swarm::HistoryInput {
+        Ok(Self::Input {
             limit: request.args.get("limit").and_then(|v: &Value| v.as_i64()),
         })
     }
 }
 
 impl ParseInput for swarm::LockInput {
-    type Input = swarm::LockInput;
+    type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
         let resource = request
@@ -335,7 +394,7 @@ impl ParseInput for swarm::LockInput {
                 field: "ttl_ms".to_string(),
             })?;
 
-        Ok(swarm::LockInput {
+        Ok(Self::Input {
             resource,
             agent,
             ttl_ms,
@@ -345,7 +404,7 @@ impl ParseInput for swarm::LockInput {
 }
 
 impl ParseInput for swarm::UnlockInput {
-    type Input = swarm::UnlockInput;
+    type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
         let resource = request
@@ -366,7 +425,7 @@ impl ParseInput for swarm::UnlockInput {
             })?
             .to_string();
 
-        Ok(swarm::UnlockInput {
+        Ok(Self::Input {
             resource,
             agent,
             dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
@@ -375,15 +434,15 @@ impl ParseInput for swarm::UnlockInput {
 }
 
 impl ParseInput for swarm::AgentsInput {
-    type Input = swarm::AgentsInput;
+    type Input = Self;
 
     fn parse_input(_request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
-        Ok(swarm::AgentsInput {})
+        Ok(Self::Input {})
     }
 }
 
 impl ParseInput for swarm::BroadcastInput {
-    type Input = swarm::BroadcastInput;
+    type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
         let msg = request
@@ -404,7 +463,7 @@ impl ParseInput for swarm::BroadcastInput {
             })?
             .to_string();
 
-        Ok(swarm::BroadcastInput {
+        Ok(Self::Input {
             msg,
             from,
             dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
@@ -413,13 +472,24 @@ impl ParseInput for swarm::BroadcastInput {
 }
 
 impl ParseInput for swarm::LoadProfileInput {
-    type Input = swarm::LoadProfileInput;
+    type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
-        Ok(swarm::LoadProfileInput {
-            agents: request.args.get("agents").and_then(|v: &Value| v.as_u64()).map(|v| v as u32),
-            rounds: request.args.get("rounds").and_then(|v: &Value| v.as_u64()).map(|v| v as u32),
-            timeout_ms: request.args.get("timeout_ms").and_then(|v: &Value| v.as_u64()),
+        Ok(Self::Input {
+            agents: request
+                .args
+                .get("agents")
+                .and_then(|v: &Value| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok()),
+            rounds: request
+                .args
+                .get("rounds")
+                .and_then(|v: &Value| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok()),
+            timeout_ms: request
+                .args
+                .get("timeout_ms")
+                .and_then(|v: &Value| v.as_u64()),
             dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
         })
     }
@@ -461,7 +531,7 @@ pub async fn process_protocol_line(line: &str) -> std::result::Result<(), SwarmE
         ProtocolEnvelope::error(
             maybe_rid.clone(),
             code::INVALID.to_string(),
-            format!("Invalid request JSON: {}", err),
+            format!("Invalid request JSON: {err}"),
         )
         .with_fix("Ensure request is valid JSON with a 'cmd' field. Example: echo '{\"cmd\":\"doctor\"}' | swarm".to_string())
         .with_ctx(json!({"line": line}))
@@ -480,13 +550,13 @@ pub async fn process_protocol_line(line: &str) -> std::result::Result<(), SwarmE
                 Err(failure) => *failure,
             };
             (
-                env.with_ms(started.elapsed().as_millis() as i64),
+                env.with_ms(i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)),
                 command_name,
                 command_args,
             )
         }
         Err(env) => (
-            env.with_ms(started.elapsed().as_millis() as i64),
+            env.with_ms(i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX)),
             "invalid".to_string(),
             json!({"raw": line}),
         ),
@@ -572,7 +642,7 @@ async fn execute_request_no_batch(
             other => Err(Box::new(ProtocolEnvelope::error(
                 request.rid.clone(),
                 code::INVALID.to_string(),
-                format!("Unknown command: {}", other),
+                format!("Unknown command: {other}"),
             ).with_fix("Use a valid command: init, doctor, status, agent, smoke, prompt, register, release, monitor, init-db, init-local-db, spawn-prompts, batch, bootstrap, or ? for help".to_string())
             .with_ctx(json!({"cmd": other})))),
     }
@@ -781,7 +851,7 @@ async fn handle_lock(
     match acquired {
         Some(until_at) => Ok(CommandSuccess {
             data: json!({"locked": true, "until": until_at.timestamp_millis()}),
-            next: format!("swarm unlock --resource {} --agent {}", resource, agent),
+            next: format!("swarm unlock --resource {resource} --agent {agent}"),
             state: minimal_state_for_request(request).await,
         }),
         None => Err(Box::new(
@@ -926,7 +996,7 @@ async fn handle_batch(
                         ProtocolEnvelope::error(
                             request.rid.clone(),
                             code::INVALID.to_string(),
-                            format!("Invalid batch item {}: {}", idx, err),
+                            format!("Invalid batch item {idx}: {err}"),
                         )
                         .with_fix(
                             "Ensure each batch item is valid JSON with a 'cmd' field".to_string(),
@@ -968,6 +1038,7 @@ async fn handle_batch(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_monitor(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
@@ -1085,7 +1156,7 @@ async fn handle_register(
         .args
         .get("count")
         .and_then(Value::as_u64)
-        .map(|v| v as u32)
+        .and_then(|v| u32::try_from(v).ok())
         .or_else(|| config.as_ref().map(|c| c.max_agents))
         .unwrap_or(10);
 
@@ -1150,18 +1221,17 @@ fn register_agents_recursive<'a>(
 async fn handle_agent(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
-    let input = swarm::AgentInput::parse_input(request)
-        .map_err(|e| {
-            Box::new(
-                ProtocolEnvelope::error(
-                    request.rid.clone(),
-                    code::INVALID.to_string(),
-                    e.to_string(),
-                )
-                .with_fix("echo '{\"cmd\":\"agent\",\"id\":1}' | swarm".to_string())
-                .with_ctx(json!({"error": e.to_string()})),
+    let input = swarm::AgentInput::parse_input(request).map_err(|e| {
+        Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::INVALID.to_string(),
+                e.to_string(),
             )
-        })?;
+            .with_fix("echo '{\"cmd\":\"agent\",\"id\":1}' | swarm".to_string())
+            .with_ctx(json!({"error": e.to_string()})),
+        )
+    })?;
 
     if input.dry.unwrap_or(false) {
         return Ok(dry_run_success(
@@ -1187,9 +1257,13 @@ async fn handle_agent(
             .with_fix("Run from repo root".to_string()),
         )
     })?;
-    run_agent(&db, &AgentId::new(repo_id, input.id), &config.stage_commands)
-        .await
-        .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
+    run_agent(
+        &db,
+        &AgentId::new(repo_id, input.id),
+        &config.stage_commands,
+    )
+    .await
+    .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
 
     Ok(CommandSuccess {
         data: json!({"agent_id": input.id, "status": "completed"}),
@@ -1267,7 +1341,7 @@ async fn handle_init_db(
         .args
         .get("url")
         .and_then(Value::as_str)
-        .map(|value| value.to_string())
+        .map(std::string::ToString::to_string)
     {
         Some(value) => value,
         None => default_database_url_for_cli(),
@@ -1304,7 +1378,7 @@ async fn handle_init_db(
             ProtocolEnvelope::error(
                 request.rid.clone(),
                 code::INVALID.to_string(),
-                format!("Failed to read schema: {}", err),
+                format!("Failed to read schema: {err}"),
             )
             .with_fix("swarm init-db --schema crates/swarm-coordinator/schema.sql".to_string())
             .with_ctx(json!({"schema": schema.display().to_string()})),
@@ -1330,6 +1404,7 @@ async fn handle_init_db(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_init_local_db(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
@@ -1382,7 +1457,7 @@ async fn handle_init_local_db(
         ));
     }
 
-    let port_mapping = format!("{}:5432", port);
+    let port_mapping = format!("{port}:5432");
     // 1. Try to start existing container
     let _ = Command::new("docker")
         .args(["start", container_name.as_str()])
@@ -1399,11 +1474,11 @@ async fn handle_init_local_db(
             "-p",
             port_mapping.as_str(),
             "-e",
-            format!("POSTGRES_USER={}", user).as_str(),
+            format!("POSTGRES_USER={user}").as_str(),
             "-e",
             "POSTGRES_HOST_AUTH_METHOD=trust",
             "-e",
-            format!("POSTGRES_DB={}", database).as_str(),
+            format!("POSTGRES_DB={database}").as_str(),
             "postgres:16",
         ])
         .output()
@@ -1427,7 +1502,7 @@ async fn handle_init_local_db(
         retry_count += 1;
     }
 
-    let url = format!("postgresql://{}@localhost:{}/{}", user, port, database);
+    let url = format!("postgresql://{user}@localhost:{port}/{database}");
 
     // 4. Idempotent bootstrap of repository config
     let bootstrap_request = ProtocolRequest {
@@ -1474,9 +1549,9 @@ async fn handle_spawn_prompts(
                     ProtocolEnvelope::error(
                         request.rid.clone(),
                         code::NOTFOUND.to_string(),
-                        format!("Template file not found: {}", err),
+                        format!("Template file not found: {err}"),
                     )
-                    .with_fix(format!("Ensure {} exists", path))
+                    .with_fix(format!("Ensure {path} exists"))
                     .with_ctx(json!({"template": path})),
                 )
             })?;
@@ -1498,7 +1573,7 @@ async fn handle_spawn_prompts(
         .args
         .get("count")
         .and_then(Value::as_u64)
-        .map(|v| v as u32)
+        .and_then(|v| u32::try_from(v).ok())
         .or_else(|| config.as_ref().map(|c| c.max_agents))
         .unwrap_or(10);
 
@@ -1538,7 +1613,7 @@ fn spawn_prompts_recursive<'a>(
         if next > count {
             Ok(())
         } else {
-            let file = format!("{}/agent_{:02}.md", out_dir, next);
+            let file = format!("{out_dir}/agent_{next:02}.md");
             fs::write(file, template_text.replace("{N}", &next.to_string()))
                 .await
                 .map_err(SwarmError::IoError)
@@ -1560,20 +1635,18 @@ async fn handle_prompt(
                 next: "swarm monitor --view progress".to_string(),
                 state: minimal_state_for_request(request).await,
             });
-        } else {
-            return Err(Box::new(
-                ProtocolEnvelope::error(
-                    request.rid.clone(),
-                    code::NOTFOUND.to_string(),
-                    format!("Skill prompt not found: {}", skill_name),
-                )
-                .with_fix(
-                    "Use a valid skill: rust-contract, implement, qa-enforcer, red-queen"
-                        .to_string(),
-                )
-                .with_ctx(json!({"skill": skill_name})),
-            ));
         }
+        return Err(Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::NOTFOUND.to_string(),
+                format!("Skill prompt not found: {skill_name}"),
+            )
+            .with_fix(
+                "Use a valid skill: rust-contract, implement, qa-enforcer, red-queen".to_string(),
+            )
+            .with_ctx(json!({"skill": skill_name})),
+        ));
     }
 
     let id = request
@@ -1586,7 +1659,7 @@ async fn handle_prompt(
 
     Ok(CommandSuccess {
         data: json!({"agent_id": id, "prompt": prompt}),
-        next: format!("swarm agent --id {}", id),
+        next: format!("swarm agent --id {id}"),
         state: minimal_state_for_request(request).await,
     })
 }
@@ -1622,7 +1695,7 @@ async fn handle_smoke(
 async fn handle_doctor(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
-    let checks = vec![
+    let checks = [
         check_command("moon").await,
         check_command("br").await,
         check_command("jj").await,
@@ -1783,7 +1856,7 @@ fn load_profile_round_recursive<'a>(
                 Ok(Ok(None)) => stats.empty = stats.empty.saturating_add(1),
                 Ok(Err(_)) => stats.error = stats.error.saturating_add(1),
                 Err(_) => stats.timeout = stats.timeout.saturating_add(1),
-            };
+            }
 
             load_profile_round_recursive(
                 db,
@@ -1860,6 +1933,7 @@ async fn handle_bootstrap(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_init(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
@@ -1872,7 +1946,7 @@ async fn handle_init(
         .args
         .get("database_url")
         .and_then(Value::as_str)
-        .map(|value| value.to_string())
+        .map(std::string::ToString::to_string)
     {
         Some(value) => value,
         None => default_database_url_for_cli(),
@@ -1984,14 +2058,14 @@ fn required_string_arg(
         .args
         .get(key)
         .and_then(Value::as_str)
-        .map(|value| value.to_string())
+        .map(std::string::ToString::to_string)
         .ok_or_else(|| {
             Box::new(ProtocolEnvelope::error(
                 request.rid.clone(),
                 code::INVALID.to_string(),
-                format!("Missing required field: {}", key),
+                format!("Missing required field: {key}"),
             )
-            .with_fix(format!("Add '{}' field to request. Example: echo '{{\"cmd\":\"agent\",\"{}\":<value>}}' | swarm", key, key))
+            .with_fix(format!("Add '{key}' field to request. Example: echo '{{\"cmd\":\"agent\",\"{key}\":<value>}}' | swarm"))
             .with_ctx(json!({key: "required"})))
         })
 }
@@ -2003,7 +2077,7 @@ async fn db_from_request(
         .args
         .get("database_url")
         .and_then(Value::as_str)
-        .map(|value| value.to_string())
+        .map(std::string::ToString::to_string)
     {
         Some(value) => value,
         None => default_database_url_for_cli(),
@@ -2033,7 +2107,7 @@ fn minimal_state_from_progress(progress: &swarm::ProgressSummary) -> Value {
 async fn check_command(command: &str) -> Value {
     match Command::new("bash")
         .arg("-lc")
-        .arg(format!("command -v {}", command))
+        .arg(format!("command -v {command}"))
         .output()
         .await
     {

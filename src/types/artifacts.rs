@@ -32,7 +32,8 @@ pub enum ArtifactType {
 }
 
 impl ArtifactType {
-    pub fn as_str(&self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::ContractDocument => "contract_document",
             Self::Requirements => "requirements",
@@ -95,7 +96,7 @@ impl TryFrom<&str> for ArtifactType {
             "skill_invocation" => Ok(Self::SkillInvocation),
             "error_message" => Ok(Self::ErrorMessage),
             "feedback" => Ok(Self::Feedback),
-            _ => Err(format!("Unknown artifact type: {}", value)),
+            _ => Err(format!("Unknown artifact type: {value}")),
         }
     }
 }

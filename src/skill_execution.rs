@@ -37,17 +37,19 @@ pub struct SkillInvocationMetadata {
 
 impl SkillOutput {
     /// Create a new skill output from shell command execution.
-    pub fn from_shell_output(stdout: String, stderr: String, exit_code: Option<i32>) -> Self {
+    #[must_use]
+    pub fn from_shell_output(stdout: &str, stderr: String, exit_code: Option<i32>) -> Self {
         let success = exit_code.is_none_or(|code| code == 0);
         let full_log = match (stdout.is_empty(), stderr.is_empty()) {
             (true, _) => stderr,
-            (_, true) => stdout.clone(),
-            _ => format!("{}\n{}", stdout, stderr),
+            (_, true) => stdout.to_string(),
+            _ => format!("{stdout}\n{stderr}"),
         };
 
-        let feedback = match success {
-            true => String::new(),
-            false => full_log.clone(),
+        let feedback = if success {
+            String::new()
+        } else {
+            full_log.clone()
         };
 
         Self {
@@ -121,6 +123,10 @@ impl SkillOutput {
 }
 
 /// Store skill artifacts to the database.
+///
+/// # Errors
+///
+/// Returns `SwarmError::DatabaseError` if the database operation fails.
 pub async fn store_skill_artifacts(
     db: &SwarmDb,
     stage_history_id: i64,
@@ -146,7 +152,7 @@ pub async fn store_skill_artifacts(
         ),
         (
             ArtifactType::SkillInvocation,
-            format!("Skill: {}", skill_name),
+            format!("Skill: {skill_name}"),
             Some(serde_json::json!({
                 "skill_name": skill_name,
             })),
@@ -165,7 +171,7 @@ pub async fn store_skill_artifacts(
             }
             if let Some(ref files) = output.modified_files {
                 let files_json = serde_json::to_string(files).map_err(|e| {
-                    SwarmError::DatabaseError(format!("Failed to serialize files: {}", e))
+                    SwarmError::DatabaseError(format!("Failed to serialize files: {e}"))
                 })?;
                 pending_artifacts.push((ArtifactType::ModifiedFiles, files_json, None));
             }
@@ -180,31 +186,28 @@ pub async fn store_skill_artifacts(
             }
             if let Some(ref test_results) = output.test_results {
                 let results_json = serde_json::to_string(test_results).map_err(|e| {
-                    SwarmError::DatabaseError(format!("Failed to serialize test results: {}", e))
+                    SwarmError::DatabaseError(format!("Failed to serialize test results: {e}"))
                 })?;
                 pending_artifacts.push((ArtifactType::TestResults, results_json, None));
             }
         }
         Stage::RedQueen => {
-            if !output.success {
-                if let Some(ref report) = output.adversarial_report {
-                    pending_artifacts.push((ArtifactType::AdversarialReport, report.clone(), None));
-                }
-            } else {
+            if output.success {
                 pending_artifacts.push((
                     ArtifactType::QualityGateReport,
                     output.full_log.clone(),
                     None,
                 ));
+            } else if let Some(ref report) = output.adversarial_report {
+                pending_artifacts.push((ArtifactType::AdversarialReport, report.clone(), None));
             }
         }
         Stage::Done => {}
     }
 
     for (name, value) in &output.artifacts {
-        let artifact_type = match ArtifactType::try_from(name.as_str()) {
-            Ok(value_type) => value_type,
-            Err(_) => continue,
+        let Ok(artifact_type) = ArtifactType::try_from(name.as_str()) else {
+            continue;
         };
 
         pending_artifacts.push((artifact_type, value.clone(), None));
@@ -230,8 +233,7 @@ mod tests {
 
     #[test]
     fn test_skill_output_from_success() {
-        let output =
-            SkillOutput::from_shell_output("All tests passed".to_string(), String::new(), Some(0));
+        let output = SkillOutput::from_shell_output("All tests passed", String::new(), Some(0));
 
         assert!(output.success);
         assert_eq!(output.full_log, "All tests passed");
@@ -241,11 +243,8 @@ mod tests {
 
     #[test]
     fn test_skill_output_from_failure() {
-        let output = SkillOutput::from_shell_output(
-            "Running tests".to_string(),
-            "Test failed".to_string(),
-            Some(1),
-        );
+        let output =
+            SkillOutput::from_shell_output("Running tests", "Test failed".to_string(), Some(1));
 
         assert!(!output.success);
         assert!(output.full_log.contains("Test failed"));

@@ -1,10 +1,12 @@
+#![allow(clippy::literal_string_with_formatting_args)]
+
 use crate::config::StageCommands;
 use swarm::{
     ArtifactType, BeadId, MessageType, Result, Stage, StageArtifact, StageResult, SwarmError,
 };
 use tokio::process::Command;
 
-pub fn stage_primary_artifact(stage: Stage, result: &StageResult) -> ArtifactType {
+pub const fn stage_primary_artifact(stage: Stage, result: &StageResult) -> ArtifactType {
     match (stage, result.is_success()) {
         (Stage::RustContract, _) => ArtifactType::ContractDocument,
         (Stage::Implement, _) => ArtifactType::ImplementationCode,
@@ -16,7 +18,7 @@ pub fn stage_primary_artifact(stage: Stage, result: &StageResult) -> ArtifactTyp
     }
 }
 
-pub fn stage_success_message_type(stage: Stage) -> Option<MessageType> {
+pub const fn stage_success_message_type(stage: Stage) -> Option<MessageType> {
     match stage {
         Stage::RustContract => Some(MessageType::ContractReady),
         Stage::Implement => Some(MessageType::ImplementationReady),
@@ -26,7 +28,7 @@ pub fn stage_success_message_type(stage: Stage) -> Option<MessageType> {
     }
 }
 
-pub fn stage_failure_message_type(stage: Stage) -> Option<MessageType> {
+pub const fn stage_failure_message_type(stage: Stage) -> Option<MessageType> {
     match stage {
         Stage::QaEnforcer => Some(MessageType::QaFailed),
         Stage::RedQueen => Some(MessageType::RedQueenFailed),
@@ -35,7 +37,10 @@ pub fn stage_failure_message_type(stage: Stage) -> Option<MessageType> {
     }
 }
 
-fn preferred_message_artifact_types(stage: Stage, is_success: bool) -> &'static [ArtifactType] {
+const fn preferred_message_artifact_types(
+    stage: Stage,
+    is_success: bool,
+) -> &'static [ArtifactType] {
     match (stage, is_success) {
         (Stage::RustContract, _) => &[ArtifactType::ContractDocument],
         (Stage::Implement, _) => &[ArtifactType::ImplementationCode],
@@ -63,16 +68,16 @@ pub fn build_full_message_body(
             .map(|artifact| artifact.content.as_str())
     });
 
-    match preferred_content {
-        Some(content) => content.to_owned(),
-        None => {
-            if !result_message.is_empty() {
-                result_message.to_string()
-            } else {
+    preferred_content.map_or_else(
+        || {
+            if result_message.is_empty() {
                 format!("{} {} for bead {}", stage.as_str(), status, bead_id.value())
+            } else {
+                result_message.to_string()
             }
-        }
-    }
+        },
+        ToOwned::to_owned,
+    )
 }
 
 pub async fn execute_stage(
@@ -89,7 +94,7 @@ pub async fn execute_stage(
     match run_shell_command(&command).await {
         Ok(output) if output.status_success => StageResult::Passed,
         Ok(output) => StageResult::Failed(output.message),
-        Err(err) => StageResult::Error(format!("Stage command error: {}", err)),
+        Err(err) => StageResult::Error(format!("Stage command error: {err}")),
     }
 }
 
@@ -112,7 +117,7 @@ fn shell_escape(value: &str) -> String {
     }
 }
 
-pub fn stage_command_template(stage: Stage, commands: &StageCommands) -> &str {
+pub const fn stage_command_template(stage: Stage, commands: &StageCommands) -> &str {
     match stage {
         Stage::RustContract => commands.rust_contract.as_str(),
         Stage::Implement => commands.implement.as_str(),
@@ -140,7 +145,7 @@ pub async fn run_shell_command(command: &str) -> Result<CommandOutput> {
     let message = match (stdout.is_empty(), stderr.is_empty()) {
         (true, _) => stderr,
         (_, true) => stdout,
-        _ => format!("{}\n{}", stdout, stderr),
+        _ => format!("{stdout}\n{stderr}"),
     };
 
     Ok(CommandOutput {
@@ -150,7 +155,7 @@ pub async fn run_shell_command(command: &str) -> Result<CommandOutput> {
 }
 
 pub async fn create_workspace(agent_id: u32, bead_id: &str) -> Result<()> {
-    let cmd = format!("zjj add agent-{}-{}", agent_id, bead_id);
+    let cmd = format!("zjj add agent-{agent_id}-{bead_id}");
     let out = run_shell_command(&cmd).await?;
     if !out.status_success {
         tracing::warn!(

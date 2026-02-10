@@ -14,7 +14,8 @@ pub enum AgentStatus {
 }
 
 impl AgentStatus {
-    pub fn as_str(&self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Idle => "idle",
             Self::Working => "working",
@@ -41,7 +42,7 @@ impl TryFrom<&str> for AgentStatus {
             "waiting" => Ok(Self::Waiting),
             "error" => Ok(Self::Error),
             "done" => Ok(Self::Done),
-            _ => Err(format!("Unknown status: {}", s)),
+            _ => Err(format!("Unknown status: {s}")),
         }
     }
 }
@@ -75,7 +76,8 @@ pub enum ClaimStatus {
 }
 
 impl ClaimStatus {
-    pub fn as_str(&self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::InProgress => "in_progress",
             Self::Completed => "completed",
@@ -92,7 +94,7 @@ impl TryFrom<&str> for ClaimStatus {
             "in_progress" => Ok(Self::InProgress),
             "completed" => Ok(Self::Completed),
             "blocked" => Ok(Self::Blocked),
-            _ => Err(format!("Unknown claim status: {}", s)),
+            _ => Err(format!("Unknown claim status: {s}")),
         }
     }
 }
@@ -117,7 +119,8 @@ pub enum SwarmStatus {
 }
 
 impl SwarmStatus {
-    pub fn as_str(&self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Initializing => "initializing",
             Self::Running => "running",
@@ -138,7 +141,7 @@ impl TryFrom<&str> for SwarmStatus {
             "paused" => Ok(Self::Paused),
             "complete" => Ok(Self::Complete),
             "error" => Ok(Self::Error),
-            _ => Err(format!("Unknown swarm status: {}", s)),
+            _ => Err(format!("Unknown swarm status: {s}")),
         }
     }
 }

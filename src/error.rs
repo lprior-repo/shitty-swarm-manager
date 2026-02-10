@@ -53,32 +53,29 @@ pub enum SwarmError {
 
 impl SwarmError {
     /// Returns the protocol error code for this error
-    pub fn code(&self) -> &'static str {
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
         match self {
-            SwarmError::ConfigError(_) => code::INVALID,
-            SwarmError::DatabaseError(_) => code::INTERNAL,
-            SwarmError::SqlxError(_) => code::INTERNAL,
-            SwarmError::AgentError(_) => code::CONFLICT,
-            SwarmError::BeadError(_) => code::NOTFOUND,
-            SwarmError::StageError(_) => code::CONFLICT,
-            SwarmError::IoError(_) => code::DEPENDENCY,
-            SwarmError::SerializationError(_) => code::INVALID,
-            SwarmError::Internal(_) => code::INTERNAL,
+            Self::ConfigError(_) | Self::SerializationError(_) => code::INVALID,
+            Self::DatabaseError(_) | Self::SqlxError(_) | Self::Internal(_) => code::INTERNAL,
+            Self::AgentError(_) | Self::StageError(_) => code::CONFLICT,
+            Self::BeadError(_) => code::NOTFOUND,
+            Self::IoError(_) => code::DEPENDENCY,
         }
     }
 
     /// Returns the exit code for this error
-    pub fn exit_code(&self) -> i32 {
+    #[must_use]
+    pub const fn exit_code(&self) -> i32 {
         match self {
-            SwarmError::ConfigError(_) => 2,
-            SwarmError::DatabaseError(_) => 3,
-            SwarmError::SqlxError(_) => 3,
-            SwarmError::AgentError(_) => 4,
-            SwarmError::BeadError(_) => 5,
-            SwarmError::StageError(_) => 6,
-            SwarmError::IoError(_) => 7,
-            SwarmError::SerializationError(_) => 8,
-            SwarmError::Internal(_) => 9,
+            Self::ConfigError(_) => 2,
+            Self::DatabaseError(_) | Self::SqlxError(_) => 3,
+            Self::AgentError(_) => 4,
+            Self::BeadError(_) => 5,
+            Self::StageError(_) => 6,
+            Self::IoError(_) => 7,
+            Self::SerializationError(_) => 8,
+            Self::Internal(_) => 9,
         }
     }
 }
@@ -138,6 +135,7 @@ pub const ERROR_CODES: &[(&str, &str, &str)] = &[
 ];
 
 /// Get error code details (description and fix) for a given error code
+#[must_use]
 pub fn get_error_info(error_code: &str) -> Option<(&'static str, &'static str)> {
     ERROR_CODES
         .iter()

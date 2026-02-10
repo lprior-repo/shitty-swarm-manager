@@ -16,6 +16,11 @@ pub struct SwarmDb {
 }
 
 impl SwarmDb {
+    /// Creates a new `SwarmDb` instance connected to the database.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::DatabaseError` if the database connection fails.
     pub async fn new(database_url: &str) -> Result<Self> {
         let max_connections = resolve_pool_max_connections();
 
@@ -28,12 +33,14 @@ impl SwarmDb {
         Ok(Self { pool })
     }
 
-    /// Create a new SwarmDb with an existing pool (for testing).
-    pub fn new_with_pool(pool: PgPool) -> Self {
+    /// Create a new `SwarmDb` with an existing pool (for testing).
+    #[must_use]
+    pub const fn new_with_pool(pool: PgPool) -> Self {
         Self { pool }
     }
 
-    fn pool(&self) -> &PgPool {
+    #[must_use]
+    const fn pool(&self) -> &PgPool {
         &self.pool
     }
 }

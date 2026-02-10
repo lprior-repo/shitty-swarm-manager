@@ -13,8 +13,8 @@ mod protocol_runtime;
 use serde_json::json;
 use std::env;
 use swarm::protocol_envelope::ProtocolEnvelope;
-use swarm::SwarmError;
 use swarm::CliError;
+use swarm::SwarmError;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -60,16 +60,28 @@ pub enum CliCommand {
     Doctor,
     Help,
     Status,
-    Agent { id: u32, dry: Option<bool> },
+    Agent {
+        id: u32,
+        dry: Option<bool>,
+    },
     Init {
         dry: Option<bool>,
         database_url: Option<String>,
         schema: Option<String>,
         seed_agents: Option<u32>,
     },
-    Register { count: Option<u32>, dry: Option<bool> },
-    Release { agent_id: u32, dry: Option<bool> },
-    Monitor { view: Option<String>, watch_ms: Option<u64> },
+    Register {
+        count: Option<u32>,
+        dry: Option<bool>,
+    },
+    Release {
+        agent_id: u32,
+        dry: Option<bool>,
+    },
+    Monitor {
+        view: Option<String>,
+        watch_ms: Option<u64>,
+    },
     InitDb {
         url: Option<String>,
         schema: Option<String>,
@@ -85,27 +97,47 @@ pub enum CliCommand {
         seed_agents: Option<u32>,
         dry: Option<bool>,
     },
-    Bootstrap { dry: Option<bool> },
+    Bootstrap {
+        dry: Option<bool>,
+    },
     SpawnPrompts {
         template: Option<String>,
         out_dir: Option<String>,
         count: Option<u32>,
         dry: Option<bool>,
     },
-    Prompt { id: u32, skill: Option<String> },
-    Smoke { id: u32, dry: Option<bool> },
-    Batch { dry: Option<bool> },
+    Prompt {
+        id: u32,
+        skill: Option<String>,
+    },
+    Smoke {
+        id: u32,
+        dry: Option<bool>,
+    },
+    Batch {
+        dry: Option<bool>,
+    },
     State,
-    History { limit: Option<i64> },
+    History {
+        limit: Option<i64>,
+    },
     Lock {
         resource: String,
         agent: String,
         ttl_ms: i64,
         dry: Option<bool>,
     },
-    Unlock { resource: String, agent: String, dry: Option<bool> },
+    Unlock {
+        resource: String,
+        agent: String,
+        dry: Option<bool>,
+    },
     Agents,
-    Broadcast { msg: String, from: String, dry: Option<bool> },
+    Broadcast {
+        msg: String,
+        from: String,
+        dry: Option<bool>,
+    },
     LoadProfile {
         agents: Option<u32>,
         rounds: Option<u32>,
@@ -123,11 +155,12 @@ enum CliAction {
     Command(CliCommand),
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_cli_args(args: &[String]) -> Result<CliAction, CliError> {
     match args.first().map(String::as_str) {
         None | Some("--") => Ok(CliAction::RunProtocol),
-        Some("-h") | Some("--help") => Ok(CliAction::ShowHelp),
-        Some("-v") | Some("--version") => Ok(CliAction::ShowVersion),
+        Some("-h" | "--help") => Ok(CliAction::ShowHelp),
+        Some("-v" | "--version") => Ok(CliAction::ShowVersion),
         Some("--json") => {
             if args.len() < 2 {
                 Err(CliError::MissingRequiredArg {
@@ -142,7 +175,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction, CliError> {
         // Commands with no args
         Some("doctor") => Ok(CliAction::Command(CliCommand::Doctor)),
         Some("status") => Ok(CliAction::Command(CliCommand::Status)),
-        Some("?") | Some("help") => Ok(CliAction::Command(CliCommand::Help)),
+        Some("?" | "help") => Ok(CliAction::Command(CliCommand::Help)),
         Some("state") => Ok(CliAction::Command(CliCommand::State)),
         Some("agents") => Ok(CliAction::Command(CliCommand::Agents)),
         Some("batch") => {
@@ -283,11 +316,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction, CliError> {
             let msg = parse_required_arg(args, "msg")?;
             let from = parse_required_arg(args, "from")?;
             let dry = parse_optional_arg(args, "dry")?;
-            Ok(CliAction::Command(CliCommand::Broadcast {
-                msg,
-                from,
-                dry,
-            }))
+            Ok(CliAction::Command(CliCommand::Broadcast { msg, from, dry }))
         }
 
         Some("load-profile") => {
@@ -310,6 +339,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction, CliError> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn cli_command_to_request(cmd: CliCommand) -> String {
     let (cmd_name, dry, args) = match cmd {
         CliCommand::Doctor => ("doctor".to_string(), None, serde_json::Map::new()),
@@ -518,7 +548,7 @@ fn cli_command_to_request(cmd: CliCommand) -> String {
             ("load-profile".to_string(), dry, args)
         }
 
-        CliCommand::Json(cmd) => (cmd, None, serde_json::Map::new())
+        CliCommand::Json(cmd) => (cmd, None, serde_json::Map::new()),
     };
 
     let request = protocol_runtime::ProtocolRequest {
@@ -530,7 +560,10 @@ fn cli_command_to_request(cmd: CliCommand) -> String {
     serde_json::to_string(&request).unwrap_or_default()
 }
 
-fn handle_cli_action(action: &CliAction, _unknown_arg: Option<&str>) -> (Option<String>, i32, bool) {
+fn handle_cli_action(
+    action: &CliAction,
+    _unknown_arg: Option<&str>,
+) -> (Option<String>, i32, bool) {
     match action {
         CliAction::ShowHelp => {
             let help_json: serde_json::Value = serde_json::from_str(HELP_DATA).unwrap_or_default();
@@ -590,7 +623,7 @@ where
         .map(|v| {
             v.parse::<T>().map_err(|e| CliError::InvalidArgValue {
                 arg_name: name.to_string(),
-                value: format!("{}", e),
+                value: format!("{e}"),
                 expected: std::any::type_name::<T>().to_string(),
             })
         })
@@ -643,14 +676,14 @@ async fn main() {
     let action = match parse_cli_args(&args) {
         Ok(a) => a,
         Err(err) => {
-            eprintln!("Error: {}", err);
+            eprintln!("Error: {err}");
             if let CliError::UnknownCommand {
                 command: _,
                 suggestions,
             } = &err
             {
                 if let Some(suggestion) = suggestions.first() {
-                    eprintln!("Did you mean: {}?", suggestion);
+                    eprintln!("Did you mean: {suggestion}?");
                 }
             }
             std::process::exit(1);
@@ -674,7 +707,7 @@ async fn main() {
 
     if let Some(msg) = input_or_output {
         if code != 0 || matches!(action, CliAction::ShowHelp | CliAction::ShowVersion) {
-            println!("{}", msg);
+            println!("{msg}");
             std::process::exit(code);
         }
 

@@ -33,7 +33,7 @@ pub async fn load_config(path: Option<PathBuf>, claude_mode: bool) -> Result<Con
 
     let content = tokio::fs::read_to_string(&config_path)
         .await
-        .map_err(|e| SwarmError::ConfigError(format!("Failed to read config: {}", e)))?;
+        .map_err(|e| SwarmError::ConfigError(format!("Failed to read config: {e}")))?;
 
     let (database_url, stage_commands) = parse_config_content(&content);
     let adjusted = if claude_mode {
@@ -86,7 +86,7 @@ fn expand_env_vars(input: &str) -> String {
             let var_part = &result[start + 2..start + end];
             let (var_name, default) = var_part.split_once(":-").unwrap_or((var_part, ""));
             let value = std::env::var(var_name).unwrap_or_else(|_| default.to_string());
-            result.replace_range(start..start + end + 1, &value);
+            result.replace_range(start..=(start + end), &value);
         } else {
             break;
         }
@@ -157,7 +157,7 @@ fn default_database_url() -> String {
             let port = std::env::var("SWARM_DB_PORT").unwrap_or_else(|_| "5437".to_string());
             let db = std::env::var("SWARM_DB_NAME")
                 .unwrap_or_else(|_| "shitty_swarm_manager_db".to_string());
-            format!("postgres://{}:{}@{}:{}/{}", user, pass, host, port, db)
+            format!("postgres://{user}:{pass}@{host}:{port}/{db}")
         })
 }
 

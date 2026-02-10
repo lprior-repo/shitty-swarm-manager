@@ -5,14 +5,17 @@ use std::fmt;
 pub struct RepoId(String);
 
 impl RepoId {
+    #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
 
+    #[must_use]
     pub fn value(&self) -> &str {
         &self.0
     }
 
+    #[must_use]
     pub fn from_current_dir() -> Option<Self> {
         if let Ok(output) = std::process::Command::new("git")
             .args(["remote", "get-url", "origin"])
@@ -44,20 +47,24 @@ pub struct AgentId {
 }
 
 impl AgentId {
-    pub fn new(repo_id: RepoId, number: u32) -> Self {
+    #[must_use]
+    pub const fn new(repo_id: RepoId, number: u32) -> Self {
         Self { repo_id, number }
     }
 
-    pub fn repo_id(&self) -> &RepoId {
+    #[must_use]
+    pub const fn repo_id(&self) -> &RepoId {
         &self.repo_id
     }
 
-    pub fn number(&self) -> u32 {
+    #[must_use]
+    pub const fn number(&self) -> u32 {
         self.number
     }
 
-    pub fn to_db_agent_id(&self) -> i32 {
-        self.number as i32
+    #[must_use]
+    pub const fn to_db_agent_id(&self) -> i32 {
+        self.number.cast_signed()
     }
 }
 
@@ -71,10 +78,12 @@ impl fmt::Display for AgentId {
 pub struct BeadId(String);
 
 impl BeadId {
+    #[must_use]
     pub fn new(id: impl Into<String>) -> Self {
         Self(id.into())
     }
 
+    #[must_use]
     pub fn value(&self) -> &str {
         &self.0
     }

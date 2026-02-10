@@ -18,7 +18,8 @@ pub enum MessageType {
 }
 
 impl MessageType {
-    pub fn as_str(&self) -> &'static str {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
         match self {
             Self::ContractReady => "contract_ready",
             Self::ImplementationReady => "implementation_ready",
@@ -51,7 +52,7 @@ impl TryFrom<&str> for MessageType {
             "stage_failed" => Ok(Self::StageFailed),
             "blocking_issue" => Ok(Self::BlockingIssue),
             "coordination" => Ok(Self::Coordination),
-            _ => Err(format!("Unknown message type: {}", value)),
+            _ => Err(format!("Unknown message type: {value}")),
         }
     }
 }

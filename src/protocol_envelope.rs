@@ -38,6 +38,7 @@ pub struct ProtocolError {
 }
 
 impl ProtocolEnvelope {
+    #[must_use]
     pub fn success(rid: Option<String>, data: Value) -> Self {
         Self {
             ok: true,
@@ -52,6 +53,7 @@ impl ProtocolEnvelope {
         }
     }
 
+    #[must_use]
     pub fn error(rid: Option<String>, code: String, msg: String) -> Self {
         Self {
             ok: false,
@@ -70,26 +72,31 @@ impl ProtocolEnvelope {
         }
     }
 
-    pub fn with_ms(mut self, ms: i64) -> Self {
+    #[must_use]
+    pub const fn with_ms(mut self, ms: i64) -> Self {
         self.ms = Some(ms);
         self
     }
 
+    #[must_use]
     pub fn with_next(mut self, next: String) -> Self {
         self.next = Some(next);
         self
     }
 
+    #[must_use]
     pub fn with_state(mut self, state: Value) -> Self {
         self.state = Some(Box::new(state));
         self
     }
 
+    #[must_use]
     pub fn with_fix(mut self, fix: String) -> Self {
         self.fix = Some(fix);
         self
     }
 
+    #[must_use]
     pub fn with_ctx(mut self, ctx: Value) -> Self {
         if let Some(ref mut err) = self.err {
             err.ctx = Some(Box::new(ctx));

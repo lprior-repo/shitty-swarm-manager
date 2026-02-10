@@ -29,7 +29,7 @@ pub async fn execute_stage_rust(
     }
 
     let stage_output = match stage {
-        Stage::RustContract => execute_rust_contract_stage(bead_id, agent_id).await,
+        Stage::RustContract => Ok(execute_rust_contract_stage(bead_id, agent_id)),
         Stage::Implement => execute_implement_stage(bead_id, agent_id, db).await,
         Stage::QaEnforcer => execute_qa_stage(bead_id, agent_id, db, cache).await,
         Stage::RedQueen => execute_red_queen_stage(bead_id, agent_id, db, cache).await,
@@ -43,8 +43,7 @@ pub async fn execute_stage_rust(
             let result = output_to_stage_result(&output);
             if let Err(err) = store_skill_artifacts(db, stage_history_id, stage, &output).await {
                 return crate::types::StageResult::Error(format!(
-                    "Failed to store stage artifacts: {}",
-                    err
+                    "Failed to store stage artifacts: {err}"
                 ));
             }
             result
@@ -55,8 +54,7 @@ pub async fn execute_stage_rust(
                 store_skill_artifacts(db, stage_history_id, stage, &output).await
             {
                 return crate::types::StageResult::Error(format!(
-                    "Stage execution failed ({}) and artifact storage failed ({})",
-                    err, store_err
+                    "Stage execution failed ({err}) and artifact storage failed ({store_err})"
                 ));
             }
             crate::types::StageResult::Error(err.to_string())
@@ -129,7 +127,7 @@ fn error_output(message: String) -> SkillOutput {
 async fn run_moon_task(task: &str, cache: Option<&GateExecutionCache>) -> Result<SkillOutput> {
     if let Some(cache) = cache {
         if let Some((_success, exit_code, stdout, stderr)) = cache.get(task).await {
-            return Ok(SkillOutput::from_shell_output(stdout, stderr, exit_code));
+            return Ok(SkillOutput::from_shell_output(&stdout, stderr, exit_code));
         }
     }
 
@@ -157,19 +155,19 @@ async fn run_moon_task(task: &str, cache: Option<&GateExecutionCache>) -> Result
             .ok();
     }
 
-    Ok(SkillOutput::from_shell_output(stdout, stderr, exit_code))
+    Ok(SkillOutput::from_shell_output(&stdout, stderr, exit_code))
 }
 
 /// Execute the rust-contract stage.
 ///
 /// This stage generates a contract document that follows a
 /// behavior-first, acceptance-criteria-driven style.
-async fn execute_rust_contract_stage(bead_id: &BeadId, agent_id: &AgentId) -> Result<SkillOutput> {
+fn execute_rust_contract_stage(bead_id: &BeadId, agent_id: &AgentId) -> SkillOutput {
     let (contract_document, artifacts) = contract_document_and_artifacts(bead_id);
 
     tracing::info!("Agent {} generated contract for bead {}", agent_id, bead_id);
 
-    Ok(SkillOutput {
+    SkillOutput {
         full_log: contract_document.clone(),
         success: true,
         exit_code: Some(0),
@@ -180,7 +178,7 @@ async fn execute_rust_contract_stage(bead_id: &BeadId, agent_id: &AgentId) -> Re
         modified_files: None,
         test_results: None,
         adversarial_report: None,
-    })
+    }
 }
 
 /// Execute the implement stage.

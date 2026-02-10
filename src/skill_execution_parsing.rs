@@ -17,6 +17,7 @@ pub struct TestFailure {
     pub reason: String,
 }
 
+#[must_use]
 pub fn parse_test_results(output: &str) -> TestResults {
     let result_line = output.lines().find(|line| line.contains("test result:"));
     let (passed, failed) = result_line
