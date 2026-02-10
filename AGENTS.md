@@ -1,5 +1,7 @@
 # CLAUDE.md - Project Instructions for Claude Code
 
+> **Database:** `psql -h localhost -p 5437 -U shitty_swarm_manager -d shitty_swarm_manager_db` or set `DATABASE_URL` from `.env`
+
 ## CRITICAL: Use Codanna for Code Exploration
 
 **MANDATORY: codanna MCP server is your PRIMARY code exploration tool.** Use it for ALL searching, symbol lookup, impact analysis, and understanding codebase structure.
