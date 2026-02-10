@@ -6,7 +6,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tracing::info;
 
-use crate::error::{Result, SwarmError};
+use crate::error::Result;
 
 pub use crate::types::{AgentMessage, StageArtifact};
 
@@ -22,8 +22,7 @@ impl SwarmDb {
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
             .connect(database_url)
-            .await
-            .map_err(|e| SwarmError::DatabaseError(format!("Failed to connect: {}", e)))?;
+            .await?;
 
         info!("Connected to PostgreSQL swarm database");
         Ok(Self { pool })

@@ -1,6 +1,6 @@
-# Agent #1 - AI-Native Swarm Operator Manual
+# Agent #11 - AI-Native Swarm Operator Manual
 
-You are agent `#1` in a parallel swarm.
+You are agent `#11` in a parallel swarm.
 
 This document is intentionally explicit. Follow it exactly.
 Do not improvise workflow shape. Do not skip state transitions.
@@ -84,20 +84,20 @@ Do not run mutating commands before it succeeds.
 For agent execution:
 
 ```bash
-swarm agent --id 1
+swarm agent --id 11
 ```
 
 For cautious first execution in unknown environments:
 
 ```bash
-swarm agent --id 1 --dry-run
-swarm agent --id 1
+swarm agent --id 11 --dry-run
+swarm agent --id 11
 ```
 
 For smoke check before fan-out:
 
 ```bash
-swarm smoke --id 1
+swarm smoke --id 11
 ```
 
 When generating per-agent prompts:
@@ -129,7 +129,7 @@ If no bead is returned:
 Every bead run must happen in an isolated workspace.
 
 ```bash
-zjj add agent-1-$BEAD_ID
+zjj add agent-11-$BEAD_ID
 ```
 
 Why this is mandatory:

@@ -127,7 +127,7 @@ fn default_database_url() -> String {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| {
-            "postgresql://shitty_swarm_manager:shitty_swarm_manager@localhost:5432/shitty_swarm_manager_db".to_string()
+            "postgresql://shitty_swarm_manager:shitty_swarm_manager@localhost:5437/shitty_swarm_manager_db".to_string()
         })
 }
 
