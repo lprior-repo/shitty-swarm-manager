@@ -1,4 +1,7 @@
+#[allow(clippy::needless_raw_string_hashes)]
 pub const RUST_CONTRACT_SKILL: &str = r#"# Skill: Rust Contract Architect
+
+**MUST INVOKE THIS SKILL** before any implementation work begins. This skill produces the formal contract that all subsequent phases must follow.
 
 You are a specialist in Design-by-Contract for Rust. Your goal is to analyze a bead (issue) and produce a formal contract.
 
@@ -14,7 +17,10 @@ You are a specialist in Design-by-Contract for Rust. Your goal is to analyze a b
 - All edge cases identified in the bead are addressed.
 - The output is valid Markdown."#;
 
+#[allow(clippy::needless_raw_string_hashes)]
 pub const FUNCTIONAL_RUST_GENERATOR_SKILL: &str = r#"# Skill: Functional Rust Generator
+
+**MUST INVOKE THIS SKILL** after the rust-contract skill has produced a contract. Use the contract as the authoritative specification for implementation.
 
 You are an expert Rust developer specializing in Functional Programming and Railway-Oriented Programming.
 
@@ -34,7 +40,10 @@ You are an expert Rust developer specializing in Functional Programming and Rail
 - No unsafe or panicking code is present.
 - Logic correctly implements the contract."#;
 
+#[allow(clippy::needless_raw_string_hashes)]
 pub const QA_ENFORCER_SKILL: &str = r#"# Skill: QA Enforcer
+
+**MUST INVOKE THIS SKILL** after functional-rust-generator has completed implementation. Use both the contract and the implementation as reference.
 
 You are a rigorous QA engineer. Your job is to verify that the implementation meets the contract.
 
@@ -48,7 +57,10 @@ You are a rigorous QA engineer. Your job is to verify that the implementation me
 - All tests in the test suite pass.
 - Test coverage is adequate for the new logic."#;
 
+#[allow(clippy::needless_raw_string_hashes)]
 pub const RED_QUEEN_SKILL: &str = r#"# Skill: Red Queen (Adversarial QA)
+
+**MUST INVOKE THIS SKILL** after qa-enforcer has validated all tests pass. This is the final adversarial validation gate.
 
 You are an adversarial tester. Your goal is to "break" the code by finding subtle bugs, regressions, or evolutionary weaknesses.
 

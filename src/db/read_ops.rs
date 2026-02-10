@@ -29,12 +29,12 @@ struct AvailableAgentRow {
 
 #[derive(FromRow)]
 struct ProgressRow {
-    done_agents: i64,
-    working_agents: i64,
-    waiting_agents: i64,
-    error_agents: i64,
-    idle_agents: i64,
-    total_agents: i64,
+    done: i64,
+    working: i64,
+    waiting: i64,
+    error: i64,
+    idle: i64,
+    total: i64,
 }
 
 #[derive(FromRow)]
@@ -128,7 +128,7 @@ impl SwarmDb {
         sqlx::query("DELETE FROM resource_locks WHERE until_at <= NOW()")
             .execute(self.pool())
             .await
-            .map_err(|e| SwarmError::DatabaseError(format!("Failed to cleanup locks: {}", e)))?;
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to cleanup locks: {e}")))?;
 
         sqlx::query_as::<_, CommandAuditRow>(
             "SELECT seq, t, cmd, args, ok, ms, error_code
@@ -139,7 +139,7 @@ impl SwarmDb {
         .bind(limit)
         .fetch_all(self.pool())
         .await
-        .map_err(|e| SwarmError::DatabaseError(format!("Failed to load command history: {}", e)))
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to load command history: {e}")))
         .map(|rows| {
             rows.into_iter()
                 .map(|row| {
@@ -161,7 +161,7 @@ impl SwarmDb {
         sqlx::query("DELETE FROM resource_locks WHERE until_at <= NOW()")
             .execute(self.pool())
             .await
-            .map_err(|e| SwarmError::DatabaseError(format!("Failed to cleanup locks: {}", e)))?;
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to cleanup locks: {e}")))?;
 
         sqlx::query_as::<_, ResourceLockRow>(
             "SELECT resource, agent, since, until_at
@@ -170,7 +170,7 @@ impl SwarmDb {
         )
         .fetch_all(self.pool())
         .await
-        .map_err(|e| SwarmError::DatabaseError(format!("Failed to load resource locks: {}", e)))
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to load resource locks: {e}")))
         .map(|rows| {
             rows.into_iter()
                 .map(|row| {
@@ -193,7 +193,7 @@ impl SwarmDb {
             .bind(agent_id.number() as i32)
             .fetch_optional(self.pool())
             .await
-            .map_err(|e| SwarmError::DatabaseError(format!("Failed to get agent state: {}", e)))
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to get agent state: {e}")))
             .and_then(|row_opt| {
                 row_opt
                     .map(|row| {
@@ -222,7 +222,7 @@ impl SwarmDb {
         )
             .fetch_all(self.pool())
             .await
-            .map_err(|e| SwarmError::DatabaseError(format!("Failed to get available agents: {}", e)))
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to get available agents: {e}")))
             .and_then(|rows| {
                 rows.into_iter()
                     .map(|row| {
@@ -248,14 +248,14 @@ impl SwarmDb {
         )
             .fetch_one(self.pool())
             .await
-            .map_err(|e| SwarmError::DatabaseError(format!("Failed to get progress: {}", e)))
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to get progress: {e}")))
             .map(|row| ProgressSummary {
-                completed: row.done_agents as u64,
-                working: row.working_agents as u64,
-                waiting: row.waiting_agents as u64,
-                errors: row.error_agents as u64,
-                idle: row.idle_agents as u64,
-                total_agents: row.total_agents as u64,
+                completed: row.done as u64,
+                working: row.working as u64,
+                waiting: row.waiting as u64,
+                errors: row.error as u64,
+                idle: row.idle as u64,
+                total_agents: row.total as u64,
             })
     }
 
@@ -266,7 +266,7 @@ impl SwarmDb {
         )
             .fetch_one(self.pool())
             .await
-            .map_err(|e| SwarmError::DatabaseError(format!("Failed to get config: {}", e)))
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to get config: {e}")))
             .and_then(|row| {
                 parse_swarm_config(
                     row.max_agents,
@@ -290,7 +290,7 @@ impl SwarmDb {
         )
         .fetch_all(self.pool())
         .await
-        .map_err(|e| SwarmError::DatabaseError(format!("Failed to get active agents: {}", e)))
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to get active agents: {e}")))
         .map(|rows| {
             rows.into_iter()
                 .map(|row| {
@@ -310,7 +310,7 @@ impl SwarmDb {
             .bind(agent_id.number() as i32)
             .fetch_one(self.pool())
             .await
-            .map_err(|e| SwarmError::DatabaseError(format!("Failed to claim next bead: {}", e)))
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to claim next bead: {e}")))
             .map(|value| value.map(BeadId::new))
     }
 
@@ -324,7 +324,7 @@ impl SwarmDb {
         )
         .fetch_all(self.pool())
         .await
-        .map_err(|e| SwarmError::DatabaseError(format!("Failed to query feedback: {}", e)))
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to query feedback: {e}")))
         .map(|rows| {
             rows.into_iter()
                 .map(|row| {
@@ -351,7 +351,7 @@ impl SwarmDb {
         .bind(stage_history_id)
         .fetch_all(self.pool())
         .await
-        .map_err(|e| SwarmError::DatabaseError(format!("Failed to get stage artifacts: {}", e)))
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to get stage artifacts: {e}")))
         .and_then(|rows| {
             rows.into_iter()
                 .map(|row| {
@@ -388,7 +388,7 @@ impl SwarmDb {
         .fetch_all(self.pool())
         .await
         .map_err(|e| {
-            SwarmError::DatabaseError(format!("Failed to get bead artifacts by type: {}", e))
+            SwarmError::DatabaseError(format!("Failed to get bead artifacts by type: {e}"))
         })
         .and_then(|rows| {
             rows.into_iter()
@@ -427,7 +427,7 @@ impl SwarmDb {
         .fetch_optional(self.pool())
         .await
         .map_err(|e| {
-            SwarmError::DatabaseError(format!("Failed to get first bead artifact by type: {}", e))
+            SwarmError::DatabaseError(format!("Failed to get first bead artifact by type: {e}"))
         })
         .and_then(|maybe_row| {
             maybe_row
@@ -466,7 +466,7 @@ impl SwarmDb {
         .fetch_one(self.pool())
         .await
         .map_err(|e| {
-            SwarmError::DatabaseError(format!("Failed to check bead artifact existence: {}", e))
+            SwarmError::DatabaseError(format!("Failed to check bead artifact existence: {e}"))
         })
     }
 
@@ -485,7 +485,7 @@ impl SwarmDb {
         .bind(bead_id.map(BeadId::value))
         .fetch_all(self.pool())
         .await
-        .map_err(|e| SwarmError::DatabaseError(format!("Failed to get unread messages: {}", e)))
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to get unread messages: {e}")))
         .and_then(|rows| {
             rows.into_iter()
                 .map(|row| {
@@ -520,7 +520,7 @@ impl SwarmDb {
         .fetch_all(self.pool())
         .await
         .map_err(|e| {
-            SwarmError::DatabaseError(format!("Failed to get all unread messages: {}", e))
+            SwarmError::DatabaseError(format!("Failed to get all unread messages: {e}"))
         })
         .and_then(|rows| {
             rows.into_iter()
