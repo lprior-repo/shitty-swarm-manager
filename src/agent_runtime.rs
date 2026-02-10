@@ -42,6 +42,11 @@ fn run_agent_loop_recursive<'a>(
                 swarm::AgentStatus::Idle => match db.claim_next_bead(agent_id).await? {
                     Some(bead_id) => {
                         info!("Agent {} claimed bead {}", agent_id, bead_id);
+                        crate::agent_runtime_support::create_workspace(
+                            agent_id.number(),
+                            bead_id.value(),
+                        )
+                        .await?;
                         run_agent_loop_recursive(db, agent_id, stage_commands, MIN_POLL_BACKOFF)
                             .await
                     }
@@ -157,6 +162,7 @@ async fn process_work_state(
                 let reason = "Max implementation attempts (3) exceeded";
                 db.mark_bead_blocked(agent_id, &bead_id, reason).await?;
                 warn!("Agent {} blocked bead {}: {}", agent_id, bead_id, reason);
+                crate::agent_runtime_support::finalize_workspace(bead_id.value()).await?;
                 Ok(true)
             }
             None => Ok(false),
@@ -301,6 +307,17 @@ async fn process_work_state(
 
         let unread_message_ids = unread_messages.iter().map(|m| m.id).collect::<Vec<_>>();
         db.mark_messages_read(agent_id, &unread_message_ids).await?;
+
+        // "Landing the Plane" - if we reached Stage::Done, we must push and cleanup
+        if let Ok(Some(new_state)) = db.get_agent_state(agent_id).await {
+            if new_state.status == swarm::AgentStatus::Done {
+                info!(
+                    "Agent {} completed bead {} - Landing the plane...",
+                    agent_id, bead_id
+                );
+                crate::agent_runtime_support::finalize_workspace(bead_id.value()).await?;
+            }
+        }
 
         return Ok(true);
     }

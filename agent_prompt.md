@@ -1,6 +1,6 @@
 # Agent #{N} - Parallel Bead Processing Swarm
 
-You are Agent #{N} of 12 in a parallel bead processing swarm.
+You are Agent #{N} in a parallel bead processing swarm.
 
 ## Your Mission
 

@@ -1,3 +1,10 @@
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
+#![deny(clippy::panic)]
+#![warn(clippy::pedantic)]
+#![warn(clippy::nursery)]
+#![forbid(unsafe_code)]
+
 mod agent_runtime;
 mod agent_runtime_support;
 mod config;
@@ -7,98 +14,523 @@ use serde_json::json;
 use std::env;
 use swarm::protocol_envelope::ProtocolEnvelope;
 use swarm::SwarmError;
+use swarm::CliError;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const HELP_DATA: &str = r#"{
-  "tool": "swarm",
-  "description": "PostgreSQL-based agent swarm coordination for AI-native workflows",
-  "version": "0.2.0",
-  "protocol": "v1",
-  "ai_expectations": {
-    "input_format": "JSONL - single line JSON objects via stdin",
-    "output_format": "JSONL - parse by keys, not string matching",
-    "workflow": [
-      "1. Run 'swarm doctor' to verify environment",
-      "2. Check 'swarm status' for current state", 
-      "3. Use 'dry':true flag before destructive operations",
-      "4. Parse 'ok' field to determine success/failure",
-      "5. Check 'err.msg' for actionable error details",
-      "6. Follow 'next' field suggestions for workflow continuation"
-    ],
-    "rules": [
-      "Always parse JSON responses programmatically",
-      "Never assume command success - check 'ok' field",
-      "Use dry-run mode for unfamiliar operations",
-      "Handle database connection errors gracefully",
-      "Follow the state machine transitions exactly"
-    ]
-  },
-  "usage": "echo '{\"cmd\":\"<command>\"}' | swarm",
-  "commands": [
-    {"cmd": "doctor", "desc": "Check environment health - REQUIRED first step", "ai_priority": "high"},
-    {"cmd": "status", "desc": "Show swarm state", "ai_priority": "high"},
-    {"cmd": "agent", "desc": "Run single agent pipeline", "args": {"id": "number (1-12)", "dry": "boolean (optional, use for testing)"}, "ai_priority": "high"},
-    {"cmd": "smoke", "desc": "Run smoke test for agent", "args": {"id": "number"}, "ai_priority": "medium"},
-    {"cmd": "register", "desc": "Register repository agents", "args": {"count": "number"}, "ai_priority": "medium"},
-    {"cmd": "release", "desc": "Release agent claim", "args": {"agent_id": "number"}, "ai_priority": "medium"},
-    {"cmd": "monitor", "desc": "Read monitor view", "args": {"view": "active|progress|failures|messages", "watch_ms": "number (optional)"}, "ai_priority": "high"},
-    {"cmd": "init-db", "desc": "Initialize database schema", "ai_priority": "low"},
-    {"cmd": "init-local-db", "desc": "Initialize local database", "ai_priority": "low"},
-    {"cmd": "spawn-prompts", "desc": "Generate agent prompt files", "args": {"count": "number"}, "ai_priority": "low"},
-    {"cmd": "batch", "desc": "Execute multiple commands", "ai_priority": "medium"},
-    {"cmd": "bootstrap", "desc": "Bootstrap swarm environment", "ai_priority": "low"},
-    {"cmd": "?", "desc": "Return this API metadata", "ai_priority": "high"}
+  "n": "swarm",
+  "desc": "PostgreSQL-based agent swarm coordination",
+  "v": "0.2.0",
+  "proto": "v1",
+  "fmt": "jsonl",
+  "usage": "echo '{\"cmd\":\"<cmd>\"}' | swarm",
+  "cmds": [
+    ["init", "Initialize swarm (bootstrap + init-db + register)"],
+    ["doctor", "Environment health check"],
+    ["status", "Show swarm state"],
+    ["agent", "Run single agent"],
+    ["monitor", "View agents/progress"],
+    ["register", "Register agents"],
+    ["release", "Release agent claim"],
+    ["prompt", "Return agent/skill prompt"],
+    ["smoke", "Run smoke test"],
+    ["init-db", "Initialize database"],
+    ["bootstrap", "Bootstrap repo"],
+    ["batch", "Execute multiple commands"],
+    ["state", "Full coordinator state"],
+    ["?", "This help"]
   ],
   "examples": [
-    {
-      "desc": "Health check - ALWAYS run this first",
-      "cmd": "echo '{\"cmd\":\"doctor\"}' | swarm"
-    },
-    {
-      "desc": "Dry run before executing agent",
-      "cmd": "echo '{\"cmd\":\"agent\",\"id\":1,\"dry\":true}' | swarm"
-    },
-    {
-      "desc": "Execute agent for real",
-      "cmd": "echo '{\"cmd\":\"agent\",\"id\":1}' | swarm"
-    },
-    {
-      "desc": "Monitor active agents",
-      "cmd": "echo '{\"cmd\":\"monitor\",\"view\":\"active\"}' | swarm"
-    }
+    {"desc": "Quick start", "cmd": "echo '{\"cmd\":\"init\"}' | swarm"},
+    {"desc": "Health check", "cmd": "echo '{\"cmd\":\"doctor\"}' | swarm"},
+    {"desc": "Dry run", "cmd": "echo '{\"cmd\":\"agent\",\"id\":1,\"dry\":true}' | swarm"}
   ],
-  "response_schema": {
-    "ok": "boolean - true if command succeeded",
-    "d": "object - response data (when ok=true)",
-    "err": "object - error details (when ok=false)",
-    "err.code": "string - error code for programmatic handling",
-    "err.msg": "string - human-readable error message",
-    "next": "string - suggested next command",
-    "t": "number - timestamp in milliseconds",
-    "state": "object - current swarm state"
-  },
-  "documentation": "https://github.com/lewisprior/shitty-swarm-manager"
+  "resp": {
+    "ok": "bool - success",
+    "d": "object - data",
+    "err": "object - error",
+    "t": "number - timestamp",
+    "state": "object - current state"
+  }
 }"#;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
+pub enum CliCommand {
+    Doctor,
+    Help,
+    Status,
+    Agent { id: u32, dry: Option<bool> },
+    Init {
+        dry: Option<bool>,
+        database_url: Option<String>,
+        schema: Option<String>,
+        seed_agents: Option<u32>,
+    },
+    Register { count: Option<u32>, dry: Option<bool> },
+    Release { agent_id: u32, dry: Option<bool> },
+    Monitor { view: Option<String>, watch_ms: Option<u64> },
+    InitDb {
+        url: Option<String>,
+        schema: Option<String>,
+        seed_agents: Option<u32>,
+        dry: Option<bool>,
+    },
+    InitLocalDb {
+        container_name: Option<String>,
+        port: Option<u16>,
+        user: Option<String>,
+        database: Option<String>,
+        schema: Option<String>,
+        seed_agents: Option<u32>,
+        dry: Option<bool>,
+    },
+    Bootstrap { dry: Option<bool> },
+    SpawnPrompts {
+        template: Option<String>,
+        out_dir: Option<String>,
+        count: Option<u32>,
+        dry: Option<bool>,
+    },
+    Prompt { id: u32, skill: Option<String> },
+    Smoke { id: u32, dry: Option<bool> },
+    Batch { dry: Option<bool> },
+    State,
+    History { limit: Option<i64> },
+    Lock {
+        resource: String,
+        agent: String,
+        ttl_ms: i64,
+        dry: Option<bool>,
+    },
+    Unlock { resource: String, agent: String, dry: Option<bool> },
+    Agents,
+    Broadcast { msg: String, from: String, dry: Option<bool> },
+    LoadProfile {
+        agents: Option<u32>,
+        rounds: Option<u32>,
+        timeout_ms: Option<u64>,
+        dry: Option<bool>,
+    },
+    Json(String),
+}
+
+#[derive(Debug, Clone)]
 enum CliAction {
     ShowHelp,
     ShowVersion,
     RunProtocol,
-    ExitWithError(i32),
+    Command(CliCommand),
 }
 
-fn parse_cli_args(args: &[String]) -> CliAction {
+fn parse_cli_args(args: &[String]) -> Result<CliAction, CliError> {
     match args.first().map(String::as_str) {
-        None | Some("--") => CliAction::RunProtocol,
-        Some("-h") | Some("--help") => CliAction::ShowHelp,
-        Some("-v") | Some("--version") => CliAction::ShowVersion,
-        Some(_) => CliAction::ExitWithError(1),
+        None | Some("--") => Ok(CliAction::RunProtocol),
+        Some("-h") | Some("--help") => Ok(CliAction::ShowHelp),
+        Some("-v") | Some("--version") => Ok(CliAction::ShowVersion),
+        Some("--json") => {
+            if args.len() < 2 {
+                Err(CliError::MissingRequiredArg {
+                    arg_name: "command".to_string(),
+                    usage: "--json <command>".to_string(),
+                })
+            } else {
+                Ok(CliAction::Command(CliCommand::Json(args[1].clone())))
+            }
+        }
+
+        // Commands with no args
+        Some("doctor") => Ok(CliAction::Command(CliCommand::Doctor)),
+        Some("status") => Ok(CliAction::Command(CliCommand::Status)),
+        Some("?") | Some("help") => Ok(CliAction::Command(CliCommand::Help)),
+        Some("state") => Ok(CliAction::Command(CliCommand::State)),
+        Some("agents") => Ok(CliAction::Command(CliCommand::Agents)),
+        Some("batch") => {
+            let dry = parse_optional_arg(args, "dry")?;
+            Ok(CliAction::Command(CliCommand::Batch { dry }))
+        }
+
+        // Commands with required args
+        Some("agent") => {
+            let id = parse_required_arg(args, "id")?;
+            let dry = parse_optional_arg(args, "dry")?;
+            Ok(CliAction::Command(CliCommand::Agent { id, dry }))
+        }
+
+        Some("init") => {
+            let dry = parse_optional_arg(args, "dry")?;
+            let database_url = parse_optional_arg(args, "database_url")?;
+            let schema = parse_optional_arg(args, "schema")?;
+            let seed_agents = parse_optional_arg(args, "seed_agents")?;
+            Ok(CliAction::Command(CliCommand::Init {
+                dry,
+                database_url,
+                schema,
+                seed_agents,
+            }))
+        }
+
+        Some("register") => {
+            let count = parse_optional_arg(args, "count")?;
+            let dry = parse_optional_arg(args, "dry")?;
+            Ok(CliAction::Command(CliCommand::Register { count, dry }))
+        }
+
+        Some("release") => {
+            let agent_id = parse_required_arg(args, "agent_id")?;
+            let dry = parse_optional_arg(args, "dry")?;
+            Ok(CliAction::Command(CliCommand::Release { agent_id, dry }))
+        }
+
+        Some("monitor") => {
+            let view = parse_optional_arg(args, "view")?;
+            let watch_ms = parse_optional_arg(args, "watch_ms")?;
+            Ok(CliAction::Command(CliCommand::Monitor { view, watch_ms }))
+        }
+
+        Some("init-db") => {
+            let url = parse_optional_arg(args, "url")?;
+            let schema = parse_optional_arg(args, "schema")?;
+            let seed_agents = parse_optional_arg(args, "seed_agents")?;
+            let dry = parse_optional_arg(args, "dry")?;
+            Ok(CliAction::Command(CliCommand::InitDb {
+                url,
+                schema,
+                seed_agents,
+                dry,
+            }))
+        }
+
+        Some("init-local-db") => {
+            let container_name = parse_optional_arg(args, "container_name")?;
+            let port = parse_optional_arg(args, "port")?;
+            let user = parse_optional_arg(args, "user")?;
+            let database = parse_optional_arg(args, "database")?;
+            let schema = parse_optional_arg(args, "schema")?;
+            let seed_agents = parse_optional_arg(args, "seed_agents")?;
+            let dry = parse_optional_arg(args, "dry")?;
+            Ok(CliAction::Command(CliCommand::InitLocalDb {
+                container_name,
+                port,
+                user,
+                database,
+                schema,
+                seed_agents,
+                dry,
+            }))
+        }
+
+        Some("bootstrap") => {
+            let dry = parse_optional_arg(args, "dry")?;
+            Ok(CliAction::Command(CliCommand::Bootstrap { dry }))
+        }
+
+        Some("spawn-prompts") => {
+            let template = parse_optional_arg(args, "template")?;
+            let out_dir = parse_optional_arg(args, "out_dir")?;
+            let count = parse_optional_arg(args, "count")?;
+            let dry = parse_optional_arg(args, "dry")?;
+            Ok(CliAction::Command(CliCommand::SpawnPrompts {
+                template,
+                out_dir,
+                count,
+                dry,
+            }))
+        }
+
+        Some("prompt") => {
+            let id = parse_optional_arg(args, "id")?.map_or(1, |v: u32| v);
+            let skill = parse_optional_arg(args, "skill")?;
+            Ok(CliAction::Command(CliCommand::Prompt { id, skill }))
+        }
+
+        Some("smoke") => {
+            let id = parse_optional_arg(args, "id")?.map_or(1, |v: u32| v);
+            let dry = parse_optional_arg(args, "dry")?;
+            Ok(CliAction::Command(CliCommand::Smoke { id, dry }))
+        }
+
+        Some("history") => {
+            let limit = parse_optional_arg(args, "limit")?;
+            Ok(CliAction::Command(CliCommand::History { limit }))
+        }
+
+        Some("lock") => {
+            let resource = parse_required_arg(args, "resource")?;
+            let agent = parse_required_arg(args, "agent")?;
+            let ttl_ms = parse_required_arg(args, "ttl_ms")?;
+            let dry = parse_optional_arg(args, "dry")?;
+            Ok(CliAction::Command(CliCommand::Lock {
+                resource,
+                agent,
+                ttl_ms,
+                dry,
+            }))
+        }
+
+        Some("unlock") => {
+            let resource = parse_required_arg(args, "resource")?;
+            let agent = parse_required_arg(args, "agent")?;
+            let dry = parse_optional_arg(args, "dry")?;
+            Ok(CliAction::Command(CliCommand::Unlock {
+                resource,
+                agent,
+                dry,
+            }))
+        }
+
+        Some("broadcast") => {
+            let msg = parse_required_arg(args, "msg")?;
+            let from = parse_required_arg(args, "from")?;
+            let dry = parse_optional_arg(args, "dry")?;
+            Ok(CliAction::Command(CliCommand::Broadcast {
+                msg,
+                from,
+                dry,
+            }))
+        }
+
+        Some("load-profile") => {
+            let agents = parse_optional_arg(args, "agents")?;
+            let rounds = parse_optional_arg(args, "rounds")?;
+            let timeout_ms = parse_optional_arg(args, "timeout_ms")?;
+            let dry = parse_optional_arg(args, "dry")?;
+            Ok(CliAction::Command(CliCommand::LoadProfile {
+                agents,
+                rounds,
+                timeout_ms,
+                dry,
+            }))
+        }
+
+        Some(cmd) => Err(CliError::UnknownCommand {
+            command: cmd.to_string(),
+            suggestions: suggest_commands(cmd),
+        }),
     }
 }
 
-fn handle_cli_action(action: CliAction, unknown_arg: Option<&str>) -> (Option<String>, i32) {
+fn cli_command_to_request(cmd: CliCommand) -> String {
+    let (cmd_name, dry, args) = match cmd {
+        CliCommand::Doctor => ("doctor".to_string(), None, serde_json::Map::new()),
+
+        CliCommand::Help => ("?".to_string(), None, serde_json::Map::new()),
+
+        CliCommand::Status => ("status".to_string(), None, serde_json::Map::new()),
+
+        CliCommand::Agent { id, dry } => {
+            let mut args = serde_json::Map::new();
+            args.insert("id".to_string(), json!(id));
+            ("agent".to_string(), dry, args)
+        }
+
+        CliCommand::Init {
+            dry,
+            database_url,
+            schema,
+            seed_agents,
+        } => {
+            let mut args = serde_json::Map::new();
+            if let Some(url) = database_url {
+                args.insert("database_url".to_string(), json!(url));
+            }
+            if let Some(schema_path) = schema {
+                args.insert("schema".to_string(), json!(schema_path));
+            }
+            if let Some(seeds) = seed_agents {
+                args.insert("seed_agents".to_string(), json!(seeds));
+            }
+            ("init".to_string(), dry, args)
+        }
+
+        CliCommand::Register { count, dry } => {
+            let mut args = serde_json::Map::new();
+            if let Some(cnt) = count {
+                args.insert("count".to_string(), json!(cnt));
+            }
+            ("register".to_string(), dry, args)
+        }
+
+        CliCommand::Release { agent_id, dry } => {
+            let mut args = serde_json::Map::new();
+            args.insert("agent_id".to_string(), json!(agent_id));
+            ("release".to_string(), dry, args)
+        }
+
+        CliCommand::Monitor { view, watch_ms } => {
+            let mut args = serde_json::Map::new();
+            if let Some(v) = view {
+                args.insert("view".to_string(), json!(v));
+            }
+            if let Some(w) = watch_ms {
+                args.insert("watch_ms".to_string(), json!(w));
+            }
+            ("monitor".to_string(), None, args)
+        }
+
+        CliCommand::InitDb {
+            url,
+            schema,
+            seed_agents,
+            dry,
+        } => {
+            let mut args = serde_json::Map::new();
+            if let Some(u) = url {
+                args.insert("url".to_string(), json!(u));
+            }
+            if let Some(schema_path) = schema {
+                args.insert("schema".to_string(), json!(schema_path));
+            }
+            if let Some(seeds) = seed_agents {
+                args.insert("seed_agents".to_string(), json!(seeds));
+            }
+            ("init-db".to_string(), dry, args)
+        }
+
+        CliCommand::InitLocalDb {
+            container_name,
+            port,
+            user,
+            database,
+            schema,
+            seed_agents,
+            dry,
+        } => {
+            let mut args = serde_json::Map::new();
+            if let Some(name) = container_name {
+                args.insert("container_name".to_string(), json!(name));
+            }
+            if let Some(p) = port {
+                args.insert("port".to_string(), json!(p));
+            }
+            if let Some(u) = user {
+                args.insert("user".to_string(), json!(u));
+            }
+            if let Some(db) = database {
+                args.insert("database".to_string(), json!(db));
+            }
+            if let Some(schema_path) = schema {
+                args.insert("schema".to_string(), json!(schema_path));
+            }
+            if let Some(seeds) = seed_agents {
+                args.insert("seed_agents".to_string(), json!(seeds));
+            }
+            ("init-local-db".to_string(), dry, args)
+        }
+
+        CliCommand::Bootstrap { dry } => ("bootstrap".to_string(), dry, serde_json::Map::new()),
+
+        CliCommand::SpawnPrompts {
+            template,
+            out_dir,
+            count,
+            dry,
+        } => {
+            let mut args = serde_json::Map::new();
+            if let Some(t) = template {
+                args.insert("template".to_string(), json!(t));
+            }
+            if let Some(dir) = out_dir {
+                args.insert("out_dir".to_string(), json!(dir));
+            }
+            if let Some(c) = count {
+                args.insert("count".to_string(), json!(c));
+            }
+            ("spawn-prompts".to_string(), dry, args)
+        }
+
+        CliCommand::Prompt { id, skill } => {
+            let mut args = serde_json::Map::new();
+            args.insert("id".to_string(), json!(id));
+            if let Some(s) = skill {
+                args.insert("skill".to_string(), json!(s));
+            }
+            ("prompt".to_string(), None, args)
+        }
+
+        CliCommand::Smoke { id, dry } => {
+            let mut args = serde_json::Map::new();
+            args.insert("id".to_string(), json!(id));
+            ("smoke".to_string(), dry, args)
+        }
+
+        CliCommand::Batch { dry } => ("batch".to_string(), dry, serde_json::Map::new()),
+
+        CliCommand::State => ("state".to_string(), None, serde_json::Map::new()),
+
+        CliCommand::History { limit } => {
+            let mut args = serde_json::Map::new();
+            if let Some(l) = limit {
+                args.insert("limit".to_string(), json!(l));
+            }
+            ("history".to_string(), None, args)
+        }
+
+        CliCommand::Lock {
+            resource,
+            agent,
+            ttl_ms,
+            dry,
+        } => {
+            let mut args = serde_json::Map::new();
+            args.insert("resource".to_string(), json!(resource));
+            args.insert("agent".to_string(), json!(agent));
+            args.insert("ttl_ms".to_string(), json!(ttl_ms));
+            ("lock".to_string(), dry, args)
+        }
+
+        CliCommand::Unlock {
+            resource,
+            agent,
+            dry,
+        } => {
+            let mut args = serde_json::Map::new();
+            args.insert("resource".to_string(), json!(resource));
+            args.insert("agent".to_string(), json!(agent));
+            ("unlock".to_string(), dry, args)
+        }
+
+        CliCommand::Agents => ("agents".to_string(), None, serde_json::Map::new()),
+
+        CliCommand::Broadcast { msg, from, dry } => {
+            let mut args = serde_json::Map::new();
+            args.insert("msg".to_string(), json!(msg));
+            args.insert("from".to_string(), json!(from));
+            ("broadcast".to_string(), dry, args)
+        }
+
+        CliCommand::LoadProfile {
+            agents,
+            rounds,
+            timeout_ms,
+            dry,
+        } => {
+            let mut args = serde_json::Map::new();
+            if let Some(a) = agents {
+                args.insert("agents".to_string(), json!(a));
+            }
+            if let Some(r) = rounds {
+                args.insert("rounds".to_string(), json!(r));
+            }
+            if let Some(t) = timeout_ms {
+                args.insert("timeout_ms".to_string(), json!(t));
+            }
+            ("load-profile".to_string(), dry, args)
+        }
+
+        CliCommand::Json(cmd) => (cmd, None, serde_json::Map::new())
+    };
+
+    let request = protocol_runtime::ProtocolRequest {
+        cmd: cmd_name,
+        rid: None,
+        dry,
+        args,
+    };
+    serde_json::to_string(&request).unwrap_or_default()
+}
+
+fn handle_cli_action(action: &CliAction, _unknown_arg: Option<&str>) -> (Option<String>, i32, bool) {
     match action {
         CliAction::ShowHelp => {
             let help_json: serde_json::Value = serde_json::from_str(HELP_DATA).unwrap_or_default();
@@ -106,67 +538,157 @@ fn handle_cli_action(action: CliAction, unknown_arg: Option<&str>) -> (Option<St
             (
                 Some(serde_json::to_string(&envelope).unwrap_or_default()),
                 0,
+                false,
             )
         }
         CliAction::ShowVersion => {
             let version_data = json!({
-                "tool": "swarm",
-                "version": VERSION,
-                "protocol": "v1"
+                "n": "swarm",
+                "v": VERSION,
+                "proto": "v1"
             });
             let envelope = ProtocolEnvelope::success(None, version_data);
             (
                 Some(serde_json::to_string(&envelope).unwrap_or_default()),
                 0,
+                false,
             )
         }
-        CliAction::RunProtocol => (None, 0),
-        CliAction::ExitWithError(code) => {
-            let error_msg = unknown_arg.map_or_else(
-                || "Invalid CLI usage".to_string(),
-                |arg| {
-                    format!(
-                        "Unknown argument: {}. Use --help for usage information",
-                        arg
-                    )
-                },
-            );
-            let envelope = ProtocolEnvelope::error(None, "CLI_ERROR".to_string(), error_msg);
-            (
-                Some(serde_json::to_string(&envelope).unwrap_or_default()),
-                code,
-            )
+        CliAction::RunProtocol => (None, 0, true),
+        CliAction::Command(cmd) => {
+            let json = cli_command_to_request(cmd.clone());
+            (Some(json), 0, false)
         }
     }
 }
 
+fn parse_required_arg<T>(args: &[String], name: &str) -> Result<T, CliError>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    let flag = format!("--{}", name.replace('_', "-"));
+    args.iter()
+        .position(|a| a.as_str() == flag)
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<T>().ok())
+        .ok_or_else(|| CliError::MissingRequiredArg {
+            arg_name: name.to_string(),
+            usage: format!("--{} <value>", name.replace('_', "-")),
+        })
+}
+
+fn parse_optional_arg<T>(args: &[String], name: &str) -> Result<Option<T>, CliError>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    let flag = format!("--{}", name.replace('_', "-"));
+    args.iter()
+        .position(|a| a.as_str() == flag)
+        .and_then(|i| args.get(i + 1))
+        .map(|v| {
+            v.parse::<T>().map_err(|e| CliError::InvalidArgValue {
+                arg_name: name.to_string(),
+                value: format!("{}", e),
+                expected: std::any::type_name::<T>().to_string(),
+            })
+        })
+        .transpose()
+}
+
+fn suggest_commands(typo: &str) -> Vec<String> {
+    const VALID_COMMANDS: &[&str] = &[
+        "doctor",
+        "help",
+        "status",
+        "agent",
+        "init",
+        "register",
+        "release",
+        "monitor",
+        "init-db",
+        "init-local-db",
+        "bootstrap",
+        "spawn-prompts",
+        "prompt",
+        "smoke",
+        "batch",
+        "state",
+        "history",
+        "lock",
+        "unlock",
+        "agents",
+        "broadcast",
+        "load-profile",
+    ];
+
+    VALID_COMMANDS
+        .iter()
+        .map(|cmd| (cmd, strsim::levenshtein(typo, cmd)))
+        .filter(|(_, dist)| *dist <= 3)
+        .min_by_key(|(_, dist)| *dist)
+        .map(|(cmd, _)| vec![cmd.to_string()])
+        .unwrap_or_default()
+}
+
 #[tokio::main]
 async fn main() {
+    dotenv::dotenv().ok();
+
     tracing_subscriber::fmt::init();
 
     let args: Vec<String> = env::args().skip(1).collect();
-    let action = parse_cli_args(&args);
-    let unknown_arg = args
-        .first()
-        .filter(|_| matches!(action, CliAction::ExitWithError(_)));
 
-    let (output, code) = handle_cli_action(action, unknown_arg.map(String::as_str));
-
-    if let Some(msg) = output {
-        println!("{}", msg);
-        std::process::exit(code);
-    }
-
-    let exit_code = match run().await {
-        Ok(()) => 0,
+    let action = match parse_cli_args(&args) {
+        Ok(a) => a,
         Err(err) => {
-            let envelope = ProtocolEnvelope::error(None, err.code().to_string(), err.to_string());
-            println!("{}", serde_json::to_string(&envelope).unwrap_or_default());
-            err.exit_code()
+            eprintln!("Error: {}", err);
+            if let CliError::UnknownCommand {
+                command: _,
+                suggestions,
+            } = &err
+            {
+                if let Some(suggestion) = suggestions.first() {
+                    eprintln!("Did you mean: {}?", suggestion);
+                }
+            }
+            std::process::exit(1);
         }
     };
 
-    std::process::exit(exit_code);
+    let (input_or_output, code, is_loop) = handle_cli_action(&action, None);
+
+    if is_loop {
+        let exit_code = match run().await {
+            Ok(()) => 0,
+            Err(err) => {
+                let envelope =
+                    ProtocolEnvelope::error(None, err.code().to_string(), err.to_string());
+                println!("{}", serde_json::to_string(&envelope).unwrap_or_default());
+                err.exit_code()
+            }
+        };
+        std::process::exit(exit_code);
+    }
+
+    if let Some(msg) = input_or_output {
+        if code != 0 || matches!(action, CliAction::ShowHelp | CliAction::ShowVersion) {
+            println!("{}", msg);
+            std::process::exit(code);
+        }
+
+        let exit_code = match protocol_runtime::process_protocol_line(&msg).await {
+            Ok(()) => 0,
+            Err(err) => {
+                let envelope =
+                    ProtocolEnvelope::error(None, err.code().to_string(), err.to_string());
+                println!("{}", serde_json::to_string(&envelope).unwrap_or_default());
+                err.exit_code()
+            }
+        };
+        std::process::exit(exit_code);
+    }
 }
 
 async fn run() -> std::result::Result<(), SwarmError> {

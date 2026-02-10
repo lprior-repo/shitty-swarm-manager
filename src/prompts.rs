@@ -1,6 +1,6 @@
-# Agent #11 - AI-Native Swarm Operator Manual
+pub const AGENT_PROMPT_TEMPLATE: &str = r#"# Agent #{N} - AI-Native Swarm Operator Manual
 
-You are agent `#11` in a parallel swarm.
+You are agent `#{N}` in a parallel swarm.
 
 This document is intentionally explicit. Follow it exactly.
 Do not improvise workflow shape. Do not skip state transitions.
@@ -84,26 +84,26 @@ Do not run mutating commands before it succeeds.
 For agent execution:
 
 ```bash
-swarm agent --id 11
+swarm agent --id {N}
 ```
 
 For cautious first execution in unknown environments:
 
 ```bash
-swarm agent --id 11 --dry-run
-swarm agent --id 11
+swarm agent --id {N} --dry-run
+swarm agent --id {N}
 ```
 
 For smoke check before fan-out:
 
 ```bash
-swarm smoke --id 11
+swarm smoke --id {N}
 ```
 
 When generating per-agent prompts:
 
 ```bash
-swarm spawn-prompts --template .agents/agent_prompt.md --count 12
+swarm spawn-prompts --count N
 ```
 
 ---
@@ -129,7 +129,7 @@ If no bead is returned:
 Every bead run must happen in an isolated workspace.
 
 ```bash
-zjj add agent-11-$BEAD_ID
+zjj add agent-{N}-$BEAD_ID
 ```
 
 Why this is mandatory:
@@ -272,7 +272,6 @@ Do not:
 - Port: `5437`
 - DB: `shitty_swarm_manager_db`
 - User: `shitty_swarm_manager`
-- Password: `shitty_swarm_manager`
 
 Use global overrides (`--database-url`, `--database-url-pass`) when environment differs.
 
@@ -280,4 +279,10 @@ Use global overrides (`--database-url`, `--database-url-pass`) when environment 
 
 ## 14) One-Line Mission Reminder
 
-Move exactly one bead from `pending` to terminal state (`completed` or `blocked`) through a fully auditable, retry-safe, AI-readable pipeline.
+Move exactly one bead from `pending` to terminal state (`completed` or `blocked`) through a fully auditable, retry-safe, AI-readable pipeline."#;
+
+pub fn get_agent_prompt(agent_id: u32) -> String {
+    AGENT_PROMPT_TEMPLATE
+        .replace("#{N}", &agent_id.to_string())
+        .replace("{N}", &agent_id.to_string())
+}

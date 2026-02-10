@@ -112,16 +112,26 @@ impl SwarmDb {
             .map_err(|e| SwarmError::DatabaseError(format!("Failed to count agents: {}", e)))
     }
 
-    pub async fn register_repo(&self, _repo_id: &RepoId, _name: &str, _path: &str) -> Result<()> {
-        info!("Repository registration skipped for single-repo coordinator");
-        Ok(())
+    pub async fn register_repo(&self, repo_id: &RepoId, name: &str, path: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO repos (repo_id, name, path) VALUES ($1, $2, $3)
+             ON CONFLICT (repo_id) DO NOTHING",
+        )
+        .bind(repo_id.value())
+        .bind(name)
+        .bind(path)
+        .execute(self.pool())
+        .await
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to register repo: {}", e)))
+        .map(|_| ())
     }
 
     pub async fn register_agent(&self, agent_id: &AgentId) -> Result<bool> {
         sqlx::query(
-            "INSERT INTO agent_state (agent_id, status) VALUES ($1, 'idle')
-             ON CONFLICT (agent_id) DO NOTHING",
+            "INSERT INTO agent_state (repo_id, agent_id, status) VALUES ($1, $2, 'idle')
+             ON CONFLICT (repo_id, agent_id) DO NOTHING",
         )
+        .bind(agent_id.repo_id().value())
         .bind(agent_id.number() as i32)
         .execute(self.pool())
         .await
@@ -321,6 +331,15 @@ impl SwarmDb {
             .await
             .map(|_| ())
             .map_err(|e| SwarmError::DatabaseError(format!("Failed to update status: {}", e)))
+    }
+
+    pub async fn update_config(&self, max_agents: u32) -> Result<()> {
+        sqlx::query("UPDATE swarm_config SET max_agents = $1 WHERE id = TRUE")
+            .bind(max_agents as i32)
+            .execute(self.pool())
+            .await
+            .map(|_| ())
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to update config: {}", e)))
     }
 
     pub async fn start_swarm(&self, _repo_id: &RepoId) -> Result<()> {

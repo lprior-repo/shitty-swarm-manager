@@ -53,7 +53,7 @@ where
             let agent_count = env_lookup("SWARM_MAX_AGENTS")
                 .and_then(|v| v.parse::<u32>().ok())
                 .filter(|v| *v > 0)
-                .unwrap_or(12);
+                .unwrap_or(10);
 
             32_u32.max(agent_count.saturating_mul(3))
         })

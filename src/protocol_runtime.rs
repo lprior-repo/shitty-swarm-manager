@@ -8,18 +8,421 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::Instant;
 use swarm::protocol_envelope::ProtocolEnvelope;
-use swarm::{code, AgentId, RepoId, SwarmDb, SwarmError, ERROR_CODES};
+use swarm::{code, AgentId, RepoId, SwarmDb, SwarmError};
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct ProtocolRequest {
     pub cmd: String,
     pub rid: Option<String>,
     pub dry: Option<bool>,
     #[serde(flatten)]
     pub args: Map<String, Value>,
+}
+
+// ============================================================================
+// PARSE INPUT TRAIT
+// ============================================================================
+
+pub trait ParseInput {
+    type Input;
+    fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError>;
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ParseError {
+    #[error("Missing required field: {field}")]
+    MissingField { field: String },
+
+    #[error("Invalid type for field {field}: expected {expected}, got {got}")]
+    InvalidType {
+        field: String,
+        expected: String,
+        got: String,
+    },
+
+    #[error("Invalid value for field {field}: {value}")]
+    InvalidValue { field: String, value: String },
+
+    #[error("Parse error: {0}")]
+    Custom(String),
+}
+
+// Implement ParseInput for all contract types
+impl ParseInput for swarm::DoctorInput {
+    type Input = swarm::DoctorInput;
+
+    fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
+        Ok(swarm::DoctorInput {
+            json: request.args.get("json").and_then(|v: &Value| v.as_bool()),
+        })
+    }
+}
+
+impl ParseInput for swarm::HelpInput {
+    type Input = swarm::HelpInput;
+
+    fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
+        Ok(swarm::HelpInput {
+            short: request.args.get("short").and_then(|v: &Value| v.as_bool()),
+            s: request.args.get("s").and_then(|v: &Value| v.as_bool()),
+        })
+    }
+}
+
+impl ParseInput for swarm::StatusInput {
+    type Input = swarm::StatusInput;
+
+    fn parse_input(_request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
+        Ok(swarm::StatusInput {})
+    }
+}
+
+impl ParseInput for swarm::AgentInput {
+    type Input = swarm::AgentInput;
+
+    fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
+        let id = request
+            .args
+            .get("id")
+            .and_then(|v: &Value| v.as_u64())
+            .map(|v| v as u32)
+            .ok_or_else(|| ParseError::MissingField {
+                field: "id".to_string(),
+            })?;
+
+        Ok(swarm::AgentInput {
+            id,
+            dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
+        })
+    }
+}
+
+impl ParseInput for swarm::InitInput {
+    type Input = swarm::InitInput;
+
+    fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
+        Ok(swarm::InitInput {
+            dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
+            database_url: request
+                .args
+                .get("database_url")
+                .and_then(|v: &Value| v.as_str())
+                .map(|s| s.to_string()),
+            schema: request
+                .args
+                .get("schema")
+                .and_then(|v: &Value| v.as_str())
+                .map(|s| s.to_string()),
+            seed_agents: request.args.get("seed_agents").and_then(|v: &Value| v.as_u64()).map(|v| v as u32),
+        })
+    }
+}
+
+impl ParseInput for swarm::RegisterInput {
+    type Input = swarm::RegisterInput;
+
+    fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
+        Ok(swarm::RegisterInput {
+            count: request.args.get("count").and_then(|v: &Value| v.as_u64()).map(|v| v as u32),
+            dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
+        })
+    }
+}
+
+impl ParseInput for swarm::ReleaseInput {
+    type Input = swarm::ReleaseInput;
+
+    fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
+        let agent_id = request
+            .args
+            .get("agent_id")
+            .and_then(|v: &Value| v.as_u64())
+            .map(|v| v as u32)
+            .ok_or_else(|| ParseError::MissingField {
+                field: "agent_id".to_string(),
+            })?;
+
+        Ok(swarm::ReleaseInput {
+            agent_id,
+            dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
+        })
+    }
+}
+
+impl ParseInput for swarm::MonitorInput {
+    type Input = swarm::MonitorInput;
+
+    fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
+        Ok(swarm::MonitorInput {
+            view: request.args.get("view").and_then(|v: &Value| v.as_str()).map(|s| s.to_string()),
+            watch_ms: request.args.get("watch_ms").and_then(|v: &Value| v.as_u64()),
+        })
+    }
+}
+
+impl ParseInput for swarm::InitDbInput {
+    type Input = swarm::InitDbInput;
+
+    fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
+        Ok(swarm::InitDbInput {
+            url: request.args.get("url").and_then(|v: &Value| v.as_str()).map(|s| s.to_string()),
+            schema: request.args.get("schema").and_then(|v: &Value| v.as_str()).map(|s| s.to_string()),
+            seed_agents: request.args.get("seed_agents").and_then(|v: &Value| v.as_u64()).map(|v| v as u32),
+            dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
+        })
+    }
+}
+
+impl ParseInput for swarm::InitLocalDbInput {
+    type Input = swarm::InitLocalDbInput;
+
+    fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
+        Ok(swarm::InitLocalDbInput {
+            container_name: request
+                .args
+                .get("container_name")
+                .and_then(|v: &Value| v.as_str())
+                .map(|s| s.to_string()),
+            port: request.args.get("port").and_then(|v: &Value| v.as_u64()).map(|v| v as u16),
+            user: request.args.get("user").and_then(|v: &Value| v.as_str()).map(|s| s.to_string()),
+            database: request
+                .args
+                .get("database")
+                .and_then(|v: &Value| v.as_str())
+                .map(|s| s.to_string()),
+            schema: request.args.get("schema").and_then(|v: &Value| v.as_str()).map(|s| s.to_string()),
+            seed_agents: request.args.get("seed_agents").and_then(|v: &Value| v.as_u64()).map(|v| v as u32),
+            dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
+        })
+    }
+}
+
+impl ParseInput for swarm::BootstrapInput {
+    type Input = swarm::BootstrapInput;
+
+    fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
+        Ok(swarm::BootstrapInput {
+            dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
+        })
+    }
+}
+
+impl ParseInput for swarm::SpawnPromptsInput {
+    type Input = swarm::SpawnPromptsInput;
+
+    fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
+        Ok(swarm::SpawnPromptsInput {
+            template: request
+                .args
+                .get("template")
+                .and_then(|v: &Value| v.as_str())
+                .map(|s| s.to_string()),
+            out_dir: request
+                .args
+                .get("out_dir")
+                .and_then(|v: &Value| v.as_str())
+                .map(|s| s.to_string()),
+            count: request.args.get("count").and_then(|v: &Value| v.as_u64()).map(|v| v as u32),
+            dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
+        })
+    }
+}
+
+impl ParseInput for swarm::PromptInput {
+    type Input = swarm::PromptInput;
+
+    fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
+        Ok(swarm::PromptInput {
+            id: request
+                .args
+                .get("id")
+                .and_then(|v: &Value| v.as_u64())
+                .map(|v| v as u32)
+                .unwrap_or(1),
+            skill: request
+                .args
+                .get("skill")
+                .and_then(|v: &Value| v.as_str())
+                .map(|s| s.to_string()),
+        })
+    }
+}
+
+impl ParseInput for swarm::SmokeInput {
+    type Input = swarm::SmokeInput;
+
+    fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
+        Ok(swarm::SmokeInput {
+            id: request
+                .args
+                .get("id")
+                .and_then(|v: &Value| v.as_u64())
+                .map(|v| v as u32)
+                .unwrap_or(1),
+            dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
+        })
+    }
+}
+
+impl ParseInput for swarm::BatchInput {
+    type Input = swarm::BatchInput;
+
+    fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
+        let ops = request
+            .args
+            .get("ops")
+            .and_then(|v: &Value| v.as_array())
+            .ok_or_else(|| ParseError::MissingField {
+                field: "ops".to_string(),
+            })?
+            .clone();
+
+        Ok(swarm::BatchInput {
+            ops,
+            dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
+        })
+    }
+}
+
+impl ParseInput for swarm::StateInput {
+    type Input = swarm::StateInput;
+
+    fn parse_input(_request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
+        Ok(swarm::StateInput {})
+    }
+}
+
+impl ParseInput for swarm::HistoryInput {
+    type Input = swarm::HistoryInput;
+
+    fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
+        Ok(swarm::HistoryInput {
+            limit: request.args.get("limit").and_then(|v: &Value| v.as_i64()),
+        })
+    }
+}
+
+impl ParseInput for swarm::LockInput {
+    type Input = swarm::LockInput;
+
+    fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
+        let resource = request
+            .args
+            .get("resource")
+            .and_then(|v: &Value| v.as_str())
+            .ok_or_else(|| ParseError::MissingField {
+                field: "resource".to_string(),
+            })?
+            .to_string();
+
+        let agent = request
+            .args
+            .get("agent")
+            .and_then(|v: &Value| v.as_str())
+            .ok_or_else(|| ParseError::MissingField {
+                field: "agent".to_string(),
+            })?
+            .to_string();
+
+        let ttl_ms = request
+            .args
+            .get("ttl_ms")
+            .and_then(|v: &Value| v.as_i64())
+            .ok_or_else(|| ParseError::MissingField {
+                field: "ttl_ms".to_string(),
+            })?;
+
+        Ok(swarm::LockInput {
+            resource,
+            agent,
+            ttl_ms,
+            dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
+        })
+    }
+}
+
+impl ParseInput for swarm::UnlockInput {
+    type Input = swarm::UnlockInput;
+
+    fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
+        let resource = request
+            .args
+            .get("resource")
+            .and_then(|v: &Value| v.as_str())
+            .ok_or_else(|| ParseError::MissingField {
+                field: "resource".to_string(),
+            })?
+            .to_string();
+
+        let agent = request
+            .args
+            .get("agent")
+            .and_then(|v: &Value| v.as_str())
+            .ok_or_else(|| ParseError::MissingField {
+                field: "agent".to_string(),
+            })?
+            .to_string();
+
+        Ok(swarm::UnlockInput {
+            resource,
+            agent,
+            dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
+        })
+    }
+}
+
+impl ParseInput for swarm::AgentsInput {
+    type Input = swarm::AgentsInput;
+
+    fn parse_input(_request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
+        Ok(swarm::AgentsInput {})
+    }
+}
+
+impl ParseInput for swarm::BroadcastInput {
+    type Input = swarm::BroadcastInput;
+
+    fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
+        let msg = request
+            .args
+            .get("msg")
+            .and_then(|v: &Value| v.as_str())
+            .ok_or_else(|| ParseError::MissingField {
+                field: "msg".to_string(),
+            })?
+            .to_string();
+
+        let from = request
+            .args
+            .get("from")
+            .and_then(|v: &Value| v.as_str())
+            .ok_or_else(|| ParseError::MissingField {
+                field: "from".to_string(),
+            })?
+            .to_string();
+
+        Ok(swarm::BroadcastInput {
+            msg,
+            from,
+            dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
+        })
+    }
+}
+
+impl ParseInput for swarm::LoadProfileInput {
+    type Input = swarm::LoadProfileInput;
+
+    fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
+        Ok(swarm::LoadProfileInput {
+            agents: request.args.get("agents").and_then(|v: &Value| v.as_u64()).map(|v| v as u32),
+            rounds: request.args.get("rounds").and_then(|v: &Value| v.as_u64()).map(|v| v as u32),
+            timeout_ms: request.args.get("timeout_ms").and_then(|v: &Value| v.as_u64()),
+            dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -50,7 +453,7 @@ fn run_protocol_loop_recursive(
     })
 }
 
-async fn process_protocol_line(line: &str) -> std::result::Result<(), SwarmError> {
+pub async fn process_protocol_line(line: &str) -> std::result::Result<(), SwarmError> {
     let mut stdout = tokio::io::stdout();
     let started = Instant::now();
     let maybe_rid = parse_rid(line);
@@ -96,6 +499,30 @@ async fn process_protocol_line(line: &str) -> std::result::Result<(), SwarmError
         .map_err(SwarmError::IoError)?;
     stdout.write_all(b"\n").await.map_err(SwarmError::IoError)?;
 
+    let mut audit_args = audit_args;
+    if let Some(obj) = audit_args.as_object_mut() {
+        if let Some(url_val) = obj.get_mut("database_url") {
+            if let Some(url_str) = url_val.as_str() {
+                if let Ok(mut url) = url::Url::parse(url_str) {
+                    if url.password().is_some() {
+                        let _ = url.set_password(Some("********"));
+                        *url_val = json!(url.to_string());
+                    }
+                }
+            }
+        }
+        if let Some(url_val) = obj.get_mut("url") {
+            if let Some(url_str) = url_val.as_str() {
+                if let Ok(mut url) = url::Url::parse(url_str) {
+                    if url.password().is_some() {
+                        let _ = url.set_password(Some("********"));
+                        *url_val = json!(url.to_string());
+                    }
+                }
+            }
+        }
+    }
+
     let _ = audit_request(
         &audit_cmd,
         maybe_rid.as_deref(),
@@ -137,14 +564,16 @@ async fn execute_request_no_batch(
         "init-local-db" => handle_init_local_db(&request).await,
         "spawn-prompts" => handle_spawn_prompts(&request).await,
         "smoke" => handle_smoke(&request).await,
+        "prompt" => handle_prompt(&request).await,
         "doctor" => handle_doctor(&request).await,
         "load-profile" => handle_load_profile(&request).await,
         "bootstrap" => handle_bootstrap(&request).await,
+        "init" => handle_init(&request).await,
             other => Err(Box::new(ProtocolEnvelope::error(
                 request.rid.clone(),
                 code::INVALID.to_string(),
                 format!("Unknown command: {}", other),
-            ).with_fix("Use a valid command: doctor, status, agent, smoke, register, release, monitor, init-db, init-local-db, spawn-prompts, batch, bootstrap, or ? for help".to_string())
+            ).with_fix("Use a valid command: init, doctor, status, agent, smoke, prompt, register, release, monitor, init-db, init-local-db, spawn-prompts, batch, bootstrap, or ? for help".to_string())
             .with_ctx(json!({"cmd": other})))),
     }
 }
@@ -155,41 +584,34 @@ struct CommandSuccess {
     state: Value,
 }
 async fn handle_help(
-    request: &ProtocolRequest,
+    _request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
-    let commands = BTreeMap::from([
-        ("?", "Return API metadata"),
-        ("state", "Return full coordinator state"),
-        ("history", "Return persisted command history"),
-        ("batch", "Execute multiple commands with partial success"),
-        ("lock", "Acquire resource lock"),
-        ("unlock", "Release resource lock"),
-        ("agents", "List active lock holders"),
-        ("broadcast", "Broadcast coordination message"),
-        ("monitor", "Read monitor view"),
-        ("register", "Register repository agents"),
-        ("agent", "Run single agent pipeline"),
-        ("status", "Read progress summary"),
-        ("release", "Release current agent claim"),
-        ("init-db", "Initialize database schema"),
-        ("init-local-db", "Start local Postgres and init schema"),
-        ("spawn-prompts", "Generate per-agent prompts"),
-        ("smoke", "Run single-agent smoke"),
-        ("doctor", "Run environment diagnostics"),
-        ("load-profile", "Run synthetic load profile"),
-        ("bootstrap", "Idempotent repository bootstrap"),
-    ]);
+    // Compact help format (default)
+    let commands = vec![
+        ("init", "Initialize swarm (bootstrap + init-db + register)"),
+        ("doctor", "Environment health check"),
+        ("status", "Show swarm state"),
+        ("agent", "Run single agent"),
+        ("monitor", "View agents/progress"),
+        ("register", "Register agents"),
+        ("release", "Release agent claim"),
+        ("prompt", "Return agent/skill prompt"),
+        ("smoke", "Run smoke test"),
+        ("init-db", "Initialize database"),
+        ("bootstrap", "Bootstrap repo"),
+        ("batch", "Execute multiple commands"),
+        ("state", "Full coordinator state"),
+        ("?", "This help"),
+    ];
 
     Ok(CommandSuccess {
         data: json!({
-            "name": "swarm",
-            "version": env!("CARGO_PKG_VERSION"),
-            "description": "Deterministic multi-agent orchestration protocol CLI",
-            "commands": commands,
-            "errors": standard_errors(),
+            "n": "swarm",
+            "v": env!("CARGO_PKG_VERSION"),
+            "cmds": commands,
         }),
         next: "swarm state".to_string(),
-        state: minimal_state_for_request(request).await,
+        state: minimal_state_for_request(_request).await,
     })
 }
 
@@ -656,11 +1078,17 @@ async fn handle_monitor(
 async fn handle_register(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
+    let db: SwarmDb = db_from_request(request).await?;
+    let config = db.get_config(&RepoId::new("local")).await.ok();
+
     let count = request
         .args
         .get("count")
         .and_then(Value::as_u64)
-        .map_or(12, |value| value) as u32;
+        .map(|v| v as u32)
+        .or_else(|| config.as_ref().map(|c| c.max_agents))
+        .unwrap_or(10);
+
     if dry_flag(request) {
         return Ok(dry_run_success(
             request,
@@ -672,7 +1100,6 @@ async fn handle_register(
         ));
     }
 
-    let db: SwarmDb = db_from_request(request).await?;
     let repo_id = RepoId::from_current_dir().ok_or_else(|| {
         Box::new(
             ProtocolEnvelope::error(
@@ -686,6 +1113,10 @@ async fn handle_register(
     db.register_repo(&repo_id, repo_id.value(), ".")
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
+
+    if let Some(explicit_count) = request.args.get("count").and_then(Value::as_u64) {
+        let _ = db.update_config(explicit_count as u32).await;
+    }
 
     register_agents_recursive(&db, &repo_id, 1, count, request.rid.clone()).await?;
 
@@ -719,26 +1150,23 @@ fn register_agents_recursive<'a>(
 async fn handle_agent(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
-    let id = request
-        .args
-        .get("id")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| {
+    let input = swarm::AgentInput::parse_input(request)
+        .map_err(|e| {
             Box::new(
                 ProtocolEnvelope::error(
                     request.rid.clone(),
                     code::INVALID.to_string(),
-                    "Missing id".to_string(),
+                    e.to_string(),
                 )
                 .with_fix("echo '{\"cmd\":\"agent\",\"id\":1}' | swarm".to_string())
-                .with_ctx(json!({"id": "required"})),
+                .with_ctx(json!({"error": e.to_string()})),
             )
-        })? as u32;
+        })?;
 
-    if dry_flag(request) {
+    if input.dry.unwrap_or(false) {
         return Ok(dry_run_success(
             request,
-            vec![json!({"step": 1, "action": "run_agent", "target": id})],
+            vec![json!({"step": 1, "action": "run_agent", "target": input.id})],
             "swarm status",
         ));
     }
@@ -759,12 +1187,12 @@ async fn handle_agent(
             .with_fix("Run from repo root".to_string()),
         )
     })?;
-    run_agent(&db, &AgentId::new(repo_id, id), &config.stage_commands)
+    run_agent(&db, &AgentId::new(repo_id, input.id), &config.stage_commands)
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
 
     Ok(CommandSuccess {
-        data: json!({"agent_id": id, "status": "completed"}),
+        data: json!({"agent_id": input.id, "status": "completed"}),
         next: "swarm monitor --view progress".to_string(),
         state: minimal_state_for_request(request).await,
     })
@@ -857,7 +1285,7 @@ async fn handle_init_db(
         .args
         .get("seed_agents")
         .and_then(Value::as_u64)
-        .map_or(12, |value| value) as u32;
+        .map_or(10, |value| value) as u32;
 
     if dry_flag(request) {
         return Ok(dry_run_success(
@@ -886,6 +1314,9 @@ async fn handle_init_db(
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
     db.initialize_schema_from_sql(&schema_sql)
+        .await
+        .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
+    db.update_config(seed_agents)
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
     db.seed_idle_agents(seed_agents)
@@ -919,12 +1350,6 @@ async fn handle_init_local_db(
         .and_then(Value::as_str)
         .map_or("shitty_swarm_manager", |value| value)
         .to_string();
-    let password = request
-        .args
-        .get("password")
-        .and_then(Value::as_str)
-        .map_or("shitty_swarm_manager", |value| value)
-        .to_string();
     let database = request
         .args
         .get("database")
@@ -944,7 +1369,7 @@ async fn handle_init_local_db(
         .args
         .get("seed_agents")
         .and_then(Value::as_u64)
-        .map_or(12, |value| value) as u32;
+        .map_or(10, |value| value) as u32;
 
     if dry_flag(request) {
         return Ok(dry_run_success(
@@ -958,12 +1383,13 @@ async fn handle_init_local_db(
     }
 
     let port_mapping = format!("{}:5432", port);
+    // 1. Try to start existing container
     let _ = Command::new("docker")
         .args(["start", container_name.as_str()])
         .output()
-        .await
-        .map_err(SwarmError::IoError)
-        .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
+        .await;
+
+    // 2. Try to run new container if start failed or container didn't exist
     let _ = Command::new("docker")
         .args([
             "run",
@@ -975,19 +1401,43 @@ async fn handle_init_local_db(
             "-e",
             format!("POSTGRES_USER={}", user).as_str(),
             "-e",
-            format!("POSTGRES_PASSWORD={}", password).as_str(),
+            "POSTGRES_HOST_AUTH_METHOD=trust",
             "-e",
             format!("POSTGRES_DB={}", database).as_str(),
             "postgres:16",
         ])
         .output()
-        .await
-        .map_err(SwarmError::IoError);
+        .await;
 
-    let url = format!(
-        "postgresql://{}:{}@localhost:{}/{}",
-        user, password, port, database
-    );
+    // 3. Wait for Postgres to be ready inside the container
+    let mut retry_count = 0;
+    let max_retries = 10;
+    while retry_count < max_retries {
+        let ready_check = Command::new("docker")
+            .args(["exec", container_name.as_str(), "pg_isready", "-U", &user])
+            .output()
+            .await;
+
+        if let Ok(check) = ready_check {
+            if check.status.success() {
+                break;
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        retry_count += 1;
+    }
+
+    let url = format!("postgresql://{}@localhost:{}/{}", user, port, database);
+
+    // 4. Idempotent bootstrap of repository config
+    let bootstrap_request = ProtocolRequest {
+        cmd: "bootstrap".to_string(),
+        rid: request.rid.clone(),
+        dry: Some(false),
+        args: Map::new(),
+    };
+    let _ = handle_bootstrap(&bootstrap_request).await?;
+
     let init_request = ProtocolRequest {
         cmd: "init-db".to_string(),
         rid: request.rid.clone(),
@@ -1013,44 +1463,56 @@ async fn handle_init_local_db(
 async fn handle_spawn_prompts(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
-    let template = request
-        .args
-        .get("template")
-        .and_then(Value::as_str)
-        .map_or(".agents/agent_prompt.md", |value| value);
+    let db: SwarmDb = db_from_request(request).await?;
+    let config = db.get_config(&RepoId::new("local")).await.ok();
+
+    let (template_text, template_name) = match request.args.get("template").and_then(Value::as_str)
+    {
+        Some(path) => {
+            let text = fs::read_to_string(path).await.map_err(|err| {
+                Box::new(
+                    ProtocolEnvelope::error(
+                        request.rid.clone(),
+                        code::NOTFOUND.to_string(),
+                        format!("Template file not found: {}", err),
+                    )
+                    .with_fix(format!("Ensure {} exists", path))
+                    .with_ctx(json!({"template": path})),
+                )
+            })?;
+            (text, path.to_string())
+        }
+        None => (
+            swarm::prompts::AGENT_PROMPT_TEMPLATE.to_string(),
+            "embedded_template".to_string(),
+        ),
+    };
+
     let out_dir = request
         .args
         .get("out_dir")
         .and_then(Value::as_str)
         .map_or(".agents/generated", |value| value);
+
     let count = request
         .args
         .get("count")
         .and_then(Value::as_u64)
-        .map_or(12, |value| value) as u32;
+        .map(|v| v as u32)
+        .or_else(|| config.as_ref().map(|c| c.max_agents))
+        .unwrap_or(10);
 
     if dry_flag(request) {
         return Ok(dry_run_success(
             request,
             vec![
-                json!({"step": 1, "action": "read_template", "target": template}),
-                json!({"step": 2, "action": "write_prompts", "target": count}),
+                json!({"step": 1, "action": "read_template", "target": template_name}),
+                json!({"step": 2, "action": "write_prompts", "target": count, "dir": out_dir}),
             ],
             "swarm monitor --view progress",
         ));
     }
 
-    let template_text = fs::read_to_string(template).await.map_err(|err| {
-        Box::new(
-            ProtocolEnvelope::error(
-                request.rid.clone(),
-                code::NOTFOUND.to_string(),
-                format!("Template not found: {}", err),
-            )
-            .with_fix("swarm spawn-prompts --template .agents/agent_prompt.md".to_string())
-            .with_ctx(json!({"template": template})),
-        )
-    })?;
     fs::create_dir_all(out_dir)
         .await
         .map_err(SwarmError::IoError)
@@ -1059,7 +1521,7 @@ async fn handle_spawn_prompts(
     spawn_prompts_recursive(out_dir, &template_text, 1, count, request.rid.clone()).await?;
 
     Ok(CommandSuccess {
-        data: json!({"count": count, "out_dir": out_dir}),
+        data: json!({"count": count, "out_dir": out_dir, "template": template_name}),
         next: "swarm monitor --view active".to_string(),
         state: minimal_state_for_request(request).await,
     })
@@ -1085,6 +1547,47 @@ fn spawn_prompts_recursive<'a>(
             spawn_prompts_recursive(out_dir, template_text, next.saturating_add(1), count, rid)
                 .await
         }
+    })
+}
+
+async fn handle_prompt(
+    request: &ProtocolRequest,
+) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
+    if let Some(skill_name) = request.args.get("skill").and_then(Value::as_str) {
+        if let Some(prompt) = swarm::skill_prompts::get_skill_prompt(skill_name) {
+            return Ok(CommandSuccess {
+                data: json!({"skill": skill_name, "prompt": prompt}),
+                next: "swarm monitor --view progress".to_string(),
+                state: minimal_state_for_request(request).await,
+            });
+        } else {
+            return Err(Box::new(
+                ProtocolEnvelope::error(
+                    request.rid.clone(),
+                    code::NOTFOUND.to_string(),
+                    format!("Skill prompt not found: {}", skill_name),
+                )
+                .with_fix(
+                    "Use a valid skill: rust-contract, implement, qa-enforcer, red-queen"
+                        .to_string(),
+                )
+                .with_ctx(json!({"skill": skill_name})),
+            ));
+        }
+    }
+
+    let id = request
+        .args
+        .get("id")
+        .and_then(Value::as_u64)
+        .map_or(1, |value| value) as u32;
+
+    let prompt = swarm::prompts::get_agent_prompt(id);
+
+    Ok(CommandSuccess {
+        data: json!({"agent_id": id, "prompt": prompt}),
+        next: format!("swarm agent --id {}", id),
+        state: minimal_state_for_request(request).await,
     })
 }
 
@@ -1132,14 +1635,24 @@ async fn handle_doctor(
         .count() as i64;
     let passed = checks.len() as i64 - failed;
 
+    // Compact machine-readable format (default)
+    let check_results: Vec<Value> = checks
+        .iter()
+        .map(|check| {
+            json!({
+                "n": check["name"],
+                "ok": check["ok"]
+            })
+        })
+        .collect();
+
     Ok(CommandSuccess {
         data: json!({
-            "version": "v1",
-            "healthy": failed == 0,
-            "dry_run": dry_flag(request),
-            "checks": checks,
-            "summary": {"passed": passed, "failed": failed, "warn": 0},
-            "next_actions": if failed == 0 { vec!["System ready".to_string()] } else { vec!["Install missing commands from checks".to_string()] },
+            "v": "v1",
+            "h": failed == 0,
+            "p": passed,
+            "f": failed,
+            "c": check_results
         }),
         next: if failed == 0 {
             "swarm state".to_string()
@@ -1320,7 +1833,7 @@ async fn handle_bootstrap(
     if !config_path.exists() {
         fs::write(
             &config_path,
-            "database_url = \"postgresql://shitty_swarm_manager:shitty_swarm_manager@localhost:5432/shitty_swarm_manager_db\"\nrust_contract_cmd = \"br show {bead_id}\"\nimplement_cmd = \"jj status\"\nqa_enforcer_cmd = \"moon run :quick\"\nred_queen_cmd = \"moon run :test\"\n",
+            "database_url = \"postgresql://shitty_swarm_manager@localhost:5437/shitty_swarm_manager_db\"\nrust_contract_cmd = \"br show {bead_id}\"\nimplement_cmd = \"jj status\"\nqa_enforcer_cmd = \"moon run :quick\"\nred_queen_cmd = \"moon run :test\"\n",
         )
         .await
         .map_err(SwarmError::IoError)
@@ -1345,6 +1858,122 @@ async fn handle_bootstrap(
         next: "swarm doctor".to_string(),
         state: minimal_state_for_request(request).await,
     })
+}
+
+async fn handle_init(
+    request: &ProtocolRequest,
+) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
+    let seed_agents = request
+        .args
+        .get("seed_agents")
+        .and_then(Value::as_u64)
+        .map_or(10, |value| value) as u32;
+    let db_url = match request
+        .args
+        .get("database_url")
+        .and_then(Value::as_str)
+        .map(|value| value.to_string())
+    {
+        Some(value) => value,
+        None => default_database_url_for_cli(),
+    };
+    let schema = match request
+        .args
+        .get("schema")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+    {
+        Some(value) => value,
+        None => PathBuf::from("crates/swarm-coordinator/schema.sql"),
+    };
+
+    if dry_flag(request) {
+        return Ok(dry_run_success(
+            request,
+            vec![
+                json!({"step": 1, "action": "bootstrap", "target": "repository"}),
+                json!({"step": 2, "action": "init_db", "target": db_url.clone()}),
+                json!({"step": 3, "action": "register", "target": seed_agents}),
+            ],
+            "swarm doctor",
+        ));
+    }
+
+    let mut steps = Vec::new();
+    let mut errors = Vec::new();
+
+    // Step 1: Bootstrap
+    match handle_bootstrap(request).await {
+        Ok(success) => {
+            steps
+                .push(json!({"step": 1, "action": "bootstrap", "status": "ok", "d": success.data}));
+        }
+        Err(e) => {
+            errors.push(json!({"step": 1, "action": "bootstrap", "err": e.err}));
+        }
+    }
+
+    // Step 2: Initialize database
+    let init_db_request = ProtocolRequest {
+        cmd: "init-db".to_string(),
+        rid: request.rid.clone(),
+        dry: Some(false),
+        args: Map::from_iter(vec![
+            ("url".to_string(), Value::String(db_url.clone())),
+            (
+                "schema".to_string(),
+                Value::String(schema.display().to_string()),
+            ),
+            ("seed_agents".to_string(), Value::from(seed_agents)),
+        ]),
+    };
+    match handle_init_db(&init_db_request).await {
+        Ok(success) => {
+            steps.push(json!({"step": 2, "action": "init_db", "status": "ok", "d": success.data}));
+        }
+        Err(e) => {
+            errors.push(json!({"step": 2, "action": "init_db", "err": e.err}));
+        }
+    }
+
+    // Step 3: Register agents
+    let register_request = ProtocolRequest {
+        cmd: "register".to_string(),
+        rid: request.rid.clone(),
+        dry: Some(false),
+        args: Map::from_iter(vec![("count".to_string(), Value::from(seed_agents))]),
+    };
+    match handle_register(&register_request).await {
+        Ok(success) => {
+            steps.push(json!({"step": 3, "action": "register", "status": "ok", "d": success.data}));
+        }
+        Err(e) => {
+            errors.push(json!({"step": 3, "action": "register", "err": e.err}));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(CommandSuccess {
+            data: json!({
+                "initialized": true,
+                "steps": steps,
+                "database_url": db_url,
+                "seed_agents": seed_agents,
+            }),
+            next: "swarm doctor".to_string(),
+            state: minimal_state_for_request(request).await,
+        })
+    } else {
+        Err(Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::INTERNAL.to_string(),
+                format!("Init completed with {} errors", errors.len()),
+            )
+            .with_fix("Review error details and retry failed steps manually".to_string())
+            .with_ctx(json!({"errors": errors, "completed_steps": steps})),
+        ))
+    }
 }
 
 fn required_string_arg(
@@ -1491,15 +2120,6 @@ fn parse_rid(raw: &str) -> Option<String> {
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
-}
-
-fn standard_errors() -> Value {
-    Value::Object(
-        ERROR_CODES
-            .iter()
-            .map(|(code, desc, fix)| (code.to_string(), json!({"desc": desc, "fix": fix})))
-            .collect(),
-    )
 }
 
 fn dry_flag(request: &ProtocolRequest) -> bool {

@@ -106,6 +106,9 @@ moon run :check      # Fast type check
 
 **shitty-swarm-manager** is a PostgreSQL-based agent swarm coordination system.
 
+### AI Mission & Guidelines
+See **[MISSION.md](MISSION.md)** for the high-level mission statement, operating principles, and detailed pipeline guidance for autonomous agents.
+
 ### Project Structure
 ```
 src/

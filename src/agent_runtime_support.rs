@@ -149,6 +149,28 @@ pub async fn run_shell_command(command: &str) -> Result<CommandOutput> {
     })
 }
 
+pub async fn create_workspace(agent_id: u32, bead_id: &str) -> Result<()> {
+    let cmd = format!("zjj add agent-{}-{}", agent_id, bead_id);
+    let out = run_shell_command(&cmd).await?;
+    if !out.status_success {
+        tracing::warn!(
+            "Workspace creation might have failed or already exists: {}",
+            out.message
+        );
+    }
+    Ok(())
+}
+
+pub async fn finalize_workspace(_bead_id: &str) -> Result<()> {
+    // br sync --flush-only
+    let _ = run_shell_command("br sync --flush-only").await;
+    // jj git push
+    let _ = run_shell_command("jj git push").await;
+    // zjj done
+    let _ = run_shell_command("zjj done").await;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{execute_stage, render_stage_command, run_shell_command, stage_command_template};

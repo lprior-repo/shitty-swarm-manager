@@ -1,3 +1,10 @@
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
+#![deny(clippy::panic)]
+#![warn(clippy::pedantic)]
+#![warn(clippy::nursery)]
+#![forbid(unsafe_code)]
+
 use std::path::PathBuf;
 use swarm::{Result, SwarmError};
 
@@ -53,7 +60,7 @@ pub fn parse_config_content(content: &str) -> (Option<String>, StageCommands) {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
     {
         if let Some(value) = parse_key_value(line, "database_url") {
-            database_url = Some(value.to_string());
+            database_url = Some(expand_env_vars(value));
         }
         if let Some(value) = parse_key_value(line, "rust_contract_cmd") {
             stage_commands.rust_contract = value.to_string();
@@ -70,6 +77,21 @@ pub fn parse_config_content(content: &str) -> (Option<String>, StageCommands) {
     }
 
     (database_url, stage_commands)
+}
+
+fn expand_env_vars(input: &str) -> String {
+    let mut result = input.to_string();
+    while let Some(start) = result.find("${") {
+        if let Some(end) = result[start..].find('}') {
+            let var_part = &result[start + 2..start + end];
+            let (var_name, default) = var_part.split_once(":-").unwrap_or((var_part, ""));
+            let value = std::env::var(var_name).unwrap_or_else(|_| default.to_string());
+            result.replace_range(start..start + end + 1, &value);
+        } else {
+            break;
+        }
+    }
+    result
 }
 
 pub fn parse_key_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
@@ -127,11 +149,30 @@ fn default_database_url() -> String {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| {
-            "postgresql://shitty_swarm_manager:shitty_swarm_manager@localhost:5437/shitty_swarm_manager_db".to_string()
+            let user = std::env::var("SWARM_DB_USER")
+                .unwrap_or_else(|_| "shitty_swarm_manager".to_string());
+            let pass = std::env::var("SWARM_DB_PASSWORD")
+                .unwrap_or_else(|_| "shitty_swarm_manager".to_string());
+            let host = std::env::var("SWARM_DB_HOST").unwrap_or_else(|_| "localhost".to_string());
+            let port = std::env::var("SWARM_DB_PORT").unwrap_or_else(|_| "5437".to_string());
+            let db = std::env::var("SWARM_DB_NAME")
+                .unwrap_or_else(|_| "shitty_swarm_manager_db".to_string());
+            format!("postgres://{}:{}@{}:{}/{}", user, pass, host, port, db)
         })
 }
 
 pub fn default_database_url_for_cli() -> String {
+    // 1. Try .swarm/config.toml (without credentials for security)
+    if let Ok(content) = std::fs::read_to_string(".swarm/config.toml") {
+        let (database_url, _) = parse_config_content(&content);
+        if let Some(url) = database_url {
+            if !url.is_empty() {
+                return url;
+            }
+        }
+    }
+
+    // 2. Fallback to env or computed default
     default_database_url()
 }
 

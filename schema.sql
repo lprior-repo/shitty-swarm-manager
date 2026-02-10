@@ -90,7 +90,7 @@ CREATE INDEX IF NOT EXISTS idx_stage_history_time ON stage_history(started_at DE
 -- ============================================================
 CREATE TABLE IF NOT EXISTS swarm_config (
     repo_id TEXT PRIMARY KEY REFERENCES repos(repo_id),
-    max_agents INTEGER NOT NULL DEFAULT 12,
+    max_agents INTEGER NOT NULL DEFAULT 10,
     max_implementation_attempts INTEGER NOT NULL DEFAULT 3,
     claim_label TEXT NOT NULL DEFAULT 'p0',
     swarm_started_at TIMESTAMPTZ,
@@ -233,11 +233,11 @@ WHERE a.status IN ('working', 'waiting', 'error');
 CREATE OR REPLACE VIEW v_swarm_progress AS
 SELECT
     repo_id,
-    COUNT(*) FILTER (WHERE status = 'done')::BIGINT as completed,
-    COUNT(*) FILTER (WHERE status = 'working')::BIGINT as working,
-    COUNT(*) FILTER (WHERE status = 'waiting')::BIGINT as waiting,
-    COUNT(*) FILTER (WHERE status = 'error')::BIGINT as errors,
-    COUNT(*) FILTER (WHERE status = 'idle')::BIGINT as idle,
+    COUNT(*) FILTER (WHERE status = 'done')::BIGINT as done_agents,
+    COUNT(*) FILTER (WHERE status = 'working')::BIGINT as working_agents,
+    COUNT(*) FILTER (WHERE status = 'waiting')::BIGINT as waiting_agents,
+    COUNT(*) FILTER (WHERE status = 'error')::BIGINT as error_agents,
+    COUNT(*) FILTER (WHERE status = 'idle')::BIGINT as idle_agents,
     COUNT(*)::BIGINT as total_agents
 FROM agent_state
 GROUP BY repo_id;

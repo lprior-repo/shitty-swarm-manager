@@ -71,7 +71,7 @@ mod agent_lifecycle {
                 let db = test_db().await;
                 setup_schema(&db).await;
                 reset_runtime_tables(&db).await;
-                let count = 12;
+                let count = 10;
 
                 // When
                 db.seed_idle_agents(count).await

@@ -1,4 +1,4 @@
--- Swarm State Database for 12-Agent Parallel Bead Processing
+-- Swarm State Database for Parallel Bead Processing
 -- SQLite schema for tracking agent progress, bead claims, and stage history
 
 -- Enable foreign keys
@@ -10,7 +10,7 @@ PRAGMA foreign_keys = ON;
 -- ============================================================
 CREATE TABLE IF NOT EXISTS bead_claims (
     bead_id TEXT PRIMARY KEY,
-    claimed_by INTEGER NOT NULL,  -- Agent number (1-12)
+    claimed_by INTEGER NOT NULL,  -- Agent ID
     claimed_at TEXT NOT NULL,     -- ISO 8601 timestamp
     status TEXT NOT NULL DEFAULT 'in_progress',  -- in_progress, completed, blocked
     UNIQUE(bead_id)
@@ -21,10 +21,10 @@ CREATE INDEX IF NOT EXISTS idx_bead_claims_status ON bead_claims(status);
 
 -- ============================================================
 -- Table: agent_state
--- Current state of each agent (12 rows max)
+-- Current state of each agent
 -- ============================================================
 CREATE TABLE IF NOT EXISTS agent_state (
-    agent_id INTEGER PRIMARY KEY,  -- 1-12
+    agent_id INTEGER PRIMARY KEY,  -- Unique agent ID
     bead_id TEXT,                  -- Currently assigned bead
     current_stage TEXT,            -- rust-contract, implement, qa, red-queen, done
     stage_started_at TEXT,         -- When current stage began
@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS pipeline_config (
 
 -- Insert default configuration
 INSERT OR REPLACE INTO pipeline_config (key, value) VALUES
-    ('max_agents', '12'),
+    ('max_agents', '10'),
     ('max_implementation_attempts', '3'),
     ('claim_label', 'p0'),
     ('swarm_started_at', datetime('now')),

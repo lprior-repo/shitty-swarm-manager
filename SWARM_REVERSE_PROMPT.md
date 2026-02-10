@@ -1,6 +1,6 @@
-# Reverse Prompt: Build 12-Agent Parallel Bead Processing Swarm
+# Reverse Prompt: Build Parallel Bead Processing Swarm
 
-You are building a **distributed parallel agent swarm** that processes 12 beads simultaneously using isolated workspaces and a central coordinator database.
+You are building a **distributed parallel agent swarm** that processes beads simultaneously using isolated workspaces and a central coordinator database.
 
 ## Architecture Overview
 
@@ -11,7 +11,7 @@ You are building a **distributed parallel agent swarm** that processes 12 beads 
 │                                                              │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
 │  │ bead_claims  │  │ agent_state  │  │ stage_history    │  │
-│  │              │  │ (12 agents)  │  │ (audit log)      │  │
+│  │              │  │ (N agents)   │  │ (audit log)      │  │
 │  └──────────────┘  └──────────────┘  └──────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
           ▲                    ▲                   ▲
@@ -21,7 +21,7 @@ You are building a **distributed parallel agent swarm** that processes 12 beads 
     ┌──────────┬──────────┬──────────┬─────────────┐
     │          │          │          │             │
 ┌───▼───┐ ┌───▼───┐ ┌───▼───┐ ┌────▼────┐   ┌────▼────┐
-│Agent 1│ │Agent 2│ │Agent 3│ │Agent 4  │...│Agent 12 │
+│Agent 1│ │Agent 2│ │Agent 3│ │Agent 4  │...│Agent N  │
 └───┬───┘ └───┬───┘ └───┬───┘ └────┬────┘   └────┬────┘
     │         │         │            │             │
     │         │         │            │             │
@@ -53,14 +53,14 @@ You are building a **distributed parallel agent swarm** that processes 12 beads 
 -- Bead claims: Tracks which beads are claimed by which agents
 CREATE TABLE bead_claims (
     bead_id TEXT PRIMARY KEY,
-    claimed_by SMALLINT CHECK (claimed_by BETWEEN 1 AND 12),
+    claimed_by SMALLINT,
     claimed_at TIMESTAMPTZ DEFAULT NOW(),
     status TEXT CHECK (status IN ('in_progress', 'completed', 'blocked'))
 );
 
--- Agent state: Current state of each of the 12 agents
+-- Agent state: Current state of each agent
 CREATE TABLE agent_state (
-    agent_id SMALLINT PRIMARY KEY CHECK (agent_id BETWEEN 1 AND 12),
+    agent_id SMALLINT PRIMARY KEY,
     bead_id TEXT REFERENCES bead_claims(bead_id),
     current_stage TEXT CHECK (current_stage IN ('rust-contract', 'implement', 'qa-enforcer', 'red-queen', 'done')),
     stage_started_at TIMESTAMPTZ,
@@ -73,7 +73,7 @@ CREATE TABLE agent_state (
 -- Stage history: Audit log of all stage executions
 CREATE TABLE stage_history (
     id BIGSERIAL PRIMARY KEY,
-    agent_id SMALLINT CHECK (agent_id BETWEEN 1 AND 12),
+    agent_id SMALLINT,
     bead_id TEXT NOT NULL,
     stage TEXT CHECK (stage IN ('rust-contract', 'implement', 'qa-enforcer', 'red-queen')),
     attempt_number INTEGER NOT NULL,
@@ -257,7 +257,6 @@ Host: localhost
 Port: 5432
 Database: swarm_db
 User: oya
-Password: oya
 ```
 
 ## Deliverables
@@ -265,7 +264,7 @@ Password: oya
 1. ✅ PostgreSQL schema with all tables, indexes, views, triggers
 2. ✅ Database initialization script
 3. ✅ Agent prompt template (with {N} placeholder)
-4. ✅ Script to spawn 12 agents via Task tool
+4. ✅ Script to spawn agents via Task tool
 5. ✅ Monitoring scripts
 6. ✅ README with quick start guide
 
@@ -277,7 +276,7 @@ docker run -d \
   --name oya-swarm-db \
   -p 5432:5432 \
   -e POSTGRES_USER=oya \
-  -e POSTGRES_PASSWORD=oya \
+  -e POSTGRES_HOST_AUTH_METHOD=trust \
   -e POSTGRES_DB=swarm_db \
   postgres:16
 
@@ -289,7 +288,7 @@ createdb swarm_db
 
 ## Testing the Swarm
 
-Before launching all 12 agents, test with 1 agent:
+Before launching all agents, test with 1 agent:
 
 1. Initialize database: `.agents/init_postgres_swarm.sh`
 2. Ensure beads exist: `br list --status pending --priority p0`
@@ -297,16 +296,16 @@ Before launching all 12 agents, test with 1 agent:
 4. Monitor: `watch .agents/progress.sh`
 5. Verify: bead claimed → stages executed → completed
 
-If test passes, launch all 12 in parallel.
+If test passes, launch the swarm in parallel.
 
 ## What Makes This Work
 
-- **PostgreSQL SKIP LOCKED**: Allows 12 concurrent transactions to each grab a different row without contention
+- **PostgreSQL SKIP LOCKED**: Allows concurrent transactions to each grab a different row without contention
 - **zjj workspace isolation**: Each agent in its own JJ workspace, no git conflicts
-- **Centralized state**: Database is single source of truth for all 12 agents
+- **Centralized state**: Database is single source of truth for all agents
 - **Audit trail**: Full history in stage_history for debugging and accountability
 - **Graceful failure**: Max retry prevents infinite loops, blocking allows manual intervention
 
 ---
 
-Now build this system. Start with the database schema, then the initialization script, then the agent prompt template. Test with 1 agent before scaling to 12.
+Now build this system. Start with the database schema, then the initialization script, then the agent prompt template. Test with 1 agent before scaling up.
