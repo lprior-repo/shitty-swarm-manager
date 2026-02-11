@@ -224,7 +224,7 @@ async fn record_stage_complete_persists_transcript_for_success() {
         .await
         .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
 
-    let _stage_history_id = db
+    let stage_history_id = db
         .record_stage_started(&agent_id, &bead_id, Stage::RustContract, 1)
         .await
         .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
@@ -325,7 +325,7 @@ async fn record_stage_complete_persists_transcript_for_failure() {
         .await
         .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
 
-    let _stage_history_id = db
+    let stage_history_id = db
         .record_stage_started(&agent_id, &bead_id, Stage::RustContract, 1)
         .await
         .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
@@ -960,7 +960,7 @@ async fn stage_artifact_store_is_deduplicated_by_hash_and_type() {
     db.claim_next_bead(&agent_id)
         .await
         .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
-    let _stage_history_id = db
+    let stage_history_id = db
         .record_stage_started(&agent_id, &bead_id, Stage::RustContract, 1)
         .await
         .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
@@ -1410,7 +1410,7 @@ async fn transition_retry_records_retry_packet_for_qa_failure() {
         .await
         .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
 
-    let _stage_history_id = db
+    let stage_history_id = db
         .record_stage_started(&agent_id, &bead_id, Stage::QaEnforcer, 1)
         .await
         .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
@@ -1491,7 +1491,7 @@ async fn transition_retry_records_retry_packet_for_red_queen_failure() {
         .await
         .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
 
-    let _stage_history_id = db
+    let stage_history_id = db
         .record_stage_started(&agent_id, &bead_id, Stage::RedQueen, 2)
         .await
         .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
@@ -1569,7 +1569,7 @@ async fn retry_packet_handles_missing_failure_message_and_references() {
         .await
         .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
 
-    let _stage_history_id = db
+    let stage_history_id = db
         .record_stage_started(&agent_id, &bead_id, Stage::QaEnforcer, 1)
         .await
         .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
@@ -1641,7 +1641,7 @@ async fn given_qa_failure_with_retries_remaining_when_transition_retry_is_record
         .await
         .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
 
-    let _stage_history_id = db
+    let stage_history_id = db
         .record_stage_started(&agent_id, &bead_id, Stage::QaEnforcer, 1)
         .await
         .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
@@ -1829,7 +1829,7 @@ async fn given_missing_failure_diagnostics_when_retry_packet_creation_runs_then_
         .await
         .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
 
-    let _stage_history_id = db
+    let stage_history_id = db
         .record_stage_started(&agent_id, &bead_id, Stage::QaEnforcer, 1)
         .await
         .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
@@ -1898,7 +1898,7 @@ async fn given_invalid_artifact_references_when_retry_packet_creation_runs_then_
         .await
         .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
 
-    let _stage_history_id = db
+    let stage_history_id = db
         .record_stage_started(&agent_id, &bead_id, Stage::QaEnforcer, 1)
         .await
         .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
