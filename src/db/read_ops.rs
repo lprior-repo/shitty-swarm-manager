@@ -59,16 +59,6 @@ struct ActiveAgentRow {
 }
 
 #[derive(FromRow)]
-struct FeedbackRow {
-    bead_id: String,
-    agent_id: i32,
-    stage: String,
-    attempt_number: i32,
-    feedback: Option<String>,
-    completed_at: Option<String>,
-}
-
-#[derive(FromRow)]
 struct ResumeContextAggregateRow {
     agent_id: i32,
     bead_id: String,
@@ -454,7 +444,18 @@ impl SwarmDb {
     pub async fn get_feedback_required(
         &self,
     ) -> Result<Vec<(RepoId, u32, String, u32, Option<String>, Option<String>)>> {
-        sqlx::query_as::<_, (String, String, i32, String, i32, Option<String>, Option<String>)>(
+        sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                i32,
+                String,
+                i32,
+                Option<String>,
+                Option<String>,
+            ),
+        >(
             "SELECT repo_id, bead_id, agent_id, stage, attempt_number, feedback, completed_at::TEXT
              FROM v_feedback_required
              ORDER BY completed_at DESC NULLS LAST",
@@ -546,7 +547,10 @@ impl SwarmDb {
     /// # Errors
     ///
     /// Returns `SwarmError::DatabaseError` if the database query fails.
-    pub async fn get_resume_context_projections(&self, repo_id: &RepoId) -> Result<Vec<ResumeContextProjection>> {
+    pub async fn get_resume_context_projections(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<Vec<ResumeContextProjection>> {
         let artifact_types = resume_artifact_type_names();
         let contexts = sqlx::query_as::<_, ResumeContextAggregateRow>(
             "SELECT
@@ -652,7 +656,10 @@ impl SwarmDb {
     /// # Errors
     ///
     /// Returns `SwarmError::DatabaseError` if any database query fails.
-    pub async fn get_deep_resume_contexts(&self, repo_id: &RepoId) -> Result<Vec<DeepResumeContextContract>> {
+    pub async fn get_deep_resume_contexts(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<Vec<DeepResumeContextContract>> {
         let projections = self.get_resume_context_projections(repo_id).await?;
         if projections.is_empty() {
             return Ok(Vec::new());
@@ -663,8 +670,12 @@ impl SwarmDb {
             .map(|context| context.bead_id.value().to_string())
             .collect::<Vec<_>>();
 
-        let diagnostics_map = self.get_latest_diagnostics_for_beads(repo_id, &bead_ids).await?;
-        let artifacts_map = self.get_latest_artifacts_for_beads(repo_id, &bead_ids).await?;
+        let diagnostics_map = self
+            .get_latest_diagnostics_for_beads(repo_id, &bead_ids)
+            .await?;
+        let artifacts_map = self
+            .get_latest_artifacts_for_beads(repo_id, &bead_ids)
+            .await?;
 
         let contexts = projections
             .into_iter()
@@ -914,7 +925,9 @@ impl SwarmDb {
         artifact_type: Option<ArtifactType>,
     ) -> Result<Vec<StageArtifact>> {
         if let Some(kind) = artifact_type {
-            return self.get_bead_artifacts_by_type(repo_id, bead_id, kind).await;
+            return self
+                .get_bead_artifacts_by_type(repo_id, bead_id, kind)
+                .await;
         }
 
         sqlx::query_as::<_, StageArtifactRow>(
@@ -1064,6 +1077,7 @@ impl SwarmDb {
              )",
         )
         .bind(bead_id.value())
+        .bind(repo_id.value())
         .bind(artifact_type.as_str())
         .fetch_one(self.pool())
         .await

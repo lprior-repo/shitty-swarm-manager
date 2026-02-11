@@ -190,8 +190,12 @@ async fn execute_implement_stage(
     agent_id: &AgentId,
     db: &SwarmDb,
 ) -> Result<SkillOutput> {
-     let maybe_contract_artifact = db
-        .get_first_bead_artifact_by_type(agent_id.repo_id(), bead_id, ArtifactType::ContractDocument)
+    let maybe_contract_artifact = db
+        .get_first_bead_artifact_by_type(
+            agent_id.repo_id(),
+            bead_id,
+            ArtifactType::ContractDocument,
+        )
         .await?;
 
     let contract_context = match maybe_contract_artifact {
@@ -210,7 +214,11 @@ async fn execute_implement_stage(
 
     let retry_packet_context = if previous_attempts > 0 {
         match db
-            .get_latest_bead_artifact_by_type(agent_id.repo_id(), bead_id, ArtifactType::RetryPacket)
+            .get_latest_bead_artifact_by_type(
+                agent_id.repo_id(),
+                bead_id,
+                ArtifactType::RetryPacket,
+            )
             .await?
         {
             Some(artifact) => Some(format_retry_packet(&artifact.content)),
@@ -293,7 +301,11 @@ async fn execute_qa_stage(
     cache: Option<&GateExecutionCache>,
 ) -> Result<SkillOutput> {
     if !db
-        .bead_has_artifact_type(agent_id.repo_id(), bead_id, ArtifactType::ImplementationCode)
+        .bead_has_artifact_type(
+            agent_id.repo_id(),
+            bead_id,
+            ArtifactType::ImplementationCode,
+        )
         .await?
     {
         return Ok(failure_output(
@@ -397,12 +409,25 @@ mod tests {
         .expect("Failed to insert stage history")
     }
 
+    async fn insert_bead_claim(pool: &PgPool, bead_id: &BeadId, agent_id: &AgentId) {
+        sqlx::query(
+            "INSERT INTO bead_claims (repo_id, bead_id, claimed_by, status) VALUES ($1, $2, $3, 'in_progress')",
+        )
+        .bind(agent_id.repo_id().value())
+        .bind(bead_id.value())
+        .bind(agent_id.number().cast_signed())
+        .execute(pool)
+        .await
+        .expect("Failed to insert bead claim");
+    }
+
     #[sqlx::test]
     async fn test_implement_stage_loads_contract_only_for_first_attempt(pool: PgPool) {
         let db = SwarmDb::new_with_pool(pool.clone());
         let bead_id = BeadId::new("test-bead-1");
         let agent_id = AgentId::new(RepoId::new("local"), 1);
         setup_schema(&db).await;
+        insert_bead_claim(&pool, &bead_id, &agent_id).await;
 
         // Store contract artifact
         let stage_history_id = insert_started_stage_history(&pool, &bead_id, &agent_id).await;
@@ -438,6 +463,7 @@ mod tests {
         let bead_id = BeadId::new("test-bead-2");
         let agent_id = AgentId::new(RepoId::new("local"), 1);
         setup_schema(&db).await;
+        insert_bead_claim(&pool, &bead_id, &agent_id).await;
 
         sqlx::query(
             "INSERT INTO agent_state (agent_id, status, implementation_attempt) VALUES ($1, 'working', 1)",
@@ -498,10 +524,11 @@ mod tests {
 
     #[sqlx::test]
     async fn test_implement_stage_fails_without_contract(pool: PgPool) {
-        let db = SwarmDb::new_with_pool(pool);
+        let db = SwarmDb::new_with_pool(pool.clone());
         let bead_id = BeadId::new("test-bead-3");
         let agent_id = AgentId::new(RepoId::new("local"), 1);
         setup_schema(&db).await;
+        insert_bead_claim(&pool, &bead_id, &agent_id).await;
 
         // No contract artifact stored
 

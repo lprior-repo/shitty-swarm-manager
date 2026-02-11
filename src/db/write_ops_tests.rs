@@ -1,10 +1,7 @@
 use super::{determine_transition, StageTransition};
 use crate::db::SwarmDb;
 use crate::error::SwarmError;
-use crate::types::{
-    AgentId, ArtifactType, BeadId, MessageType, RepoId, Stage, StageArtifact, StageResult,
-};
-use chrono::Utc;
+use crate::types::{AgentId, ArtifactType, BeadId, MessageType, RepoId, Stage, StageResult};
 use futures_util::future::join_all;
 use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
@@ -227,7 +224,7 @@ async fn record_stage_complete_persists_transcript_for_success() {
         .await
         .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
 
-    let stage_history_id = db
+    let _stage_history_id = db
         .record_stage_started(&agent_id, &bead_id, Stage::RustContract, 1)
         .await
         .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
@@ -328,7 +325,7 @@ async fn record_stage_complete_persists_transcript_for_failure() {
         .await
         .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
 
-    let stage_history_id = db
+    let _stage_history_id = db
         .record_stage_started(&agent_id, &bead_id, Stage::RustContract, 1)
         .await
         .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
@@ -425,7 +422,7 @@ async fn record_stage_complete_errors_when_transcript_storage_fails() {
         .await
         .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
 
-    let stage_history_id = db
+    let _stage_history_id = db
         .record_stage_started(&agent_id, &bead_id, Stage::RustContract, 1)
         .await
         .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
@@ -963,7 +960,7 @@ async fn stage_artifact_store_is_deduplicated_by_hash_and_type() {
     db.claim_next_bead(&agent_id)
         .await
         .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
-    let stage_history_id = db
+    let _stage_history_id = db
         .record_stage_started(&agent_id, &bead_id, Stage::RustContract, 1)
         .await
         .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
@@ -1120,19 +1117,23 @@ async fn artifact_lookup_helpers_avoid_overfetch_and_preserve_ordering() {
     .unwrap_or_else(|e| panic!("store second contract failed: {}", e));
 
     let has_contract = db
-         .bead_has_artifact_type(agent_id.repo_id(), &bead_id, ArtifactType::ContractDocument)
-         .await
+        .bead_has_artifact_type(agent_id.repo_id(), &bead_id, ArtifactType::ContractDocument)
+        .await
         .unwrap_or_else(|e| panic!("bead_has_artifact_type failed: {}", e));
-   let has_test_results = db
-         .bead_has_artifact_type(agent_id.repo_id(), &bead_id, ArtifactType::TestResults)
-         .await
+    let has_test_results = db
+        .bead_has_artifact_type(agent_id.repo_id(), &bead_id, ArtifactType::TestResults)
+        .await
         .unwrap_or_else(|e| panic!("bead_has_artifact_type missing failed: {}", e));
 
     assert!(has_contract);
     assert!(!has_test_results);
 
     let first_contract = db
-        .get_first_bead_artifact_by_type(&bead_id, ArtifactType::ContractDocument)
+        .get_first_bead_artifact_by_type(
+            agent_id.repo_id(),
+            &bead_id,
+            ArtifactType::ContractDocument,
+        )
         .await
         .unwrap_or_else(|e| panic!("get_first_bead_artifact_by_type failed: {}", e));
 
@@ -1409,28 +1410,30 @@ async fn transition_retry_records_retry_packet_for_qa_failure() {
         .await
         .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
 
-    let stage_history_id = db
+    let _stage_history_id = db
         .record_stage_started(&agent_id, &bead_id, Stage::QaEnforcer, 1)
         .await
         .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
 
-    let artifacts = vec![
-        build_stage_artifact(
-            stage_history_id,
-            1,
-            ArtifactType::FailureDetails,
-            Some("hash-1"),
-        ),
-        build_stage_artifact(
-            stage_history_id,
-            2,
-            ArtifactType::TestResults,
-            Some("hash-2"),
-        ),
-    ];
+    db.store_stage_artifact(
+        stage_history_id,
+        ArtifactType::FailureDetails,
+        "failure details artifact",
+        Some(json!({"content_hash_hint": "hash-1"})),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("store_stage_artifact failure_details failed: {}", e));
+    db.store_stage_artifact(
+        stage_history_id,
+        ArtifactType::TestResults,
+        "test results artifact",
+        Some(json!({"content_hash_hint": "hash-2"})),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("store_stage_artifact test_results failed: {}", e));
 
     db.persist_retry_packet(
-        stage_history_id,
+        Some(stage_history_id),
         Stage::QaEnforcer,
         1,
         &bead_id,
@@ -1450,9 +1453,9 @@ async fn transition_retry_records_retry_packet_for_qa_failure() {
         packet["failure_message"].as_str().unwrap(),
         "qa tests failed password=<redacted>"
     );
-    let references = packet["artifact_references"]
+    let references = packet["artifact_refs"]
         .as_array()
-        .expect("artifact_references should be array");
+        .expect("artifact_refs should be array");
     assert_eq!(references.len(), 2);
     assert_eq!(
         references[0]["artifact_type"],
@@ -1488,33 +1491,35 @@ async fn transition_retry_records_retry_packet_for_red_queen_failure() {
         .await
         .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
 
-    let stage_history_id = db
+    let _stage_history_id = db
         .record_stage_started(&agent_id, &bead_id, Stage::RedQueen, 2)
         .await
         .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
 
-    let artifacts = vec![
-        build_stage_artifact(
-            stage_history_id,
-            1,
-            ArtifactType::ImplementationCode,
-            Some("hash-impl"),
-        ),
-        build_stage_artifact(
-            stage_history_id,
-            2,
-            ArtifactType::TestResults,
-            Some("hash-tests"),
-        ),
-    ];
-
-    persist_retry_packet(
-        &db,
+    db.store_stage_artifact(
         stage_history_id,
+        ArtifactType::ImplementationCode,
+        "impl artifact",
+        Some(json!({"content_hash_hint": "hash-impl"})),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("store_stage_artifact implementation failed: {}", e));
+    db.store_stage_artifact(
+        stage_history_id,
+        ArtifactType::TestResults,
+        "test artifact",
+        Some(json!({"content_hash_hint": "hash-tests"})),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("store_stage_artifact tests failed: {}", e));
+
+    db.persist_retry_packet(
+        Some(stage_history_id),
         Stage::RedQueen,
         2,
+        &bead_id,
+        &agent_id,
         Some("red-queen timeout on moon run"),
-        &artifacts,
     )
     .await
     .unwrap_or_else(|e| panic!("persist_retry_packet failed: {}", e));
@@ -1524,9 +1529,9 @@ async fn transition_retry_records_retry_packet_for_red_queen_failure() {
     assert_eq!(packet["stage"], "red-queen");
     assert_eq!(packet["remaining_attempts"], 1);
     assert_eq!(packet["failure_category"], "timeout");
-    let references = packet["artifact_references"]
+    let references = packet["artifact_refs"]
         .as_array()
-        .expect("artifact_references should be array");
+        .expect("artifact_refs should be array");
     let artifact_types: Vec<String> = references
         .iter()
         .filter_map(|reference| {
@@ -1564,25 +1569,27 @@ async fn retry_packet_handles_missing_failure_message_and_references() {
         .await
         .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
 
-    let stage_history_id = db
+    let _stage_history_id = db
         .record_stage_started(&agent_id, &bead_id, Stage::QaEnforcer, 1)
         .await
         .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
 
-    let artifacts = vec![build_stage_artifact(
+    db.store_stage_artifact(
         stage_history_id,
-        1,
         ArtifactType::ImplementationCode,
+        "impl artifact",
         None,
-    )];
+    )
+    .await
+    .unwrap_or_else(|e| panic!("store_stage_artifact failed: {}", e));
 
-    persist_retry_packet(
-        &db,
-        stage_history_id,
+    db.persist_retry_packet(
+        Some(stage_history_id),
         Stage::QaEnforcer,
         1,
+        &bead_id,
+        &agent_id,
         None,
-        &artifacts,
     )
     .await
     .unwrap_or_else(|e| panic!("persist_retry_packet failed: {}", e));
@@ -1591,9 +1598,9 @@ async fn retry_packet_handles_missing_failure_message_and_references() {
 
     assert_eq!(packet["failure_category"], "stage_failure");
     assert!(packet["failure_message"].is_null());
-    let references = packet["artifact_references"]
+    let references = packet["artifact_refs"]
         .as_array()
-        .expect("artifact_references should be array");
+        .expect("artifact_refs should be array");
     assert_eq!(references[0]["content_hash"], serde_json::Value::Null);
 }
 
@@ -1607,23 +1614,6 @@ async fn load_retry_packet(db: &SwarmDb, stage_history_id: i64) -> Value {
     .unwrap_or_else(|e| panic!("failed to fetch retry packet: {}", e));
     serde_json::from_str(&raw)
         .unwrap_or_else(|e| panic!("failed to parse retry packet JSON: {}", e))
-}
-
-fn build_stage_artifact(
-    stage_history_id: i64,
-    artifact_id: i64,
-    artifact_type: ArtifactType,
-    content_hash: Option<&str>,
-) -> StageArtifact {
-    StageArtifact {
-        id: artifact_id,
-        stage_history_id,
-        artifact_type,
-        content: format!("artifact {} content", artifact_type.as_str()),
-        metadata: None,
-        created_at: Utc::now(),
-        content_hash: content_hash.map(String::from),
-    }
 }
 
 #[tokio::test]
@@ -1651,7 +1641,7 @@ async fn given_qa_failure_with_retries_remaining_when_transition_retry_is_record
         .await
         .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
 
-    let stage_history_id = db
+    let _stage_history_id = db
         .record_stage_started(&agent_id, &bead_id, Stage::QaEnforcer, 1)
         .await
         .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
@@ -1790,7 +1780,7 @@ async fn given_red_queen_failure_with_retries_remaining_when_transition_retry_is
     .unwrap_or_else(|e| panic!("record_stage_complete failed: {}", e));
 
     let retry_packet = db
-        .get_stage_artifacts(red_history)
+        .get_stage_artifacts(agent_id.repo_id(), red_history)
         .await
         .unwrap_or_else(|e| panic!("get_stage_artifacts failed: {}", e))
         .into_iter()
@@ -1810,8 +1800,8 @@ async fn given_red_queen_failure_with_retries_remaining_when_transition_retry_is
         .find(|entry| entry["artifact_type"] == "test_results")
         .unwrap_or_else(|| panic!("test results reference not found"));
 
-    assert_eq!(impl_ref["stage_history_id"], implement_history.into());
-    assert_eq!(qa_ref["stage_history_id"], qa_history.into());
+    assert_eq!(impl_ref["stage_history_id"], Value::from(implement_history));
+    assert_eq!(qa_ref["stage_history_id"], Value::from(qa_history));
 }
 
 #[tokio::test]
@@ -1839,7 +1829,7 @@ async fn given_missing_failure_diagnostics_when_retry_packet_creation_runs_then_
         .await
         .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
 
-    let stage_history_id = db
+    let _stage_history_id = db
         .record_stage_started(&agent_id, &bead_id, Stage::QaEnforcer, 1)
         .await
         .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
@@ -1908,7 +1898,7 @@ async fn given_invalid_artifact_references_when_retry_packet_creation_runs_then_
         .await
         .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
 
-    let stage_history_id = db
+    let _stage_history_id = db
         .record_stage_started(&agent_id, &bead_id, Stage::QaEnforcer, 1)
         .await
         .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));

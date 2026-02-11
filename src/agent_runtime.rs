@@ -358,7 +358,9 @@ async fn process_work_state(
             .await?;
         }
 
-        let stage_artifacts_result = db.get_stage_artifacts(agent_id.repo_id(), stage_history_id).await;
+        let stage_artifacts_result = db
+            .get_stage_artifacts(&RepoId::new(agent_id.repo_id().value()), stage_history_id)
+            .await;
         let stage_artifacts = stage_artifacts_result
             .into_iter()
             .flat_map(IntoIterator::into_iter)

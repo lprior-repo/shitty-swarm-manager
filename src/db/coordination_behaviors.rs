@@ -312,7 +312,7 @@ mod agent_coordination {
                 assert_ne!(code_id, notes_id,
                     "Different artifact types should have different IDs");
 
-                let artifacts = db.get_stage_artifacts(stage_history_id).await
+                let artifacts = db.get_stage_artifacts(agent_id.repo_id(), stage_history_id).await
                     .unwrap_or_else(|e| panic!("get artifacts failed: {}", e));
                 assert_eq!(artifacts.len(), 2, "Should have two artifacts");
             }

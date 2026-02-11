@@ -255,7 +255,7 @@ mod concurrent_operations {
                 assert!(results.iter().all(|r| r.is_ok()),
                     "All artifact stores should succeed");
 
-                let stored_artifacts = db.get_stage_artifacts(stage_history_id).await
+                let stored_artifacts = db.get_stage_artifacts(agent_id.repo_id(), stage_history_id).await
                     .unwrap_or_else(|e| panic!("get artifacts failed: {}", e));
 
                 // Deduplication may reduce count, verify integrity

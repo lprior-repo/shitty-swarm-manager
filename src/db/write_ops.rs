@@ -440,8 +440,15 @@ impl SwarmDb {
 
         let stage_history_id = stage_history_row.id;
 
-        self.persist_stage_transcript(agent_id, stage_history_id, stage, attempt, result, completed_at)
-            .await?;
+        self.persist_stage_transcript(
+            agent_id,
+            stage_history_id,
+            stage,
+            attempt,
+            result,
+            completed_at,
+        )
+        .await?;
 
         self.record_execution_event(
             bead_id,
@@ -472,7 +479,9 @@ impl SwarmDb {
         result: &StageResult,
         completed_at: DateTime<Utc>,
     ) -> Result<()> {
-        let artifacts = self.get_stage_artifacts(agent_id.repo_id(), stage_history_id).await?;
+        let artifacts = self
+            .get_stage_artifacts(agent_id.repo_id(), stage_history_id)
+            .await?;
         let mut sorted_artifacts = artifacts.clone();
         sorted_artifacts.sort_by(|a, b| {
             a.artifact_type
@@ -740,7 +749,9 @@ impl SwarmDb {
         let mut seen_ids = HashSet::new();
         let mut seen_types = HashSet::new();
 
-        let stage_artifacts = self.get_stage_artifacts(agent_id.repo_id(), stage_history_id).await?;
+        let stage_artifacts = self
+            .get_stage_artifacts(agent_id.repo_id(), stage_history_id)
+            .await?;
         for artifact in stage_artifacts {
             let artifact_type_name = artifact.artifact_type.as_str().to_string();
             if seen_ids.insert(artifact.id) {
