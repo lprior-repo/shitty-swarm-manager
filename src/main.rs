@@ -29,6 +29,7 @@ const HELP_DATA: &str = r#"{
     ["init", "Initialize swarm (bootstrap + init-db + register)"],
     ["doctor", "Environment health check"],
     ["status", "Show swarm state"],
+    ["resume", "Show resumable context projections"],
     ["agent", "Run single agent"],
     ["monitor", "View agents/progress"],
     ["register", "Register agents"],
@@ -60,6 +61,7 @@ pub enum CliCommand {
     Doctor,
     Help,
     Status,
+    Resume,
     Agent {
         id: u32,
         dry: Option<bool>,
@@ -175,6 +177,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction, CliError> {
         // Commands with no args
         Some("doctor") => Ok(CliAction::Command(CliCommand::Doctor)),
         Some("status") => Ok(CliAction::Command(CliCommand::Status)),
+        Some("resume") => Ok(CliAction::Command(CliCommand::Resume)),
         Some("?" | "help") => Ok(CliAction::Command(CliCommand::Help)),
         Some("state") => Ok(CliAction::Command(CliCommand::State)),
         Some("agents") => Ok(CliAction::Command(CliCommand::Agents)),
@@ -347,6 +350,8 @@ fn cli_command_to_request(cmd: CliCommand) -> String {
         CliCommand::Help => ("?".to_string(), None, serde_json::Map::new()),
 
         CliCommand::Status => ("status".to_string(), None, serde_json::Map::new()),
+
+        CliCommand::Resume => ("resume".to_string(), None, serde_json::Map::new()),
 
         CliCommand::Agent { id, dry } => {
             let mut args = serde_json::Map::new();
@@ -635,6 +640,7 @@ fn suggest_commands(typo: &str) -> Vec<String> {
         "doctor",
         "help",
         "status",
+        "resume",
         "agent",
         "init",
         "register",

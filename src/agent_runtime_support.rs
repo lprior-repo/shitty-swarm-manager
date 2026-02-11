@@ -1,10 +1,111 @@
 #![allow(clippy::literal_string_with_formatting_args)]
 
 use crate::config::StageCommands;
+use serde::Serialize;
+use serde_json::json;
 use swarm::{
     ArtifactType, BeadId, MessageType, Result, Stage, StageArtifact, StageResult, SwarmError,
 };
 use tokio::process::Command;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum LandingSagaState {
+    Pending,
+    Committing,
+    Syncing,
+    Fetching,
+    Pushing,
+    Confirmed,
+    Failed,
+}
+
+impl LandingSagaState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Committing => "committing",
+            Self::Syncing => "syncing",
+            Self::Fetching => "fetching",
+            Self::Pushing => "pushing",
+            Self::Confirmed => "confirmed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LandingStepOutcome {
+    pub state: LandingSagaState,
+    pub step: &'static str,
+    pub command: Option<&'static str>,
+    pub status_success: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LandingSagaOutcome {
+    pub bead_id: String,
+    pub initial_state: LandingSagaState,
+    pub terminal_state: LandingSagaState,
+    pub push_confirmed: bool,
+    pub steps: Vec<LandingStepOutcome>,
+}
+
+impl LandingSagaOutcome {
+    #[must_use]
+    pub fn failure_summary(&self) -> String {
+        self.steps
+            .last()
+            .filter(|last| !last.status_success)
+            .map_or_else(
+                || "landing saga ended before push confirmation".to_string(),
+                |last| format!("{} failed: {}", last.step, last.message.trim()),
+            )
+    }
+
+    #[must_use]
+    pub fn persistence_payload(&self) -> serde_json::Value {
+        json!({
+            "initial_state": self.initial_state.as_str(),
+            "terminal_state": self.terminal_state.as_str(),
+            "push_confirmed": self.push_confirmed,
+            "steps": self.steps.iter().map(|step| {
+                json!({
+                    "state": step.state.as_str(),
+                    "step": step.step,
+                    "command": step.command,
+                    "status_success": step.status_success,
+                    "message": step.message,
+                })
+            }).collect::<Vec<_>>(),
+        })
+    }
+}
+
+const LANDING_SAGA_STEPS: [(LandingSagaState, &str, Option<&str>); 5] = [
+    (LandingSagaState::Committing, "commit_changes", None),
+    (
+        LandingSagaState::Syncing,
+        "sync_beads",
+        Some("br sync --flush-only"),
+    ),
+    (
+        LandingSagaState::Fetching,
+        "fetch_remote",
+        Some("jj git fetch"),
+    ),
+    (
+        LandingSagaState::Pushing,
+        "push_commits",
+        Some("jj git push"),
+    ),
+    (
+        LandingSagaState::Confirmed,
+        "finalize_workspace",
+        Some("zjj done"),
+    ),
+];
 
 pub const fn stage_primary_artifact(stage: Stage, result: &StageResult) -> ArtifactType {
     match (stage, result.is_success()) {
@@ -166,6 +267,66 @@ pub async fn create_workspace(agent_id: u32, bead_id: &str) -> Result<()> {
     Ok(())
 }
 
+pub async fn execute_landing_saga(bead_id: &str) -> Result<LandingSagaOutcome> {
+    run_landing_saga_with_runner(bead_id, |command| async move {
+        run_shell_command(command.as_str()).await
+    })
+    .await
+}
+
+pub async fn run_landing_saga_with_runner<R, Fut>(
+    bead_id: &str,
+    mut run: R,
+) -> Result<LandingSagaOutcome>
+where
+    R: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<CommandOutput>>,
+{
+    let mut push_confirmed = false;
+    let mut terminal_state = LandingSagaState::Pending;
+    let mut steps = Vec::with_capacity(LANDING_SAGA_STEPS.len());
+
+    for (state, step, command) in LANDING_SAGA_STEPS {
+        let output = match command {
+            Some(actual_command) => run(actual_command.to_string()).await?,
+            None => CommandOutput {
+                status_success: true,
+                message: "Commit state already persisted before landing".to_string(),
+            },
+        };
+
+        if step == "push_commits" {
+            push_confirmed = output.status_success;
+        }
+
+        let status_success = output.status_success;
+        terminal_state = if status_success {
+            state
+        } else {
+            LandingSagaState::Failed
+        };
+        steps.push(LandingStepOutcome {
+            state,
+            step,
+            command,
+            status_success,
+            message: output.message,
+        });
+
+        if !status_success {
+            break;
+        }
+    }
+
+    Ok(LandingSagaOutcome {
+        bead_id: bead_id.to_string(),
+        initial_state: LandingSagaState::Pending,
+        terminal_state,
+        push_confirmed,
+        steps,
+    })
+}
+
 pub async fn finalize_workspace(_bead_id: &str) -> Result<()> {
     // br sync --flush-only
     let _ = run_shell_command("br sync --flush-only").await;
@@ -178,9 +339,24 @@ pub async fn finalize_workspace(_bead_id: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_stage, render_stage_command, run_shell_command, stage_command_template};
+    use super::{
+        execute_stage, render_stage_command, run_landing_saga_with_runner, run_shell_command,
+        stage_command_template, CommandOutput, LandingSagaState,
+    };
     use crate::config::StageCommands;
+    use swarm::Result as SwarmResult;
     use swarm::{AgentId, BeadId, RepoId, Stage, StageResult};
+
+    fn pop_output(outputs: &mut Vec<CommandOutput>) -> SwarmResult<CommandOutput> {
+        outputs.pop().map_or_else(
+            || {
+                Err(swarm::Error::Internal(
+                    "test output queue was exhausted".to_string(),
+                ))
+            },
+            Ok,
+        )
+    }
 
     #[tokio::test]
     async fn shell_command_failure_captures_both_streams() {
@@ -251,5 +427,123 @@ mod tests {
         .await;
 
         assert_eq!(result, StageResult::Passed);
+    }
+
+    #[tokio::test]
+    async fn landing_saga_confirms_push_before_completion() {
+        let mut outputs = vec![
+            CommandOutput {
+                status_success: true,
+                message: "workspace done".to_string(),
+            },
+            CommandOutput {
+                status_success: true,
+                message: "push ok".to_string(),
+            },
+            CommandOutput {
+                status_success: true,
+                message: "fetch ok".to_string(),
+            },
+            CommandOutput {
+                status_success: true,
+                message: "sync ok".to_string(),
+            },
+        ];
+
+        let outcome = run_landing_saga_with_runner("swm-qso", move |_command| {
+            let next = pop_output(&mut outputs);
+            async move { next }
+        })
+        .await;
+
+        assert!(outcome.is_ok());
+        if let Ok(result) = outcome {
+            assert!(result.push_confirmed);
+            assert_eq!(result.initial_state, LandingSagaState::Pending);
+            assert_eq!(result.terminal_state, LandingSagaState::Confirmed);
+            assert_eq!(result.steps.len(), 5);
+            assert_eq!(result.steps[3].step, "push_commits");
+            assert_eq!(result.steps[4].state, LandingSagaState::Confirmed);
+        }
+    }
+
+    #[tokio::test]
+    async fn landing_saga_stops_when_fetch_fails_and_marks_failed_terminal_state() {
+        let mut outputs = vec![
+            CommandOutput {
+                status_success: true,
+                message: "should not run".to_string(),
+            },
+            CommandOutput {
+                status_success: false,
+                message: "fetch failed".to_string(),
+            },
+            CommandOutput {
+                status_success: true,
+                message: "sync ok".to_string(),
+            },
+        ];
+
+        let outcome = run_landing_saga_with_runner("swm-qso", move |_command| {
+            let next = pop_output(&mut outputs);
+            async move { next }
+        })
+        .await;
+
+        assert!(outcome.is_ok());
+        if let Ok(result) = outcome {
+            assert!(!result.push_confirmed);
+            assert_eq!(result.terminal_state, LandingSagaState::Failed);
+            assert_eq!(result.steps.len(), 3);
+            assert_eq!(result.steps[2].state, LandingSagaState::Fetching);
+            assert!(!result.steps[2].status_success);
+        }
+    }
+
+    #[tokio::test]
+    async fn landing_saga_persistence_payload_exposes_state_machine_contract() {
+        let mut outputs = vec![
+            CommandOutput {
+                status_success: true,
+                message: "workspace done".to_string(),
+            },
+            CommandOutput {
+                status_success: true,
+                message: "push ok".to_string(),
+            },
+            CommandOutput {
+                status_success: true,
+                message: "fetch ok".to_string(),
+            },
+            CommandOutput {
+                status_success: true,
+                message: "sync ok".to_string(),
+            },
+        ];
+
+        let outcome = run_landing_saga_with_runner("swm-qso", move |_command| {
+            let next = pop_output(&mut outputs);
+            async move { next }
+        })
+        .await;
+
+        assert!(outcome.is_ok());
+        if let Ok(result) = outcome {
+            let payload = result.persistence_payload();
+            assert_eq!(payload["initial_state"], serde_json::Value::from("pending"));
+            assert_eq!(
+                payload["terminal_state"],
+                serde_json::Value::from("confirmed")
+            );
+            assert_eq!(payload["push_confirmed"], serde_json::Value::from(true));
+            assert_eq!(
+                payload["steps"][0]["state"],
+                serde_json::Value::from("committing")
+            );
+            assert_eq!(
+                payload["steps"][4]["state"],
+                serde_json::Value::from("confirmed")
+            );
+        }
     }
 }

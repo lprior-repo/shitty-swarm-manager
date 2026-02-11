@@ -15,7 +15,7 @@ Parse by keys, not by string matching.
 ## 0) Mental Model (Read Once)
 
 You are not just writing code.
-You are moving a task through a **state machine** backed by PostgreSQL.
+You are moving a bead through a **state machine** backed by PostgreSQL.
 
 Every meaningful action must leave traces in system state:
 - claim state (`bead_claims`)

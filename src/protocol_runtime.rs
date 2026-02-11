@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::Instant;
 use swarm::protocol_envelope::ProtocolEnvelope;
-use swarm::{code, AgentId, RepoId, SwarmDb, SwarmError};
+use swarm::{code, AgentId, RepoId, ResumeContextContract, SwarmDb, SwarmError};
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -629,6 +629,7 @@ async fn execute_request_no_batch(
         "register" => handle_register(&request).await,
         "agent" => handle_agent(&request).await,
         "status" => handle_status(&request).await,
+        "resume" => handle_resume(&request).await,
         "release" => handle_release(&request).await,
         "init-db" => handle_init_db(&request).await,
         "init-local-db" => handle_init_local_db(&request).await,
@@ -639,11 +640,11 @@ async fn execute_request_no_batch(
         "load-profile" => handle_load_profile(&request).await,
         "bootstrap" => handle_bootstrap(&request).await,
         "init" => handle_init(&request).await,
-            other => Err(Box::new(ProtocolEnvelope::error(
+        other => Err(Box::new(ProtocolEnvelope::error(
                 request.rid.clone(),
                 code::INVALID.to_string(),
                 format!("Unknown command: {other}"),
-            ).with_fix("Use a valid command: init, doctor, status, agent, smoke, prompt, register, release, monitor, init-db, init-local-db, spawn-prompts, batch, bootstrap, state, or ?/help for help".to_string())
+            ).with_fix("Use a valid command: init, doctor, status, resume, agent, smoke, prompt, register, release, monitor, init-db, init-local-db, spawn-prompts, batch, bootstrap, state, or ?/help for help".to_string())
             .with_ctx(json!({"cmd": other})))),
     }
 }
@@ -661,6 +662,7 @@ async fn handle_help(
         ("init", "Initialize swarm (bootstrap + init-db + register)"),
         ("doctor", "Environment health check"),
         ("status", "Show swarm state"),
+        ("resume", "Show resumable context projections"),
         ("agent", "Run single agent"),
         ("monitor", "View agents/progress"),
         ("register", "Register agents"),
@@ -1085,31 +1087,54 @@ async fn handle_monitor(
         }
         "failures" => {
             let rows = db
-                .get_feedback_required()
+                .get_execution_events(None, 200)
                 .await
                 .map_err(|e| to_protocol_failure(e, request.rid.clone()))?
                 .into_iter()
-                .map(
-                    |(bead_id, agent_id, stage, attempt, feedback, completed_at): (
-                        String,
-                        u32,
-                        String,
-                        u32,
-                        Option<String>,
-                        Option<String>,
-                    )| {
+                .filter_map(|event| {
+                    event.diagnostics.map(|diagnostics| {
                         json!({
-                            "bead_id": bead_id,
-                            "agent_id": agent_id,
-                            "stage": stage,
-                            "attempt": attempt,
-                            "feedback": feedback,
-                            "completed_at": completed_at,
+                            "seq": event.seq,
+                            "bead_id": event.bead_id,
+                            "agent_id": event.agent_id,
+                            "stage": event.stage,
+                            "event_type": event.event_type,
+                            "causation_id": event.causation_id,
+                            "category": diagnostics.category,
+                            "retryable": diagnostics.retryable,
+                            "next_command": diagnostics.next_command,
+                            "detail": diagnostics.detail,
+                            "created_at": event.created_at,
                         })
-                    },
-                )
+                    })
+                })
                 .collect::<Vec<_>>();
             json!({"view": "failures", "rows": rows})
+        }
+        "events" => {
+            let bead_filter = request.args.get("bead_id").and_then(Value::as_str);
+            let rows = db
+                .get_execution_events(bead_filter, 200)
+                .await
+                .map_err(|e| to_protocol_failure(e, request.rid.clone()))?
+                .into_iter()
+                .map(|event| {
+                    json!({
+                        "seq": event.seq,
+                        "schema_version": event.schema_version,
+                        "event_type": event.event_type,
+                        "entity_id": event.entity_id,
+                        "bead_id": event.bead_id,
+                        "agent_id": event.agent_id,
+                        "stage": event.stage,
+                        "causation_id": event.causation_id,
+                        "diagnostics": event.diagnostics,
+                        "payload": event.payload,
+                        "created_at": event.created_at,
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({"view": "events", "rows": rows})
         }
         "messages" => {
             let rows = db
@@ -1297,6 +1322,28 @@ async fn handle_status(
         }),
         next: "swarm monitor --view progress".to_string(),
         state: minimal_state_from_progress(&progress),
+    })
+}
+
+async fn handle_resume(
+    request: &ProtocolRequest,
+) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
+    let db: SwarmDb = db_from_request(request).await?;
+    let contexts = db
+        .get_resume_context_projections()
+        .await
+        .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
+    let contracts = contexts
+        .iter()
+        .map(ResumeContextContract::from_projection)
+        .collect::<Vec<_>>();
+
+    Ok(CommandSuccess {
+        data: json!({
+            "contexts": contracts,
+        }),
+        next: "swarm monitor --view failures".to_string(),
+        state: minimal_state_for_request(request).await,
     })
 }
 

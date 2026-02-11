@@ -1,5 +1,6 @@
 use super::{determine_transition, StageTransition};
 use crate::db::SwarmDb;
+use crate::error::SwarmError;
 use crate::types::{AgentId, ArtifactType, BeadId, MessageType, RepoId, Stage, StageResult};
 use futures_util::future::join_all;
 use sqlx::postgres::PgPoolOptions;
@@ -44,11 +45,14 @@ async fn setup_schema(db: &SwarmDb) {
          DROP FUNCTION IF EXISTS get_unread_messages(TEXT, INTEGER, TEXT) CASCADE;
          DROP FUNCTION IF EXISTS send_agent_message(TEXT, INTEGER, TEXT, INTEGER, TEXT, TEXT, TEXT, TEXT, JSONB) CASCADE;
          DROP FUNCTION IF EXISTS store_stage_artifact(BIGINT, TEXT, TEXT, JSONB) CASCADE;
+         DROP FUNCTION IF EXISTS heartbeat_bead_claim(INTEGER, TEXT, INTEGER) CASCADE;
+         DROP FUNCTION IF EXISTS recover_expired_bead_claims() CASCADE;
          DROP FUNCTION IF EXISTS claim_next_p0_bead(INTEGER) CASCADE;
          DROP FUNCTION IF EXISTS claim_next_p0_bead(SMALLINT) CASCADE;
          DROP FUNCTION IF EXISTS set_agent_last_update() CASCADE;
          DROP TABLE IF EXISTS agent_messages CASCADE;
          DROP TABLE IF EXISTS stage_artifacts CASCADE;
+         DROP TABLE IF EXISTS execution_events CASCADE;
          DROP TABLE IF EXISTS stage_history CASCADE;
          DROP TABLE IF EXISTS agent_run_logs CASCADE;
          DROP TABLE IF EXISTS bead_claims CASCADE;
@@ -67,7 +71,7 @@ async fn setup_schema(db: &SwarmDb) {
 
 async fn reset_runtime_tables(db: &SwarmDb) {
     sqlx::query(
-        "TRUNCATE TABLE agent_messages, stage_artifacts, stage_history, agent_run_logs, bead_claims, bead_backlog, agent_state RESTART IDENTITY",
+        "TRUNCATE TABLE agent_messages, stage_artifacts, execution_events, stage_history, agent_run_logs, bead_claims, bead_backlog, agent_state RESTART IDENTITY",
     )
     .execute(db.pool())
     .await
@@ -122,6 +126,23 @@ fn transition_for_failure_retries_implementation() {
         determine_transition(Stage::QaEnforcer, &StageResult::Failed("x".to_string())),
         StageTransition::RetryImplement
     );
+}
+
+#[tokio::test]
+async fn finalize_after_push_confirmation_rejects_unconfirmed_push_without_db_io() {
+    let lazy_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_lazy("postgres://localhost/unused")
+        .unwrap_or_else(|e| panic!("failed to build lazy pool: {e}"));
+    let db = db_from_pool(lazy_pool);
+    let agent_id = AgentId::new(RepoId::new("local"), 1);
+    let bead_id = BeadId::new(unique_bead("bead-push-gate"));
+
+    let result = db
+        .finalize_after_push_confirmation(&agent_id, &bead_id, false)
+        .await;
+
+    assert!(matches!(result, Err(SwarmError::AgentError(_))));
 }
 
 #[tokio::test]
@@ -299,6 +320,212 @@ async fn claim_next_bead_prefers_existing_in_progress_claim() {
     assert_eq!(state_bead.as_deref(), Some(bead_id.value()));
     assert_eq!(status.as_str(), "working");
     assert_eq!(stage.as_deref(), Some("rust-contract"));
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
+async fn claim_next_bead_recovers_expired_claim_for_another_agent() {
+    let db = test_db().await;
+    setup_schema(&db).await;
+    reset_runtime_tables(&db).await;
+
+    let original_agent = AgentId::new(RepoId::new("local"), 1);
+    let recovery_agent = AgentId::new(RepoId::new("local"), 2);
+    let bead_id = BeadId::new(unique_bead("bead-recover-expired"));
+
+    db.seed_idle_agents(2)
+        .await
+        .unwrap_or_else(|e| panic!("seed_idle_agents failed: {}", e));
+
+    sqlx::query(
+        "INSERT INTO bead_backlog (bead_id, priority, status) VALUES ($1, 'p0', 'pending')",
+    )
+    .bind(bead_id.value())
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("insert backlog failed: {}", e));
+
+    db.claim_next_bead(&original_agent)
+        .await
+        .unwrap_or_else(|e| panic!("initial claim failed: {}", e));
+
+    sqlx::query(
+        "UPDATE bead_claims
+         SET heartbeat_at = NOW() - INTERVAL '12 minutes',
+             lease_expires_at = NOW() - INTERVAL '1 minute'
+         WHERE bead_id = $1",
+    )
+    .bind(bead_id.value())
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("expire lease failed: {}", e));
+
+    let recovered = db
+        .claim_next_bead(&recovery_agent)
+        .await
+        .unwrap_or_else(|e| panic!("recovery claim failed: {}", e));
+
+    assert_eq!(recovered.as_ref().map(BeadId::value), Some(bead_id.value()));
+
+    let owner = sqlx::query_scalar::<_, i32>(
+        "SELECT claimed_by FROM bead_claims WHERE bead_id = $1 AND status = 'in_progress'",
+    )
+    .bind(bead_id.value())
+    .fetch_one(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("fetch owner failed: {}", e));
+    assert_eq!(owner, recovery_agent.number() as i32);
+
+    let original_status =
+        sqlx::query_scalar::<_, String>("SELECT status FROM agent_state WHERE agent_id = $1")
+            .bind(original_agent.number() as i32)
+            .fetch_one(db.pool())
+            .await
+            .unwrap_or_else(|e| panic!("fetch original status failed: {}", e));
+    assert_eq!(original_status, "idle");
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
+async fn heartbeat_extends_lease_monotonically_for_owner_claim() {
+    let db = test_db().await;
+    setup_schema(&db).await;
+    reset_runtime_tables(&db).await;
+
+    let agent_id = AgentId::new(RepoId::new("local"), 1);
+    let bead_id = BeadId::new(unique_bead("bead-heartbeat"));
+
+    db.seed_idle_agents(1)
+        .await
+        .unwrap_or_else(|e| panic!("seed_idle_agents failed: {}", e));
+    sqlx::query(
+        "INSERT INTO bead_backlog (bead_id, priority, status) VALUES ($1, 'p0', 'pending')",
+    )
+    .bind(bead_id.value())
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("insert backlog failed: {}", e));
+
+    db.claim_next_bead(&agent_id)
+        .await
+        .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
+
+    let before =
+        sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>(
+            "SELECT heartbeat_at, lease_expires_at FROM bead_claims WHERE bead_id = $1",
+        )
+        .bind(bead_id.value())
+        .fetch_one(db.pool())
+        .await
+        .unwrap_or_else(|e| panic!("fetch claim before heartbeat failed: {}", e));
+
+    let heartbeat_ok = db
+        .heartbeat_claim(&agent_id, &bead_id, 300_000)
+        .await
+        .unwrap_or_else(|e| panic!("heartbeat_claim failed: {}", e));
+    assert!(heartbeat_ok);
+
+    let after =
+        sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>(
+            "SELECT heartbeat_at, lease_expires_at FROM bead_claims WHERE bead_id = $1",
+        )
+        .bind(bead_id.value())
+        .fetch_one(db.pool())
+        .await
+        .unwrap_or_else(|e| panic!("fetch claim after heartbeat failed: {}", e));
+
+    assert!(after.0 >= before.0, "heartbeat_at must be monotonic");
+    assert!(after.1 > before.1, "lease_expires_at should be extended");
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
+async fn finalize_after_push_confirmation_rejects_non_owner_claim_mutation() {
+    let db = test_db().await;
+    setup_schema(&db).await;
+    reset_runtime_tables(&db).await;
+
+    let owner_agent = AgentId::new(RepoId::new("local"), 1);
+    let non_owner_agent = AgentId::new(RepoId::new("local"), 2);
+    let bead_id = BeadId::new(unique_bead("bead-finalize-owner"));
+
+    db.seed_idle_agents(2)
+        .await
+        .unwrap_or_else(|e| panic!("seed_idle_agents failed: {}", e));
+    sqlx::query(
+        "INSERT INTO bead_backlog (bead_id, priority, status) VALUES ($1, 'p0', 'pending')",
+    )
+    .bind(bead_id.value())
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("insert backlog failed: {}", e));
+
+    db.claim_next_bead(&owner_agent)
+        .await
+        .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
+
+    let finalize_result = db
+        .finalize_after_push_confirmation(&non_owner_agent, &bead_id, true)
+        .await;
+    assert!(
+        matches!(finalize_result, Err(SwarmError::AgentError(_))),
+        "expected AgentError for non-owner finalize, got: {:?}",
+        finalize_result
+    );
+
+    let claim_row = sqlx::query_as::<_, (String, i32)>(
+        "SELECT status, claimed_by FROM bead_claims WHERE bead_id = $1",
+    )
+    .bind(bead_id.value())
+    .fetch_one(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("fetch claim row failed: {}", e));
+    assert_eq!(claim_row.0, "in_progress");
+    assert_eq!(claim_row.1, owner_agent.number() as i32);
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
+async fn mark_bead_blocked_rejects_non_owner_claim_mutation() {
+    let db = test_db().await;
+    setup_schema(&db).await;
+    reset_runtime_tables(&db).await;
+
+    let owner_agent = AgentId::new(RepoId::new("local"), 1);
+    let non_owner_agent = AgentId::new(RepoId::new("local"), 2);
+    let bead_id = BeadId::new(unique_bead("bead-block-owner"));
+
+    db.seed_idle_agents(2)
+        .await
+        .unwrap_or_else(|e| panic!("seed_idle_agents failed: {}", e));
+    sqlx::query(
+        "INSERT INTO bead_backlog (bead_id, priority, status) VALUES ($1, 'p0', 'pending')",
+    )
+    .bind(bead_id.value())
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("insert backlog failed: {}", e));
+
+    db.claim_next_bead(&owner_agent)
+        .await
+        .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
+
+    let block_result = db
+        .mark_bead_blocked(&non_owner_agent, &bead_id, "not owner")
+        .await;
+    assert!(
+        matches!(block_result, Err(SwarmError::AgentError(_))),
+        "expected AgentError for non-owner block, got: {:?}",
+        block_result
+    );
+
+    let claim_status =
+        sqlx::query_scalar::<_, String>("SELECT status FROM bead_claims WHERE bead_id = $1")
+            .bind(bead_id.value())
+            .fetch_one(db.pool())
+            .await
+            .unwrap_or_else(|e| panic!("fetch claim status failed: {}", e));
+    assert_eq!(claim_status, "in_progress");
 }
 
 #[tokio::test]
@@ -679,6 +906,122 @@ async fn mark_messages_read_updates_requested_ids_in_single_bulk_call() {
         "other agent message should remain unread"
     );
     assert_eq!(other_unread[0].id, other_agent_message_id);
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
+async fn stage_lifecycle_emits_deterministic_execution_events() {
+    let db = test_db().await;
+    setup_schema(&db).await;
+    reset_runtime_tables(&db).await;
+
+    let agent_id = AgentId::new(RepoId::new("local"), 1);
+    let bead_id = BeadId::new(unique_bead("bead-events"));
+
+    db.seed_idle_agents(1)
+        .await
+        .unwrap_or_else(|e| panic!("seed_idle_agents failed: {}", e));
+    sqlx::query(
+        "INSERT INTO bead_backlog (bead_id, priority, status) VALUES ($1, 'p0', 'pending')",
+    )
+    .bind(bead_id.value())
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("insert backlog failed: {}", e));
+    db.claim_next_bead(&agent_id)
+        .await
+        .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
+
+    db.record_stage_started(&agent_id, &bead_id, Stage::Implement, 1)
+        .await
+        .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
+    db.record_stage_complete(
+        &agent_id,
+        &bead_id,
+        Stage::Implement,
+        1,
+        StageResult::Failed("test suite failed".to_string()),
+        15,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("record_stage_complete failed: {}", e));
+
+    let rows = sqlx::query_as::<_, (i64, String, Option<String>)>(
+        "SELECT seq, event_type, causation_id
+         FROM execution_events
+         WHERE bead_id = $1
+         ORDER BY seq ASC",
+    )
+    .bind(bead_id.value())
+    .fetch_all(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("query events failed: {}", e));
+
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].1, "stage_started");
+    assert_eq!(rows[1].1, "stage_completed");
+    assert_eq!(rows[2].1, "transition_retry");
+    assert_eq!(rows[0].2, rows[1].2);
+    assert_eq!(rows[1].2, rows[2].2);
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
+async fn transition_retry_event_includes_structured_redacted_diagnostics() {
+    let db = test_db().await;
+    setup_schema(&db).await;
+    reset_runtime_tables(&db).await;
+
+    let agent_id = AgentId::new(RepoId::new("local"), 1);
+    let bead_id = BeadId::new(unique_bead("bead-diag"));
+
+    db.seed_idle_agents(1)
+        .await
+        .unwrap_or_else(|e| panic!("seed_idle_agents failed: {}", e));
+    sqlx::query(
+        "INSERT INTO bead_backlog (bead_id, priority, status) VALUES ($1, 'p0', 'pending')",
+    )
+    .bind(bead_id.value())
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("insert backlog failed: {}", e));
+    db.claim_next_bead(&agent_id)
+        .await
+        .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
+
+    db.record_stage_started(&agent_id, &bead_id, Stage::Implement, 1)
+        .await
+        .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
+    db.record_stage_complete(
+        &agent_id,
+        &bead_id,
+        Stage::Implement,
+        1,
+        StageResult::Failed("test failed token=abc123".to_string()),
+        19,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("record_stage_complete failed: {}", e));
+
+    let row = sqlx::query_as::<_, (String, bool, String, Option<String>)>(
+        "SELECT diagnostics_category, diagnostics_retryable, diagnostics_next_command, diagnostics_detail
+         FROM execution_events
+         WHERE bead_id = $1 AND event_type = 'transition_retry'
+         ORDER BY seq DESC
+         LIMIT 1",
+    )
+    .bind(bead_id.value())
+    .fetch_one(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("query transition_retry diagnostics failed: {}", e));
+
+    assert_eq!(row.0, "test_failure");
+    assert!(row.1);
+    assert_eq!(row.2, "swarm stage --stage implement");
+    assert!(row
+        .3
+        .as_deref()
+        .is_some_and(|detail| detail.contains("token=<redacted>")));
 }
 
 #[tokio::test]

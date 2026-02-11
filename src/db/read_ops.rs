@@ -3,8 +3,11 @@ use crate::db::SwarmDb;
 use crate::error::{Result, SwarmError};
 use crate::types::{
     AgentId, AgentMessage, AgentState, AgentStatus, ArtifactType, AvailableAgent, BeadId,
-    MessageType, ProgressSummary, RepoId, StageArtifact, SwarmConfig,
+    ExecutionEvent, FailureDiagnostics, MessageType, ProgressSummary, RepoId,
+    ResumeArtifactSummary, ResumeContextProjection, ResumeStageAttempt, Stage, StageArtifact,
+    SwarmConfig,
 };
+use serde::Deserialize;
 use sqlx::FromRow;
 
 #[derive(FromRow)]
@@ -64,6 +67,36 @@ struct FeedbackRow {
 }
 
 #[derive(FromRow)]
+struct ResumeContextAggregateRow {
+    agent_id: i32,
+    bead_id: String,
+    current_stage: Option<String>,
+    implementation_attempt: i32,
+    feedback: Option<String>,
+    status: String,
+    attempts_json: serde_json::Value,
+    artifacts_json: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct ResumeStageAttemptJson {
+    stage: String,
+    attempt_number: i32,
+    status: String,
+    feedback: Option<String>,
+    started_at: chrono::DateTime<chrono::Utc>,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Deserialize)]
+struct ResumeArtifactSummaryJson {
+    artifact_type: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    content_hash: Option<String>,
+    byte_length: i64,
+}
+
+#[derive(FromRow)]
 struct StageArtifactRow {
     id: i64,
     stage_history_id: i64,
@@ -108,6 +141,24 @@ struct ResourceLockRow {
     agent: String,
     since: chrono::DateTime<chrono::Utc>,
     until_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(FromRow)]
+struct ExecutionEventRow {
+    seq: i64,
+    schema_version: i32,
+    event_type: String,
+    entity_id: String,
+    bead_id: Option<String>,
+    agent_id: Option<i32>,
+    stage: Option<String>,
+    causation_id: Option<String>,
+    diagnostics_category: Option<String>,
+    diagnostics_retryable: Option<bool>,
+    diagnostics_next_command: Option<String>,
+    diagnostics_detail: Option<String>,
+    payload: Option<serde_json::Value>,
+    created_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl SwarmDb {
@@ -399,6 +450,165 @@ impl SwarmDb {
         })
     }
 
+    /// Retrieves deterministic execution events, optionally filtered by bead.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::DatabaseError` if the database query fails.
+    pub async fn get_execution_events(
+        &self,
+        bead_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<ExecutionEvent>> {
+        sqlx::query_as::<_, ExecutionEventRow>(
+            "SELECT
+                seq,
+                schema_version,
+                event_type,
+                entity_id,
+                bead_id,
+                agent_id,
+                stage,
+                causation_id,
+                diagnostics_category,
+                diagnostics_retryable,
+                diagnostics_next_command,
+                diagnostics_detail,
+                payload,
+                created_at
+             FROM execution_events
+             WHERE ($1::TEXT IS NULL OR bead_id = $1)
+             ORDER BY seq DESC
+             LIMIT $2",
+        )
+        .bind(bead_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to load execution events: {e}")))
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| {
+                    let diagnostics = diagnostics_from_row(&row);
+                    ExecutionEvent {
+                        seq: row.seq,
+                        schema_version: row.schema_version,
+                        event_type: row.event_type,
+                        entity_id: row.entity_id,
+                        bead_id: row.bead_id,
+                        agent_id: row.agent_id.map(to_u32_i32),
+                        stage: row.stage,
+                        causation_id: row.causation_id,
+                        diagnostics,
+                        payload: row.payload,
+                        created_at: row.created_at,
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+    }
+
+    /// Retrieves resumable execution context for each active bead.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::DatabaseError` if the database query fails.
+    pub async fn get_resume_context_projections(&self) -> Result<Vec<ResumeContextProjection>> {
+        let artifact_types = resume_artifact_type_names();
+        let contexts = sqlx::query_as::<_, ResumeContextAggregateRow>(
+            "SELECT
+                a.agent_id,
+                a.bead_id,
+                a.current_stage,
+                a.implementation_attempt,
+                a.feedback,
+                a.status,
+                COALESCE(
+                    (
+                        SELECT json_agg(
+                            json_build_object(
+                                'stage', sh.stage,
+                                'attempt_number', sh.attempt_number,
+                                'status', sh.status,
+                                'feedback', sh.feedback,
+                                'started_at', sh.started_at,
+                                'completed_at', sh.completed_at
+                            )
+                            ORDER BY sh.attempt_number ASC, sh.started_at ASC, sh.id ASC
+                        )
+                        FROM stage_history sh
+                        WHERE sh.bead_id = a.bead_id
+                    ),
+                    '[]'::json
+                ) AS attempts_json,
+                COALESCE(
+                    (
+                        SELECT json_agg(
+                            json_build_object(
+                                'artifact_type', latest.artifact_type,
+                                'created_at', latest.created_at,
+                                'content_hash', latest.content_hash,
+                                'byte_length', latest.byte_length
+                            )
+                            ORDER BY latest.created_at ASC, latest.artifact_type ASC
+                        )
+                        FROM (
+                            SELECT DISTINCT ON (sa.artifact_type)
+                                sa.artifact_type,
+                                sa.created_at,
+                                sa.content_hash,
+                                OCTET_LENGTH(sa.content)::BIGINT AS byte_length
+                            FROM stage_artifacts sa
+                            JOIN stage_history sh ON sh.id = sa.stage_history_id
+                            WHERE sh.bead_id = a.bead_id
+                              AND sa.artifact_type = ANY($1::TEXT[])
+                            ORDER BY sa.artifact_type, sa.created_at DESC, sa.id DESC
+                        ) AS latest
+                    ),
+                    '[]'::json
+                ) AS artifacts_json
+             FROM agent_state a
+             WHERE a.bead_id IS NOT NULL
+               AND a.status IN ('working', 'waiting', 'error')
+             ORDER BY a.bead_id ASC, a.agent_id ASC",
+        )
+        .bind(artifact_types)
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| {
+            SwarmError::DatabaseError(format!("Failed to load resume context rows: {e}"))
+        })?;
+
+        let mut projections = Vec::with_capacity(contexts.len());
+        for context in contexts {
+            let attempts = parse_resume_attempts(context.attempts_json.clone())?;
+            let artifacts = parse_resume_artifacts(context.artifacts_json.clone())?;
+
+            let status = AgentStatus::try_from(context.status.as_str())
+                .map_err(SwarmError::DatabaseError)?;
+
+            let current_stage = context
+                .current_stage
+                .as_deref()
+                .map(Stage::try_from)
+                .transpose()
+                .map_err(SwarmError::DatabaseError)?;
+
+            projections.push(ResumeContextProjection {
+                agent_id: to_u32_i32(context.agent_id),
+                bead_id: BeadId::new(&context.bead_id),
+                status,
+                current_stage,
+                implementation_attempt: to_u32_i32(context.implementation_attempt),
+                feedback: context.feedback.clone(),
+                attempts,
+                artifacts,
+            });
+        }
+
+        Ok(projections)
+    }
+
     /// Retrieves all artifacts for a specific stage history.
     ///
     /// # Errors
@@ -633,5 +843,96 @@ impl SwarmDb {
                 })
                 .collect::<Result<Vec<_>>>()
         })
+    }
+}
+
+fn diagnostics_from_row(row: &ExecutionEventRow) -> Option<FailureDiagnostics> {
+    row.diagnostics_category
+        .as_ref()
+        .zip(row.diagnostics_retryable)
+        .zip(row.diagnostics_next_command.as_ref())
+        .map(|((category, retryable), next_command)| FailureDiagnostics {
+            category: category.clone(),
+            retryable,
+            next_command: next_command.clone(),
+            detail: row.diagnostics_detail.clone(),
+        })
+}
+
+fn parse_resume_attempts(json: serde_json::Value) -> Result<Vec<ResumeStageAttempt>> {
+    serde_json::from_value::<Vec<ResumeStageAttemptJson>>(json)
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to decode resume attempts: {e}")))
+        .and_then(|rows| {
+            rows.into_iter()
+                .map(|row| {
+                    Stage::try_from(row.stage.as_str())
+                        .map_err(SwarmError::DatabaseError)
+                        .map(|stage| ResumeStageAttempt {
+                            stage,
+                            attempt_number: to_u32_i32(row.attempt_number),
+                            status: row.status,
+                            feedback: row.feedback,
+                            started_at: row.started_at,
+                            completed_at: row.completed_at,
+                        })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+}
+
+fn parse_resume_artifacts(json: serde_json::Value) -> Result<Vec<ResumeArtifactSummary>> {
+    serde_json::from_value::<Vec<ResumeArtifactSummaryJson>>(json)
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to decode resume artifacts: {e}")))
+        .and_then(|rows| {
+            rows.into_iter()
+                .map(|row| {
+                    ArtifactType::try_from(row.artifact_type.as_str())
+                        .map_err(SwarmError::DatabaseError)
+                        .map(|artifact_type| ResumeArtifactSummary {
+                            artifact_type,
+                            created_at: row.created_at,
+                            content_hash: row.content_hash,
+                            byte_length: row.byte_length.max(0).cast_unsigned(),
+                        })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+}
+
+fn resume_artifact_type_names() -> Vec<String> {
+    [
+        ArtifactType::ContractDocument,
+        ArtifactType::ImplementationCode,
+        ArtifactType::FailureDetails,
+        ArtifactType::ErrorMessage,
+        ArtifactType::Feedback,
+        ArtifactType::ValidationReport,
+        ArtifactType::TestResults,
+        ArtifactType::StageLog,
+    ]
+    .iter()
+    .map(|value| value.as_str().to_string())
+    .collect::<Vec<_>>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resume_artifact_type_names;
+
+    #[test]
+    fn resume_artifact_query_types_include_contract_and_implementation() {
+        let query_types = resume_artifact_type_names();
+        assert!(
+            query_types.contains(&"contract_document".to_string()),
+            "contract artifact missing from query type list"
+        );
+        assert!(
+            query_types.contains(&"implementation_code".to_string()),
+            "implementation artifact missing from query type list"
+        );
+        assert!(
+            !query_types.contains(&"requirements".to_string()),
+            "non-actionable requirements artifact leaked into resume query"
+        );
     }
 }

@@ -1,4 +1,6 @@
 -- Swarm coordinator schema for high-concurrency agents.
+-- Ubiquitous language (canonical): bead, claim, attempt, transition, landing.
+-- Deprecated aliases: task, issue, work item
 
 BEGIN;
 
@@ -23,8 +25,15 @@ CREATE TABLE IF NOT EXISTS bead_claims (
     bead_id TEXT PRIMARY KEY,
     claimed_by INTEGER NOT NULL CHECK (claimed_by >= 1),
     claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    lease_expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '5 minutes'),
     status TEXT NOT NULL DEFAULT 'in_progress' CHECK (status IN ('in_progress', 'completed', 'blocked'))
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bead_claims_bead_owner ON bead_claims(bead_id, claimed_by);
+
+ALTER TABLE bead_claims ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE bead_claims ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '5 minutes');
 
 ALTER TABLE bead_claims ALTER COLUMN claimed_by TYPE INTEGER;
 ALTER TABLE bead_claims DROP CONSTRAINT IF EXISTS bead_claims_claimed_by_check;
@@ -32,7 +41,7 @@ ALTER TABLE bead_claims ADD CONSTRAINT bead_claims_claimed_by_check CHECK (claim
 
 CREATE TABLE IF NOT EXISTS agent_state (
     agent_id INTEGER PRIMARY KEY CHECK (agent_id >= 1),
-    bead_id TEXT REFERENCES bead_claims(bead_id),
+    bead_id TEXT,
     current_stage TEXT CHECK (current_stage IN ('rust-contract', 'implement', 'qa-enforcer', 'red-queen', 'done')),
     stage_started_at TIMESTAMPTZ,
     status TEXT NOT NULL DEFAULT 'idle' CHECK (status IN ('idle', 'working', 'waiting', 'error', 'done')),
@@ -44,6 +53,22 @@ CREATE TABLE IF NOT EXISTS agent_state (
 ALTER TABLE agent_state ALTER COLUMN agent_id TYPE INTEGER;
 ALTER TABLE agent_state DROP CONSTRAINT IF EXISTS agent_state_agent_id_check;
 ALTER TABLE agent_state ADD CONSTRAINT agent_state_agent_id_check CHECK (agent_id >= 1);
+ALTER TABLE agent_state DROP CONSTRAINT IF EXISTS agent_state_bead_id_fkey;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'agent_state_bead_claim_owner_fkey'
+    ) THEN
+        ALTER TABLE agent_state
+            ADD CONSTRAINT agent_state_bead_claim_owner_fkey
+            FOREIGN KEY (bead_id, agent_id)
+            REFERENCES bead_claims(bead_id, claimed_by)
+            DEFERRABLE INITIALLY IMMEDIATE;
+    END IF;
+END;
+$$;
 
 CREATE TABLE IF NOT EXISTS stage_history (
     id BIGSERIAL PRIMARY KEY,
@@ -164,6 +189,23 @@ CREATE TABLE IF NOT EXISTS command_audit (
     changes JSONB
 );
 
+CREATE TABLE IF NOT EXISTS execution_events (
+    seq BIGSERIAL PRIMARY KEY,
+    schema_version INTEGER NOT NULL DEFAULT 1 CHECK (schema_version >= 1),
+    event_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    bead_id TEXT,
+    agent_id INTEGER,
+    stage TEXT,
+    causation_id TEXT,
+    diagnostics_category TEXT,
+    diagnostics_retryable BOOLEAN,
+    diagnostics_next_command TEXT,
+    diagnostics_detail TEXT,
+    payload JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS resource_locks (
     resource TEXT PRIMARY KEY,
     agent TEXT NOT NULL,
@@ -184,6 +226,8 @@ ON CONFLICT (id) DO NOTHING;
 
 CREATE INDEX IF NOT EXISTS idx_bead_backlog_claim ON bead_backlog(status, priority, created_at);
 CREATE INDEX IF NOT EXISTS idx_bead_claims_status ON bead_claims(status, claimed_at);
+CREATE INDEX IF NOT EXISTS idx_bead_claims_lease_expires ON bead_claims(lease_expires_at)
+WHERE status = 'in_progress';
 CREATE INDEX IF NOT EXISTS idx_agent_state_status ON agent_state(status, last_update DESC);
 CREATE INDEX IF NOT EXISTS idx_stage_history_lookup ON stage_history(bead_id, stage, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_stage_history_bead_id ON stage_history(bead_id, id);
@@ -200,6 +244,9 @@ CREATE INDEX IF NOT EXISTS idx_agent_messages_unread ON agent_messages(to_repo_i
 CREATE INDEX IF NOT EXISTS idx_command_audit_t ON command_audit(t DESC);
 CREATE INDEX IF NOT EXISTS idx_command_audit_cmd ON command_audit(cmd, t DESC);
 CREATE INDEX IF NOT EXISTS idx_command_audit_ok ON command_audit(ok, t DESC);
+CREATE INDEX IF NOT EXISTS idx_execution_events_bead_seq ON execution_events(bead_id, seq);
+CREATE INDEX IF NOT EXISTS idx_execution_events_event_type ON execution_events(event_type, seq DESC);
+CREATE INDEX IF NOT EXISTS idx_execution_events_created ON execution_events(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_resource_locks_until ON resource_locks(until_at);
 
 CREATE OR REPLACE FUNCTION set_agent_last_update()
@@ -216,15 +263,85 @@ BEFORE UPDATE ON agent_state
 FOR EACH ROW
 EXECUTE FUNCTION set_agent_last_update();
 
+CREATE OR REPLACE FUNCTION recover_expired_bead_claims()
+RETURNS INTEGER AS $$
+DECLARE
+    v_recovered_count INTEGER := 0;
+BEGIN
+    WITH expired_claims AS (
+        SELECT bead_id, claimed_by
+        FROM bead_claims
+        WHERE status = 'in_progress'
+          AND lease_expires_at <= NOW()
+        FOR UPDATE SKIP LOCKED
+    ),
+    cleared_claims AS (
+        DELETE FROM bead_claims bc
+        USING expired_claims ec
+        WHERE bc.bead_id = ec.bead_id
+        RETURNING ec.bead_id, ec.claimed_by
+    ),
+    reset_backlog AS (
+        UPDATE bead_backlog bb
+        SET status = 'pending'
+        FROM cleared_claims cc
+        WHERE bb.bead_id = cc.bead_id
+          AND bb.status = 'in_progress'
+        RETURNING bb.bead_id
+    ),
+    reset_agents AS (
+        UPDATE agent_state a
+        SET bead_id = NULL,
+            current_stage = NULL,
+            stage_started_at = NULL,
+            status = 'idle',
+            feedback = NULL,
+            implementation_attempt = 0
+        FROM cleared_claims cc
+        WHERE a.agent_id = cc.claimed_by
+          AND a.bead_id = cc.bead_id
+        RETURNING a.agent_id
+    )
+    SELECT COUNT(*) INTO v_recovered_count
+    FROM cleared_claims;
+
+    RETURN v_recovered_count;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION heartbeat_bead_claim(
+    p_agent_id INTEGER,
+    p_bead_id TEXT,
+    p_lease_extension_ms INTEGER DEFAULT 300000
+) RETURNS BOOLEAN AS $$
+DECLARE
+    v_updated INTEGER;
+BEGIN
+    UPDATE bead_claims
+    SET heartbeat_at = GREATEST(heartbeat_at, NOW()),
+        lease_expires_at = GREATEST(lease_expires_at, NOW())
+            + (p_lease_extension_ms * INTERVAL '1 millisecond')
+    WHERE bead_id = p_bead_id
+      AND claimed_by = p_agent_id
+      AND status = 'in_progress'
+    RETURNING 1 INTO v_updated;
+
+    RETURN v_updated = 1;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION claim_next_p0_bead(p_agent_id INTEGER)
 RETURNS TEXT AS $$
 DECLARE
     v_bead_id TEXT;
 BEGIN
+    PERFORM recover_expired_bead_claims();
+
     SELECT bead_id INTO v_bead_id
     FROM bead_claims
     WHERE status = 'in_progress'
       AND claimed_by = p_agent_id
+      AND lease_expires_at > NOW()
     ORDER BY claimed_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1;
@@ -255,8 +372,8 @@ BEGIN
     SET status = 'in_progress'
     WHERE bead_id = v_bead_id;
 
-    INSERT INTO bead_claims (bead_id, claimed_by, status)
-    VALUES (v_bead_id, p_agent_id, 'in_progress')
+    INSERT INTO bead_claims (bead_id, claimed_by, status, heartbeat_at, lease_expires_at)
+    VALUES (v_bead_id, p_agent_id, 'in_progress', NOW(), NOW() + INTERVAL '5 minutes')
     ON CONFLICT (bead_id) DO NOTHING;
 
     UPDATE agent_state

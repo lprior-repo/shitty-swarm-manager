@@ -79,10 +79,30 @@ CREATE TABLE IF NOT EXISTS stage_history (
     duration_ms INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS execution_events (
+    seq BIGSERIAL PRIMARY KEY,
+    schema_version INTEGER NOT NULL DEFAULT 1 CHECK (schema_version >= 1),
+    event_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    bead_id TEXT,
+    agent_id INTEGER,
+    stage TEXT,
+    causation_id TEXT,
+    diagnostics_category TEXT,
+    diagnostics_retryable BOOLEAN,
+    diagnostics_next_command TEXT,
+    diagnostics_detail TEXT,
+    payload JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE INDEX IF NOT EXISTS idx_stage_history_agent ON stage_history(repo_id, agent_id);
 CREATE INDEX IF NOT EXISTS idx_stage_history_bead ON stage_history(bead_id);
 CREATE INDEX IF NOT EXISTS idx_stage_history_stage ON stage_history(stage);
 CREATE INDEX IF NOT EXISTS idx_stage_history_time ON stage_history(started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_execution_events_bead_seq ON execution_events(bead_id, seq);
+CREATE INDEX IF NOT EXISTS idx_execution_events_event_type ON execution_events(event_type, seq DESC);
+CREATE INDEX IF NOT EXISTS idx_execution_events_created ON execution_events(created_at DESC);
 
 -- ============================================================
 -- Table: swarm_config

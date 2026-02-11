@@ -13,16 +13,131 @@ use tracing::{error, info, warn};
 
 use serde_json::json;
 use swarm::{
-    runtime_determine_transition, stage_executors::execute_stage_rust, AgentId, ArtifactType,
-    BeadId, MessageType, RepoId, Result, RuntimeAgentId as AgentKey,
-    RuntimeAgentState as AgentStateKey, RuntimeAgentStatus as AgentStatusKey,
-    RuntimeBeadId as BeadKey, RuntimeRepoId as RepoKey, RuntimeStage as StageKey,
-    RuntimeStageResult as StageResultKey, RuntimeStageTransition as StageTransitionKey, Stage,
-    StageResult, SwarmDb,
+    map_terminal_sync_state, runtime_determine_transition, stage_executors::execute_stage_rust,
+    AgentId, ArtifactStore, ArtifactType, BeadId, BrSyncAction, BrSyncStatus, ClaimRepository,
+    CoordinatorSyncTerminal, EventSink, LandingGateway, LandingOutcome, MessageType,
+    OrchestratorEvent, OrchestratorService, OrchestratorTickOutcome, RepoId, Result,
+    RuntimeAgentId as AgentKey, RuntimeAgentState as AgentStateKey,
+    RuntimeAgentStatus as AgentStatusKey, RuntimeBeadId as BeadKey, RuntimeRepoId as RepoKey,
+    RuntimeStage as StageKey, RuntimeStageResult as StageResultKey,
+    RuntimeStageTransition as StageTransitionKey, Stage, StageArtifactRecord,
+    StageExecutionOutcome, StageExecutionRequest, StageExecutor, StageResult, SwarmDb,
 };
 
 const MIN_POLL_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_POLL_BACKOFF: Duration = Duration::from_secs(5);
+
+struct StageCompletionInput {
+    stage: StageKey,
+    attempt: u32,
+    result: StageResultKey,
+    duration_ms: u64,
+    apply_transition: bool,
+}
+
+struct RuntimeOrchestratorPorts<'a> {
+    db: &'a SwarmDb,
+    stage_commands: &'a StageCommands,
+}
+
+impl ClaimRepository for RuntimeOrchestratorPorts<'_> {
+    fn recover_stale_claims(&self) -> swarm::orchestrator_service::PortFuture<'_, u32> {
+        Box::pin(async move { self.db.recover_expired_claims().await })
+    }
+
+    fn get_agent_state<'a>(
+        &'a self,
+        agent_id: &'a AgentKey,
+    ) -> swarm::orchestrator_service::PortFuture<'a, Option<AgentStateKey>> {
+        Box::pin(async move { get_agent_state_key(self.db, agent_id).await })
+    }
+
+    fn claim_next_bead<'a>(
+        &'a self,
+        agent_id: &'a AgentKey,
+    ) -> swarm::orchestrator_service::PortFuture<'a, Option<BeadKey>> {
+        Box::pin(async move { claim_next_bead_key(self.db, agent_id).await })
+    }
+
+    fn create_workspace<'a>(
+        &'a self,
+        agent_id: &'a AgentKey,
+        bead_id: &'a BeadKey,
+    ) -> swarm::orchestrator_service::PortFuture<'a, ()> {
+        Box::pin(async move {
+            info!("Agent {} claimed bead {}", agent_id, bead_id.value());
+            crate::agent_runtime_support::create_workspace(agent_id.number(), bead_id.value()).await
+        })
+    }
+
+    fn heartbeat_claim<'a>(
+        &'a self,
+        agent_id: &'a AgentKey,
+        bead_id: &'a BeadKey,
+        lease_extension_ms: i32,
+    ) -> swarm::orchestrator_service::PortFuture<'a, bool> {
+        Box::pin(async move {
+            self.db
+                .heartbeat_claim(
+                    &to_swarm_agent_id(agent_id),
+                    &to_swarm_bead_id(bead_id),
+                    lease_extension_ms,
+                )
+                .await
+        })
+    }
+}
+
+impl StageExecutor for RuntimeOrchestratorPorts<'_> {
+    fn execute_work(
+        &self,
+        request: StageExecutionRequest,
+    ) -> swarm::orchestrator_service::PortFuture<'_, StageExecutionOutcome> {
+        Box::pin(async move {
+            process_work_state(
+                self.db,
+                request.agent_id(),
+                self.stage_commands,
+                request.state().clone(),
+            )
+            .await
+            .map(|progressed| {
+                if progressed {
+                    StageExecutionOutcome::Progressed
+                } else {
+                    StageExecutionOutcome::Idle
+                }
+            })
+        })
+    }
+}
+
+impl ArtifactStore for RuntimeOrchestratorPorts<'_> {
+    fn store_artifact(
+        &self,
+        _record: StageArtifactRecord,
+    ) -> swarm::orchestrator_service::PortFuture<'_, ()> {
+        Box::pin(async move { Ok(()) })
+    }
+}
+
+impl LandingGateway for RuntimeOrchestratorPorts<'_> {
+    fn execute_landing<'a>(
+        &'a self,
+        _bead_id: &'a BeadKey,
+    ) -> swarm::orchestrator_service::PortFuture<'a, LandingOutcome> {
+        Box::pin(async move { Ok(LandingOutcome::new(true, "not-invoked-by-tick")) })
+    }
+}
+
+impl EventSink for RuntimeOrchestratorPorts<'_> {
+    fn append_event(
+        &self,
+        _event: OrchestratorEvent,
+    ) -> swarm::orchestrator_service::PortFuture<'_, ()> {
+        Box::pin(async move { Ok(()) })
+    }
+}
 
 pub async fn run_agent(
     db: &SwarmDb,
@@ -40,66 +155,29 @@ fn run_agent_loop_recursive<'a>(
     poll_backoff: Duration,
 ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
-        match get_agent_state_key(db, agent_id).await? {
-            None => {
+        let service = OrchestratorService::new(RuntimeOrchestratorPorts { db, stage_commands });
+        match service.tick(agent_id).await? {
+            OrchestratorTickOutcome::AgentMissing => {
                 error!("Agent {} not registered", agent_id);
                 Ok(())
             }
-            Some(state) => match state.status {
-                AgentStatusKey::Idle => {
-                    if let Some(bead_id) = claim_next_bead_key(db, agent_id).await? {
-                        info!("Agent {} claimed bead {}", agent_id, bead_id.value());
-                        crate::agent_runtime_support::create_workspace(
-                            agent_id.number(),
-                            bead_id.value(),
-                        )
-                        .await?;
-                        run_agent_loop_recursive(db, agent_id, stage_commands, MIN_POLL_BACKOFF)
-                            .await
-                    } else {
-                        info!("Agent {} found no available beads", agent_id);
-                        tokio::time::sleep(poll_backoff).await;
-                        run_agent_loop_recursive(
-                            db,
-                            agent_id,
-                            stage_commands,
-                            next_poll_backoff(poll_backoff),
-                        )
-                        .await
-                    }
-                }
-                AgentStatusKey::Done => {
-                    info!("Agent {} completed work", agent_id);
-                    Ok(())
-                }
-                AgentStatusKey::Working | AgentStatusKey::Waiting => {
-                    let progressed =
-                        process_work_state(db, agent_id, stage_commands, state).await?;
-                    if progressed {
-                        run_agent_loop_recursive(db, agent_id, stage_commands, MIN_POLL_BACKOFF)
-                            .await
-                    } else {
-                        tokio::time::sleep(poll_backoff).await;
-                        run_agent_loop_recursive(
-                            db,
-                            agent_id,
-                            stage_commands,
-                            next_poll_backoff(poll_backoff),
-                        )
-                        .await
-                    }
-                }
-                AgentStatusKey::Error => {
-                    tokio::time::sleep(poll_backoff).await;
-                    run_agent_loop_recursive(
-                        db,
-                        agent_id,
-                        stage_commands,
-                        next_poll_backoff(poll_backoff),
-                    )
-                    .await
-                }
-            },
+            OrchestratorTickOutcome::Completed => {
+                info!("Agent {} completed work", agent_id);
+                Ok(())
+            }
+            OrchestratorTickOutcome::Progressed => {
+                run_agent_loop_recursive(db, agent_id, stage_commands, MIN_POLL_BACKOFF).await
+            }
+            OrchestratorTickOutcome::Idle => {
+                tokio::time::sleep(poll_backoff).await;
+                run_agent_loop_recursive(
+                    db,
+                    agent_id,
+                    stage_commands,
+                    next_poll_backoff(poll_backoff),
+                )
+                .await
+            }
         }
     })
 }
@@ -127,7 +205,11 @@ pub async fn run_smoke_once(db: &SwarmDb, agent_id: &AgentId) -> Result<()> {
 fn next_poll_backoff(current: Duration) -> Duration {
     let doubled_ms = current.as_millis().saturating_mul(2);
     let bounded_ms = doubled_ms.min(MAX_POLL_BACKOFF.as_millis());
-    Duration::from_millis(u64::try_from(bounded_ms).unwrap_or(u64::MAX))
+    Duration::from_millis(saturating_millis_to_u64(bounded_ms))
+}
+
+fn saturating_millis_to_u64(milliseconds: u128) -> u64 {
+    u64::try_from(milliseconds).map_or(u64::MAX, |value| value)
 }
 
 #[cfg(test)]
@@ -161,11 +243,11 @@ async fn process_work_state(
     stage_commands: &StageCommands,
     state: AgentStateKey,
 ) -> Result<bool> {
-    if state.implementation_attempt >= 3 {
-        return match state.bead_id {
+    if state.implementation_attempt() >= 3 {
+        return match state.bead_id() {
             Some(bead_id) => {
                 let reason = "Max implementation attempts (3) exceeded";
-                mark_bead_blocked_key(db, agent_id, &bead_id, reason).await?;
+                mark_bead_blocked_key(db, agent_id, bead_id, reason).await?;
                 warn!(
                     "Agent {} blocked bead {}: {}",
                     agent_id,
@@ -179,9 +261,9 @@ async fn process_work_state(
         };
     }
 
-    if let (Some(stage), Some(bead_id)) = (state.current_stage, state.bead_id) {
+    if let (Some(stage), Some(bead_id)) = (state.current_stage(), state.bead_id()) {
         let swarm_agent_id = to_swarm_agent_id(agent_id);
-        let swarm_bead_id = to_swarm_bead_id(&bead_id);
+        let swarm_bead_id = to_swarm_bead_id(bead_id);
         let swarm_stage = to_swarm_stage(stage);
 
         let unread_messages = db
@@ -200,10 +282,10 @@ async fn process_work_state(
             .map(|m| format!("[{}] {}", m.message_type.as_str(), m.body))
             .collect();
 
-        let attempt = state.implementation_attempt.saturating_add(1);
+        let attempt = state.implementation_attempt().saturating_add(1);
         let started = Instant::now();
         let stage_history_id =
-            record_stage_started_key(db, agent_id, &bead_id, stage, attempt).await?;
+            record_stage_started_key(db, agent_id, bead_id, stage, attempt).await?;
 
         if !feedback_messages.is_empty() {
             let feedback_payload = feedback_messages.join("\n\n");
@@ -295,14 +377,18 @@ async fn process_work_state(
         let stage_outcome = to_stage_result_key(&result);
         let transition = runtime_determine_transition(stage, &stage_outcome, attempt, 3);
 
+        let apply_transition = !matches!(transition, StageTransitionKey::Complete);
         record_stage_complete_key(
             db,
             agent_id,
-            &bead_id,
-            stage,
-            attempt,
-            stage_outcome,
-            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            bead_id,
+            StageCompletionInput {
+                stage,
+                attempt,
+                result: stage_outcome,
+                duration_ms: saturating_millis_to_u64(started.elapsed().as_millis()),
+                apply_transition,
+            },
         )
         .await?;
 
@@ -341,11 +427,97 @@ async fn process_work_state(
         match transition {
             StageTransitionKey::Complete => {
                 info!(
-                    "Agent {} completed bead {} - Landing the plane...",
+                    "Agent {} entering landing saga for bead {}",
                     agent_id,
                     bead_id.value()
                 );
-                crate::agent_runtime_support::finalize_workspace(bead_id.value()).await?;
+                let landing_outcome =
+                    crate::agent_runtime_support::execute_landing_saga(bead_id.value()).await;
+                match landing_outcome {
+                    Ok(outcome) => {
+                        let report = serde_json::to_string_pretty(&outcome)
+                            .map_err(swarm::Error::SerializationError)?;
+
+                        db.store_stage_artifact(
+                            stage_history_id,
+                            ArtifactType::StageLog,
+                            &report,
+                            Some(json!({
+                                "stage": swarm_stage.as_str(),
+                                "status": status,
+                                "landing": outcome.persistence_payload(),
+                            })),
+                        )
+                        .await?;
+
+                        let sync_decision = map_terminal_sync_state(if outcome.push_confirmed {
+                            CoordinatorSyncTerminal::PushConfirmed
+                        } else {
+                            CoordinatorSyncTerminal::PushUnconfirmed {
+                                reason: outcome.failure_summary(),
+                            }
+                        });
+
+                        if sync_decision.status() == BrSyncStatus::Diverged {
+                            warn!(
+                                "Landing sync diverged for bead {}: {:?}",
+                                bead_id.value(),
+                                sync_decision.divergence()
+                            );
+                        }
+
+                        match sync_decision.action() {
+                            BrSyncAction::FinalizeTerminalClaim => {
+                                db.finalize_after_push_confirmation(
+                                    &to_swarm_agent_id(agent_id),
+                                    &to_swarm_bead_id(bead_id),
+                                    outcome.push_confirmed,
+                                )
+                                .await?;
+                                info!(
+                                    "Agent {} completed bead {} after push confirmation",
+                                    agent_id,
+                                    bead_id.value()
+                                );
+                            }
+                            BrSyncAction::RecordRetryableFailure { reason } => {
+                                db.mark_landing_retryable(&to_swarm_agent_id(agent_id), reason)
+                                    .await?;
+                                warn!(
+                                    "Landing saga incomplete for bead {}: {}",
+                                    bead_id.value(),
+                                    reason
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        let sync_decision =
+                            map_terminal_sync_state(CoordinatorSyncTerminal::LandingErrored {
+                                reason: format!("Landing saga execution error: {err}"),
+                            });
+
+                        if sync_decision.status() == BrSyncStatus::Diverged {
+                            warn!(
+                                "Landing sync diverged for bead {}: {:?}",
+                                bead_id.value(),
+                                sync_decision.divergence()
+                            );
+                        }
+
+                        if let BrSyncAction::RecordRetryableFailure { reason } =
+                            sync_decision.action()
+                        {
+                            db.mark_landing_retryable(&to_swarm_agent_id(agent_id), reason)
+                                .await?;
+                            warn!(
+                                "Landing saga errored for bead {}: {}",
+                                bead_id.value(),
+                                reason
+                            );
+                        }
+                    }
+                }
             }
             StageTransitionKey::Block => {
                 let reason = if result_message.is_empty() {
@@ -353,7 +525,7 @@ async fn process_work_state(
                 } else {
                     result_message.as_str()
                 };
-                mark_bead_blocked_key(db, agent_id, &bead_id, reason).await?;
+                mark_bead_blocked_key(db, agent_id, bead_id, reason).await?;
                 warn!(
                     "Agent {} blocked bead {}: {}",
                     agent_id,
@@ -395,10 +567,15 @@ fn run_smoke_stages_recursive<'a>(
                             db,
                             agent_id,
                             bead_id,
-                            stage,
-                            1,
-                            StageResultKey::Passed,
-                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                            StageCompletionInput {
+                                stage,
+                                attempt: 1,
+                                result: StageResultKey::Passed,
+                                duration_ms: saturating_millis_to_u64(
+                                    started.elapsed().as_millis(),
+                                ),
+                                apply_transition: true,
+                            },
                         )
                         .await?;
                         run_smoke_stages_recursive(db, agent_id, bead_id, stages, idx + 1).await
@@ -414,7 +591,7 @@ fn to_agent_key(agent_id: &AgentId) -> AgentKey {
 }
 
 fn to_swarm_agent_id(agent_id: &AgentKey) -> AgentId {
-    AgentId::new(RepoId::new(agent_id.repo_id.value()), agent_id.number())
+    AgentId::new(RepoId::new(agent_id.repo_id().value()), agent_id.number())
 }
 
 fn to_swarm_bead_id(bead_id: &BeadKey) -> BeadId {
@@ -444,18 +621,21 @@ async fn get_agent_state_key(db: &SwarmDb, agent_id: &AgentKey) -> Result<Option
     db.get_agent_state(&to_swarm_agent_id(agent_id))
         .await
         .map(|state| {
-            state.map(|s| AgentStateKey {
-                agent_id: agent_id.clone(),
-                bead_id: s.bead_id.map(|bead| BeadKey::new(bead.value())),
-                current_stage: s
-                    .current_stage
-                    .and_then(|stage| stage.as_str().try_into().ok()),
-                status: s
+            state.map(|s| {
+                let runtime_status = s
                     .status
                     .as_str()
                     .try_into()
-                    .unwrap_or(AgentStatusKey::Error),
-                implementation_attempt: s.implementation_attempt,
+                    .map_or(AgentStatusKey::Error, |status| status);
+
+                AgentStateKey::new(
+                    agent_id.clone(),
+                    s.bead_id.as_ref().map(|bead| BeadKey::new(bead.value())),
+                    s.current_stage
+                        .and_then(|stage| stage.as_str().try_into().ok()),
+                    runtime_status,
+                    s.implementation_attempt,
+                )
             })
         })
 }
@@ -500,25 +680,34 @@ async fn record_stage_complete_key(
     db: &SwarmDb,
     agent_id: &AgentKey,
     bead_id: &BeadKey,
-    stage: StageKey,
-    attempt: u32,
-    result: StageResultKey,
-    duration_ms: u64,
+    completion: StageCompletionInput,
 ) -> Result<()> {
-    let swarm_result = match result {
+    let swarm_result = match completion.result {
         StageResultKey::Started => StageResult::Started,
         StageResultKey::Passed => StageResult::Passed,
         StageResultKey::Failed(msg) => StageResult::Failed(msg),
         StageResultKey::Error(msg) => StageResult::Error(msg),
     };
 
-    db.record_stage_complete(
-        &to_swarm_agent_id(agent_id),
-        &to_swarm_bead_id(bead_id),
-        to_swarm_stage(stage),
-        attempt,
-        swarm_result,
-        duration_ms,
-    )
-    .await
+    if completion.apply_transition {
+        db.record_stage_complete(
+            &to_swarm_agent_id(agent_id),
+            &to_swarm_bead_id(bead_id),
+            to_swarm_stage(completion.stage),
+            completion.attempt,
+            swarm_result,
+            completion.duration_ms,
+        )
+        .await
+    } else {
+        db.record_stage_complete_without_transition(
+            &to_swarm_agent_id(agent_id),
+            &to_swarm_bead_id(bead_id),
+            to_swarm_stage(completion.stage),
+            completion.attempt,
+            &swarm_result,
+            completion.duration_ms,
+        )
+        .await
+    }
 }
