@@ -34,6 +34,9 @@ const EMBEDDED_COORDINATOR_SCHEMA_REF: &str = "embedded:crates/swarm-coordinator
 const DEFAULT_DB_CONNECT_TIMEOUT_MS: u64 = 3_000;
 const MIN_DB_CONNECT_TIMEOUT_MS: u64 = 100;
 const MAX_DB_CONNECT_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_HISTORY_LIMIT: i64 = 100;
+const MAX_HISTORY_LIMIT: i64 = 10_000;
+const MAX_REGISTER_COUNT: u32 = 100;
 const MAX_EXTERNAL_OUTPUT_CAPTURE_BYTES: usize = 1_048_576;
 const GLOBAL_ALLOWED_REQUEST_ARGS: &[&str] = &["repo_id", "database_url", "connect_timeout_ms"];
 
@@ -170,12 +173,47 @@ impl ParseInput for swarm::RegisterInput {
     type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
+        let count = match request.args.get("count") {
+            None => None,
+            Some(raw) => {
+                if raw.as_i64().is_some_and(|value| value <= 0) {
+                    return Err(ParseError::InvalidValue {
+                        field: "count".to_string(),
+                        value: "must be greater than 0".to_string(),
+                    });
+                }
+
+                let count_as_u64 = raw.as_u64().ok_or_else(|| ParseError::InvalidType {
+                    field: "count".to_string(),
+                    expected: "u32".to_string(),
+                    got: json_value_type_name(raw).to_string(),
+                })?;
+
+                let count = u32::try_from(count_as_u64).map_err(|_| ParseError::InvalidValue {
+                    field: "count".to_string(),
+                    value: format!("{count_as_u64} exceeds max u32"),
+                })?;
+
+                if count == 0 {
+                    return Err(ParseError::InvalidValue {
+                        field: "count".to_string(),
+                        value: "must be greater than 0".to_string(),
+                    });
+                }
+
+                if count > MAX_REGISTER_COUNT {
+                    return Err(ParseError::InvalidValue {
+                        field: "count".to_string(),
+                        value: format!("must be less than or equal to {MAX_REGISTER_COUNT}"),
+                    });
+                }
+
+                Some(count)
+            }
+        };
+
         Ok(Self::Input {
-            count: request
-                .args
-                .get("count")
-                .and_then(|v: &Value| v.as_u64())
-                .and_then(|v| u32::try_from(v).ok()),
+            count,
             dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
         })
     }
@@ -205,24 +243,110 @@ impl ParseInput for swarm::MonitorInput {
     type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
+        let watch_ms = parse_optional_non_negative_u64(request, "watch_ms")?;
+
         Ok(Self::Input {
             view: request
                 .args
                 .get("view")
                 .and_then(|v: &Value| v.as_str())
                 .map(std::string::ToString::to_string),
-            watch_ms: request
-                .args
-                .get("watch_ms")
-                .and_then(|v: &Value| v.as_u64()),
+            watch_ms,
         })
     }
+}
+
+fn parse_optional_non_negative_u64(
+    request: &ProtocolRequest,
+    field: &str,
+) -> Result<Option<u64>, ParseError> {
+    let Some(raw) = request.args.get(field) else {
+        return Ok(None);
+    };
+
+    if let Some(value) = raw.as_u64() {
+        return Ok(Some(value));
+    }
+
+    if raw.as_i64().is_some_and(|value| value < 0) {
+        return Err(ParseError::InvalidValue {
+            field: field.to_string(),
+            value: "must be non-negative".to_string(),
+        });
+    }
+
+    Err(ParseError::InvalidType {
+        field: field.to_string(),
+        expected: "u64".to_string(),
+        got: json_value_type_name(raw).to_string(),
+    })
+}
+
+fn parse_optional_non_negative_i64(
+    request: &ProtocolRequest,
+    field: &str,
+) -> Result<Option<i64>, ParseError> {
+    let Some(raw) = request.args.get(field) else {
+        return Ok(None);
+    };
+
+    if let Some(value) = raw.as_i64() {
+        if value < 0 {
+            return Err(ParseError::InvalidValue {
+                field: field.to_string(),
+                value: "must be non-negative".to_string(),
+            });
+        }
+        return Ok(Some(value));
+    }
+
+    Err(ParseError::InvalidType {
+        field: field.to_string(),
+        expected: "i64".to_string(),
+        got: json_value_type_name(raw).to_string(),
+    })
+}
+
+fn parse_optional_non_negative_u32(
+    request: &ProtocolRequest,
+    field: &str,
+) -> Result<Option<u32>, ParseError> {
+    let Some(raw) = request.args.get(field) else {
+        return Ok(None);
+    };
+
+    if raw.as_i64().is_some_and(|value| value < 0) {
+        return Err(ParseError::InvalidValue {
+            field: field.to_string(),
+            value: "must be non-negative".to_string(),
+        });
+    }
+
+    let value_as_u64 = raw.as_u64().ok_or_else(|| ParseError::InvalidType {
+        field: field.to_string(),
+        expected: "u32".to_string(),
+        got: json_value_type_name(raw).to_string(),
+    })?;
+
+    let value = u32::try_from(value_as_u64).map_err(|_| ParseError::InvalidValue {
+        field: field.to_string(),
+        value: format!("{value_as_u64} exceeds max u32"),
+    })?;
+
+    Ok(Some(value))
+}
+
+fn bounded_history_limit(limit: Option<i64>) -> i64 {
+    let requested = limit.map_or(DEFAULT_HISTORY_LIMIT, |value| value);
+    requested.min(MAX_HISTORY_LIMIT)
 }
 
 impl ParseInput for swarm::InitDbInput {
     type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
+        let seed_agents = parse_optional_non_negative_u32(request, "seed_agents")?;
+
         Ok(Self::Input {
             url: request
                 .args
@@ -234,11 +358,7 @@ impl ParseInput for swarm::InitDbInput {
                 .get("schema")
                 .and_then(|v: &Value| v.as_str())
                 .map(std::string::ToString::to_string),
-            seed_agents: request
-                .args
-                .get("seed_agents")
-                .and_then(|v: &Value| v.as_u64())
-                .and_then(|v| u32::try_from(v).ok()),
+            seed_agents,
             dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
         })
     }
@@ -323,13 +443,40 @@ impl ParseInput for swarm::PromptInput {
     type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
+        let id = match request.args.get("id") {
+            None => 1,
+            Some(raw) => {
+                if raw.as_i64().is_some_and(|value| value <= 0) {
+                    return Err(ParseError::InvalidValue {
+                        field: "id".to_string(),
+                        value: "must be greater than 0".to_string(),
+                    });
+                }
+
+                let id_as_u64 = raw.as_u64().ok_or_else(|| ParseError::InvalidType {
+                    field: "id".to_string(),
+                    expected: "u32".to_string(),
+                    got: json_value_type_name(raw).to_string(),
+                })?;
+
+                let id = u32::try_from(id_as_u64).map_err(|_| ParseError::InvalidValue {
+                    field: "id".to_string(),
+                    value: format!("{id_as_u64} exceeds max u32"),
+                })?;
+
+                if id == 0 {
+                    return Err(ParseError::InvalidValue {
+                        field: "id".to_string(),
+                        value: "must be greater than 0".to_string(),
+                    });
+                }
+
+                id
+            }
+        };
+
         Ok(Self::Input {
-            id: request
-                .args
-                .get("id")
-                .and_then(|v: &Value| v.as_u64())
-                .and_then(|v| u32::try_from(v).ok())
-                .unwrap_or(1),
+            id,
             skill: request
                 .args
                 .get("skill")
@@ -387,9 +534,8 @@ impl ParseInput for swarm::HistoryInput {
     type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
-        Ok(Self::Input {
-            limit: request.args.get("limit").and_then(|v: &Value| v.as_i64()),
-        })
+        let limit = parse_optional_non_negative_i64(request, "limit")?;
+        Ok(Self::Input { limit })
     }
 }
 
@@ -1772,11 +1918,20 @@ async fn handle_state(
 async fn handle_history(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
-    let limit = request
-        .args
-        .get("limit")
-        .and_then(Value::as_i64)
-        .map_or(100, |value| value);
+    let input = swarm::HistoryInput::parse_input(request).map_err(|error| {
+        Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::INVALID.to_string(),
+                error.to_string(),
+            )
+            .with_fix("echo '{\"cmd\":\"history\",\"limit\":100}' | swarm".to_string())
+            .with_ctx(json!({"error": error.to_string()})),
+        )
+    })?;
+
+    let requested_limit = input.limit;
+    let limit = bounded_history_limit(requested_limit);
     let db: SwarmDb = db_from_request(request).await?;
     let actions = db
         .get_command_history(limit)
@@ -1832,6 +1987,8 @@ async fn handle_history(
     Ok(CommandSuccess {
         data: json!({
             "actions": actions_json,
+            "requested_limit": requested_limit,
+            "effective_limit": limit,
             "total": total,
             "aggregates": aggregates,
         }),
@@ -1844,6 +2001,19 @@ async fn handle_lock(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
     let resource = required_string_arg(request, "resource")?;
+
+    if resource.trim().is_empty() {
+        return Err(Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::INVALID.to_string(),
+                "resource cannot be empty".to_string(),
+            )
+            .with_fix("Provide a non-empty resource. Example: {\"cmd\":\"lock\",\"resource\":\"repo-123\",\"agent\":\"agent-1\",\"ttl_ms\":30000}".to_string())
+            .with_ctx(json!({"resource": resource})),
+        ));
+    }
+
     let agent = required_string_arg(request, "agent")?;
     let ttl_ms = request
         .args
@@ -1901,6 +2071,19 @@ async fn handle_unlock(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
     let resource = required_string_arg(request, "resource")?;
+
+    if resource.trim().is_empty() {
+        return Err(Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::INVALID.to_string(),
+                "resource cannot be empty".to_string(),
+            )
+            .with_fix("Provide a non-empty resource. Example: {\"cmd\":\"unlock\",\"resource\":\"repo-123\",\"agent\":\"agent-1\"}".to_string())
+            .with_ctx(json!({"resource": resource})),
+        ));
+    }
+
     let agent = required_string_arg(request, "agent")?;
 
     if dry_flag(request) {
@@ -1959,7 +2142,30 @@ async fn handle_broadcast(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
     let msg = required_string_arg(request, "msg")?;
+    if msg.trim().is_empty() {
+        return Err(Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::INVALID.to_string(),
+                "msg cannot be empty".to_string(),
+            )
+            .with_fix("Provide a non-empty msg. Example: {\"cmd\":\"broadcast\",\"msg\":\"hello\",\"from\":\"agent-1\"}".to_string())
+            .with_ctx(json!({"msg": msg})),
+        ));
+    }
+
     let from = required_string_arg(request, "from")?;
+    if from.trim().is_empty() {
+        return Err(Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::INVALID.to_string(),
+                "from cannot be empty".to_string(),
+            )
+            .with_fix("Provide a non-empty from. Example: {\"cmd\":\"broadcast\",\"msg\":\"hello\",\"from\":\"agent-1\"}".to_string())
+            .with_ctx(json!({"from": from})),
+        ));
+    }
 
     if dry_flag(request) {
         return Ok(dry_run_success(
@@ -2004,6 +2210,16 @@ async fn handle_batch(
             .with_fix(fix_hint.to_string())
             .with_ctx(json!({"ops": "required", "cmds": "not supported"})))
         })?;
+
+    if ops.is_empty() {
+        return Err(Box::new(ProtocolEnvelope::error(
+            request.rid.clone(),
+            code::INVALID.to_string(),
+            "Batch ops array cannot be empty".to_string(),
+        )
+        .with_fix("Provide at least one operation in the ops array. Example: {\"cmd\":\"batch\",\"ops\":[{\"cmd\":\"doctor\"}]}".to_string())
+        .with_ctx(json!({"ops": ops.clone()}))));
+    }
 
     if dry_flag(request) {
         let would_do = ops
@@ -2079,11 +2295,19 @@ async fn handle_batch(
 async fn handle_monitor(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
-    let view = request
-        .args
-        .get("view")
-        .and_then(Value::as_str)
-        .map_or("active", |value| value);
+    let input = swarm::MonitorInput::parse_input(request).map_err(|error| {
+        Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::INVALID.to_string(),
+                error.to_string(),
+            )
+            .with_fix("echo '{\"cmd\":\"monitor\",\"view\":\"active\"}' | swarm".to_string())
+            .with_ctx(json!({"error": error.to_string()})),
+        )
+    })?;
+
+    let view = input.view.as_deref().map_or("active", |value| value);
     let db: SwarmDb = db_from_request(request).await?;
 
     let data = match view {
@@ -2224,17 +2448,54 @@ async fn handle_monitor(
 async fn handle_register(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
+    let input = swarm::RegisterInput::parse_input(request).map_err(|error| {
+        Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::INVALID.to_string(),
+                error.to_string(),
+            )
+            .with_fix("echo '{\"cmd\":\"register\",\"count\":3}' | swarm".to_string())
+            .with_ctx(json!({"error": error.to_string()})),
+        )
+    })?;
+
     let db: SwarmDb = db_from_request(request).await?;
     let repo_id_from_context = repo_id_from_request(request);
     let config = db.get_config(&repo_id_from_context).await.ok();
 
-    let count = request
-        .args
-        .get("count")
-        .and_then(Value::as_u64)
-        .and_then(|v| u32::try_from(v).ok())
+    let count = input
+        .count
         .or_else(|| config.as_ref().map(|c| c.max_agents))
-        .unwrap_or(10);
+        .map_or(10, |value| value);
+
+    if count == 0 {
+        return Err(Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::INVALID.to_string(),
+                "count must be greater than 0".to_string(),
+            )
+            .with_fix(
+                "Provide a positive count. Example: {\"cmd\":\"register\",\"count\":3}".to_string(),
+            )
+            .with_ctx(json!({"count": count})),
+        ));
+    }
+
+    if count > MAX_REGISTER_COUNT {
+        return Err(Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::INVALID.to_string(),
+                format!("count must be less than or equal to {MAX_REGISTER_COUNT}"),
+            )
+            .with_fix(format!(
+                "Provide count <= {MAX_REGISTER_COUNT}. Example: {{\"cmd\":\"register\",\"count\":10}}"
+            ))
+            .with_ctx(json!({"count": count, "max_count": MAX_REGISTER_COUNT})),
+        ));
+    }
 
     if dry_flag(request) {
         return Ok(dry_run_success(
@@ -2261,8 +2522,8 @@ async fn handle_register(
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
 
-    if let Some(explicit_count) = request.args.get("count").and_then(Value::as_u64) {
-        let _ = db.update_config(explicit_count as u32).await;
+    if let Some(explicit_count) = input.count {
+        let _ = db.update_config(explicit_count).await;
     }
 
     register_agents_recursive(&db, &repo_id, 1, count, request.rid.clone()).await?;
@@ -2463,11 +2724,7 @@ async fn handle_resume(
 async fn handle_resume_context(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
-    let bead_filter = request
-        .args
-        .get("bead_id")
-        .and_then(Value::as_str)
-        .map(std::string::ToString::to_string);
+    let bead_filter = parse_resume_context_bead_filter(request)?;
 
     let db: SwarmDb = db_from_request(request).await?;
     let repo_id = repo_id_from_request(request);
@@ -2502,6 +2759,40 @@ async fn handle_resume_context(
         next: "swarm monitor --view failures".to_string(),
         state: minimal_state_for_request(request).await,
     })
+}
+
+fn parse_resume_context_bead_filter(
+    request: &ProtocolRequest,
+) -> std::result::Result<Option<String>, Box<ProtocolEnvelope>> {
+    let Some(raw) = request.args.get("bead_id") else {
+        return Ok(None);
+    };
+
+    let bead_id = raw.as_str().ok_or_else(|| {
+        Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::INVALID.to_string(),
+                "bead_id must be a string".to_string(),
+            )
+            .with_fix("Use --bead-id <bead-id> with a non-empty string value".to_string())
+            .with_ctx(json!({"bead_id": raw})),
+        )
+    })?;
+
+    if bead_id.trim().is_empty() {
+        return Err(Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::INVALID.to_string(),
+                "bead_id cannot be empty".to_string(),
+            )
+            .with_fix("Use --bead-id <bead-id> with a non-empty value".to_string())
+            .with_ctx(json!({"bead_id": bead_id})),
+        ));
+    }
+
+    Ok(Some(bead_id.to_string()))
 }
 
 async fn handle_artifacts(
@@ -2556,6 +2847,21 @@ fn parse_artifact_bead_id(
             )
             .with_fix("Provide a non-empty bead_id. Example: {\"cmd\":\"artifacts\",\"bead_id\":\"swm-abc123\"}".to_string())
             .with_ctx(json!({"bead_id": bead_id_str})),
+        ));
+    }
+
+    if bead_id_str.len() > 255 {
+        return Err(Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::INVALID.to_string(),
+                "bead_id exceeds maximum length of 255 characters".to_string(),
+            )
+            .with_fix(format!(
+                "Provide a bead_id with 255 or fewer characters. Current length: {}",
+                bead_id_str.len()
+            ))
+            .with_ctx(json!({"bead_id": bead_id_str, "length": bead_id_str.len()})),
         ));
     }
 
@@ -2669,6 +2975,28 @@ mod artifact_tests {
     }
 
     #[test]
+    fn parse_artifact_bead_id_errors_when_exceeds_255_characters() {
+        let long_id = "x".repeat(256);
+        let request = request_with_args(&[("bead_id", &long_id)]);
+        let err = parse_artifact_bead_id(&request)
+            .expect_err("bead_id exceeding 255 characters should be rejected");
+        let envelope: &ProtocolEnvelope = err.as_ref();
+        assert_eq!(envelope.err.as_ref().unwrap().code, "INVALID");
+        assert!(
+            envelope.fix.as_ref().unwrap().contains("255"),
+            "error should mention 255 character limit"
+        );
+    }
+
+    #[test]
+    fn parse_artifact_bead_id_accepts_exactly_255_characters() {
+        let long_id = "x".repeat(255);
+        let request = request_with_args(&[("bead_id", &long_id)]);
+        let bead_id = parse_artifact_bead_id(&request).expect("255 characters should be valid");
+        assert_eq!(bead_id.value().len(), 255);
+    }
+
+    #[test]
     fn parse_artifact_type_returns_none_by_default() {
         let request = request_with_args(&[("bead_id", "bead-42")]);
         let artifact_type = parse_artifact_type(&request).expect("should parse optional type");
@@ -2753,18 +3081,25 @@ async fn handle_release(
 async fn handle_init_db(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
+    let input = swarm::InitDbInput::parse_input(request).map_err(|error| {
+        Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::INVALID.to_string(),
+                error.to_string(),
+            )
+            .with_fix("echo '{\"cmd\":\"init-db\",\"seed_agents\":12}' | swarm".to_string())
+            .with_ctx(json!({"error": error.to_string()})),
+        )
+    })?;
+
     let url = resolve_database_url_for_init(request).await?;
-    let schema = request
-        .args
-        .get("schema")
-        .and_then(Value::as_str)
+    let schema = input
+        .schema
+        .as_deref()
         .map(PathBuf::from)
         .map(|value| value.display().to_string());
-    let seed_agents = request
-        .args
-        .get("seed_agents")
-        .and_then(Value::as_u64)
-        .map_or(12, |value| value) as u32;
+    let seed_agents = input.seed_agents.map_or(12, |value| value);
 
     if dry_flag(request) {
         return Ok(dry_run_success(
@@ -3031,7 +3366,19 @@ fn spawn_prompts_recursive<'a>(
 async fn handle_prompt(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
-    if let Some(skill_name) = request.args.get("skill").and_then(Value::as_str) {
+    let input = swarm::PromptInput::parse_input(request).map_err(|error| {
+        Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::INVALID.to_string(),
+                error.to_string(),
+            )
+            .with_fix("echo '{\"cmd\":\"prompt\",\"id\":1}' | swarm".to_string())
+            .with_ctx(json!({"error": error.to_string()})),
+        )
+    })?;
+
+    if let Some(skill_name) = input.skill.as_deref() {
         if let Some(prompt) = swarm::skill_prompts::get_skill_prompt(skill_name) {
             return Ok(CommandSuccess {
                 data: json!({"skill": skill_name, "prompt": prompt}),
@@ -3052,11 +3399,7 @@ async fn handle_prompt(
         ));
     }
 
-    let id = request
-        .args
-        .get("id")
-        .and_then(Value::as_u64)
-        .map_or(1, |value| value) as u32;
+    let id = input.id;
 
     let repo_root = current_repo_root().await?;
     let prompt = swarm::prompts::get_agent_prompt(&repo_root, id)
@@ -3862,6 +4205,108 @@ mod database_candidate_tests {
             MAX_DB_CONNECT_TIMEOUT_MS
         );
         assert_eq!(parse_database_connect_timeout_ms(Some("2500")), 2500);
+    }
+}
+
+#[cfg(test)]
+mod history_limit_tests {
+    use super::{bounded_history_limit, DEFAULT_HISTORY_LIMIT, MAX_HISTORY_LIMIT};
+
+    #[test]
+    fn history_limit_defaults_when_not_provided() {
+        assert_eq!(bounded_history_limit(None), DEFAULT_HISTORY_LIMIT);
+    }
+
+    #[test]
+    fn history_limit_caps_excessive_values() {
+        assert_eq!(bounded_history_limit(Some(50_000)), MAX_HISTORY_LIMIT);
+    }
+
+    #[test]
+    fn history_limit_preserves_values_within_bounds() {
+        assert_eq!(bounded_history_limit(Some(5_000)), 5_000);
+    }
+}
+
+#[cfg(test)]
+mod register_input_tests {
+    use super::{ParseInput, ProtocolRequest, MAX_REGISTER_COUNT};
+    use serde_json::{json, Map, Value};
+
+    fn request_with_count(count: Value) -> ProtocolRequest {
+        let mut args = Map::new();
+        args.insert("count".to_string(), count);
+        ProtocolRequest {
+            cmd: "register".to_string(),
+            rid: None,
+            dry: None,
+            args,
+        }
+    }
+
+    #[test]
+    fn register_input_rejects_zero_count() {
+        let request = request_with_count(json!(0));
+        let err =
+            swarm::RegisterInput::parse_input(&request).expect_err("count=0 should be rejected");
+        assert!(err.to_string().contains("must be greater than 0"));
+    }
+
+    #[test]
+    fn register_input_rejects_negative_count() {
+        let request = request_with_count(json!(-2));
+        let err = swarm::RegisterInput::parse_input(&request)
+            .expect_err("negative count should be rejected");
+        assert!(err.to_string().contains("must be greater than 0"));
+    }
+
+    #[test]
+    fn register_input_accepts_positive_count() {
+        let request = request_with_count(json!(2));
+        let parsed =
+            swarm::RegisterInput::parse_input(&request).expect("positive count should be accepted");
+        assert_eq!(parsed.count, Some(2));
+    }
+
+    #[test]
+    fn register_input_rejects_count_above_maximum() {
+        let request = request_with_count(json!(MAX_REGISTER_COUNT + 1));
+        let err = swarm::RegisterInput::parse_input(&request)
+            .expect_err("count above max should be rejected");
+        assert!(err.to_string().contains("less than or equal to"));
+    }
+}
+
+#[cfg(test)]
+mod init_db_input_tests {
+    use super::{ParseInput, ProtocolRequest};
+    use serde_json::{json, Map};
+
+    fn request_with_seed_agents(value: serde_json::Value) -> ProtocolRequest {
+        let mut args = Map::new();
+        args.insert("seed_agents".to_string(), value);
+        ProtocolRequest {
+            cmd: "init-db".to_string(),
+            rid: None,
+            dry: None,
+            args,
+        }
+    }
+
+    #[test]
+    fn init_db_input_rejects_negative_seed_agents() {
+        let request = request_with_seed_agents(json!(-1));
+        let err = swarm::InitDbInput::parse_input(&request)
+            .expect_err("negative seed_agents should be rejected");
+        assert!(err.to_string().contains("must be non-negative"));
+    }
+
+    #[test]
+    fn init_db_input_accepts_zero_seed_agents() {
+        let request = request_with_seed_agents(json!(0));
+        let parsed =
+            swarm::InitDbInput::parse_input(&request).expect("zero seed_agents should be accepted");
+        assert_eq!(parsed.seed_agents, Some(0));
     }
 }
 

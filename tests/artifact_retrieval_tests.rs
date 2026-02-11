@@ -114,3 +114,37 @@ fn artifacts_command_rejects_whitespace_only_bead_id() -> Result<(), String> {
 
     Ok(())
 }
+
+#[test]
+fn artifacts_command_rejects_bead_id_exceeding_255_characters() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let long_id = "x".repeat(256);
+    let request = format!(
+        r#"{{"cmd":"artifacts","rid":"artifacts-long-bead","bead_id":"{}"}}"#,
+        long_id
+    );
+    let scenario = harness.run_protocol(&request)?;
+    let output = scenario.output;
+
+    assert_protocol_envelope(&output)?;
+    if output["ok"] != Value::Bool(false) {
+        return Err(format!(
+            "expected artifacts request with bead_id > 255 chars to fail, got: {output}"
+        ));
+    }
+    if output["err"]["code"] != Value::String("INVALID".to_string()) {
+        return Err(format!(
+            "expected INVALID code for bead_id > 255 chars, got: {output}"
+        ));
+    }
+    if !output["fix"]
+        .as_str()
+        .is_some_and(|text| text.contains("255"))
+    {
+        return Err(format!(
+            "expected fix guidance mentioning 255 character limit, got: {output}"
+        ));
+    }
+
+    Ok(())
+}

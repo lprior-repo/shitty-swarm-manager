@@ -75,6 +75,28 @@ fn batch_with_cmds_field_returns_actionable_ops_hint() -> Result<(), String> {
 }
 
 #[test]
+fn batch_rejects_empty_ops_array() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"batch","ops":[],"dry":false}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["err"]["code"], "INVALID");
+
+    let msg = json["err"]["msg"]
+        .as_str()
+        .ok_or_else(|| format!("expected error message, got: {json}"))?;
+    if !msg.contains("empty") && !msg.contains("at least one") {
+        return Err(format!(
+            "expected error message to mention empty/require at least one op, got: {msg}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
 fn invalid_command_returns_structured_error() -> Result<(), String> {
     let harness = ProtocolScenarioHarness::new();
     let scenario = harness.run_protocol(r#"{"cmd":"nope"}"#)?;
@@ -132,6 +154,148 @@ fn dry_run_lock_uses_standard_dry_shape() -> Result<(), String> {
     assert!(json["d"]["estimated_ms"].is_number());
 
     Ok(())
+}
+
+#[test]
+fn lock_rejects_empty_resource() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(
+        r#"{"cmd":"lock","resource":"","agent":"agent-1","ttl_ms":30000,"dry":true}"#,
+    )?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["err"]["code"], "INVALID");
+
+    let msg = json["err"]["msg"]
+        .as_str()
+        .ok_or_else(|| format!("expected error message, got: {json}"))?;
+    if !msg.contains("resource") && !msg.contains("empty") {
+        return Err(format!(
+            "expected error message to mention resource/empty, got: {msg}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn lock_rejects_whitespace_only_resource() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(
+        r#"{"cmd":"lock","resource":"   ","agent":"agent-1","ttl_ms":30000,"dry":true}"#,
+    )?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["err"]["code"], "INVALID");
+
+    Ok(())
+}
+
+#[test]
+fn unlock_rejects_empty_resource() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario =
+        harness.run_protocol(r#"{"cmd":"unlock","resource":"","agent":"agent-1","dry":true}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["err"]["code"], "INVALID");
+
+    let msg = json["err"]["msg"]
+        .as_str()
+        .ok_or_else(|| format!("expected error message, got: {json}"))?;
+    if !msg.contains("resource") && !msg.contains("empty") {
+        return Err(format!(
+            "expected error message to mention resource/empty, got: {msg}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn unlock_rejects_whitespace_only_resource() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness
+        .run_protocol(r#"{"cmd":"unlock","resource":"   ","agent":"agent-1","dry":true}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["err"]["code"], "INVALID");
+
+    Ok(())
+}
+
+#[test]
+fn broadcast_rejects_empty_msg_parameter() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario =
+        harness.run_protocol(r#"{"cmd":"broadcast","msg":"","from":"agent-1","dry":true}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["err"]["code"], "INVALID");
+
+    let msg = json["err"]["msg"]
+        .as_str()
+        .ok_or_else(|| format!("expected error message, got: {json}"))?;
+    if !msg.contains("msg") || !msg.contains("empty") {
+        return Err(format!(
+            "expected error message to mention msg/empty, got: {msg}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn broadcast_cli_rejects_empty_msg_parameter() {
+    let binary_path = assert_cmd::cargo::cargo_bin!("swarm");
+    Command::new(binary_path)
+        .args(["broadcast", "--msg", "", "--from", "agent-1", "--dry"])
+        .assert()
+        .failure()
+        .stdout(contains("msg cannot be empty"));
+}
+
+#[test]
+fn broadcast_rejects_empty_from_parameter() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario =
+        harness.run_protocol(r#"{"cmd":"broadcast","msg":"hello","from":"","dry":true}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["err"]["code"], "INVALID");
+
+    let msg = json["err"]["msg"]
+        .as_str()
+        .ok_or_else(|| format!("expected error message, got: {json}"))?;
+    if !msg.contains("from") || !msg.contains("empty") {
+        return Err(format!(
+            "expected error message to mention from/empty, got: {msg}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn broadcast_cli_rejects_empty_from_parameter() {
+    let binary_path = assert_cmd::cargo::cargo_bin!("swarm");
+    Command::new(binary_path)
+        .args(["broadcast", "--msg", "hello", "--from", "", "--dry"])
+        .assert()
+        .failure()
+        .stdout(contains("from cannot be empty"));
 }
 
 #[test]
@@ -770,6 +934,42 @@ fn prompt_command_matches_canonical_template() -> Result<(), String> {
 }
 
 #[test]
+fn prompt_command_rejects_negative_id() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario =
+        harness.run_protocol(r#"{"cmd":"prompt","id":-1,"rid":"prompt-negative-id"}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["err"]["code"], "INVALID");
+
+    let msg = json["err"]["msg"]
+        .as_str()
+        .ok_or_else(|| format!("expected error message, got: {json}"))?;
+    if !msg.contains("must be greater than 0") {
+        return Err(format!(
+            "expected id-positive validation error, got message: {msg}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn prompt_command_rejects_zero_id() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"prompt","id":0,"rid":"prompt-zero-id"}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["err"]["code"], "INVALID");
+
+    Ok(())
+}
+
+#[test]
 fn batch_partial_success_reports_summary() -> Result<(), String> {
     let harness = ProtocolScenarioHarness::new();
     let scenario = harness.run_protocol(
@@ -821,6 +1021,28 @@ fn resume_context_with_unknown_bead_returns_notfound() -> Result<(), String> {
     }
     if json["err"]["code"] != serde_json::Value::String("NOTFOUND".to_string()) {
         return Err(format!("expected NOTFOUND error code, got: {json}"));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn resume_context_rejects_empty_bead_id() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"resume-context","bead_id":""}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["err"]["code"], "INVALID");
+
+    let msg = json["err"]["msg"]
+        .as_str()
+        .ok_or_else(|| format!("expected resume-context validation message, got: {json}"))?;
+    if !msg.contains("bead_id") || !msg.contains("empty") {
+        return Err(format!(
+            "expected empty bead_id validation message, got: {msg}"
+        ));
     }
 
     Ok(())
@@ -958,4 +1180,160 @@ fn monitor_active_reports_repo_id_and_repo_scoped_rows() -> Result<(), String> {
         }
         Ok(())
     })
+}
+
+#[test]
+fn monitor_command_rejects_negative_watch_ms() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"monitor","view":"active","watch_ms":-1}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["err"]["code"], "INVALID");
+
+    let msg = json["err"]["msg"]
+        .as_str()
+        .ok_or_else(|| format!("expected validation message for watch_ms, got: {json}"))?;
+    if !msg.contains("Invalid value for field watch_ms") || !msg.contains("non-negative") {
+        return Err(format!(
+            "expected watch_ms non-negative validation message, got: {json}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn monitor_command_accepts_zero_watch_ms() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"monitor","view":"active","watch_ms":0}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], true);
+
+    Ok(())
+}
+
+#[test]
+fn history_command_rejects_negative_limit() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"history","limit":-1}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["err"]["code"], "INVALID");
+
+    let msg = json["err"]["msg"]
+        .as_str()
+        .ok_or_else(|| format!("expected validation message for history limit, got: {json}"))?;
+    if !msg.contains("Invalid value for field limit") || !msg.contains("non-negative") {
+        return Err(format!(
+            "expected non-negative history limit validation, got: {json}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn history_command_accepts_zero_limit() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"history","limit":0}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], true);
+
+    Ok(())
+}
+
+#[test]
+fn register_command_rejects_zero_count() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"register","count":0,"dry":true}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["err"]["code"], "INVALID");
+
+    let msg = json["err"]["msg"]
+        .as_str()
+        .ok_or_else(|| format!("expected register validation message, got: {json}"))?;
+    if !msg.contains("must be greater than 0") {
+        return Err(format!(
+            "expected positive-count validation message for register, got: {msg}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn register_command_rejects_negative_count() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"register","count":-3,"dry":true}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["err"]["code"], "INVALID");
+
+    let msg = json["err"]["msg"]
+        .as_str()
+        .ok_or_else(|| format!("expected register validation message, got: {json}"))?;
+    if !msg.contains("must be greater than 0") {
+        return Err(format!(
+            "expected positive-count validation message for register, got: {msg}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn register_command_rejects_count_above_maximum() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"register","count":101,"dry":true}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["err"]["code"], "INVALID");
+
+    let msg = json["err"]["msg"]
+        .as_str()
+        .ok_or_else(|| format!("expected register validation message, got: {json}"))?;
+    if !msg.contains("less than or equal to 100") {
+        return Err(format!(
+            "expected max-count validation message for register, got: {msg}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn init_db_command_rejects_negative_seed_agents() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"init-db","seed_agents":-1,"dry":true}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["err"]["code"], "INVALID");
+
+    let msg = json["err"]["msg"]
+        .as_str()
+        .ok_or_else(|| format!("expected init-db validation message, got: {json}"))?;
+    if !msg.contains("seed_agents") || !msg.contains("non-negative") {
+        return Err(format!(
+            "expected non-negative seed_agents validation message, got: {msg}"
+        ));
+    }
+
+    Ok(())
 }
