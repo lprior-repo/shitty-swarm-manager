@@ -260,7 +260,7 @@ fn parse_ai_hints(description: &str) -> Option<AiHints> {
         None
     } else {
         Some(AiHints {
-            do_,
+            do_: do_list,
             do_not,
             constitution,
         })
