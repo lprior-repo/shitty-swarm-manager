@@ -148,7 +148,7 @@ See `ai_cli_protocol.cue` for the full schema and supported commands.
 
 - **Read**: `src/db/read_ops.rs` - Query agents, tasks, status
 - **Write**: `src/db/write_ops.rs` - Create, update, delete operations
-- **Mappers**: `src/db/mappers.rs` - Convert DB rows to domain types
+- **Mappers**: `src/db/mappers.rs` - Convert DB rows to runtime types
 
 ## Development Workflow
 

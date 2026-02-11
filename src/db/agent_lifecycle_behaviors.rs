@@ -1,5 +1,5 @@
 // BDD-style tests for Agent Lifecycle behaviors
-// Following Martin Fowler's approach: clear domain language, GWT structure,
+// Following Martin Fowler's approach: clear business language, GWT structure,
 // focus on business behaviors rather than implementation details.
 
 use super::*;

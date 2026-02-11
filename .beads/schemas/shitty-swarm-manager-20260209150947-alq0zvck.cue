@@ -53,7 +53,7 @@ import "list"
     // Required error path tests
     required_error_tests: [
       "Invalid request produces ok false with err.code INVALID and fix.",
-      "Domain failure maps to protocol error code and structured context.",
+      "Runtime failure maps to protocol error code and structured context.",
     ]
   }
 
