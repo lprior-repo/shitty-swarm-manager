@@ -30,6 +30,8 @@ const HELP_DATA: &str = r#"{
     ["doctor", "Environment health check"],
     ["status", "Show swarm state"],
     ["resume", "Show resumable context projections"],
+    ["resume-context", "Show deep resume context payload"],
+    ["artifacts", "Retrieve bead artifacts"],
     ["agent", "Run single agent"],
     ["monitor", "View agents/progress"],
     ["register", "Register agents"],
@@ -62,6 +64,11 @@ pub enum CliCommand {
     Help,
     Status,
     Resume,
+    ResumeContext,
+    Artifacts {
+        bead_id: String,
+        artifact_type: Option<String>,
+    },
     Agent {
         id: u32,
         dry: Option<bool>,
@@ -178,6 +185,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction, CliError> {
         Some("doctor") => Ok(CliAction::Command(CliCommand::Doctor)),
         Some("status") => Ok(CliAction::Command(CliCommand::Status)),
         Some("resume") => Ok(CliAction::Command(CliCommand::Resume)),
+        Some("resume-context") => Ok(CliAction::Command(CliCommand::ResumeContext)),
         Some("?" | "help") => Ok(CliAction::Command(CliCommand::Help)),
         Some("state") => Ok(CliAction::Command(CliCommand::State)),
         Some("agents") => Ok(CliAction::Command(CliCommand::Agents)),
@@ -352,6 +360,7 @@ fn cli_command_to_request(cmd: CliCommand) -> String {
         CliCommand::Status => ("status".to_string(), None, serde_json::Map::new()),
 
         CliCommand::Resume => ("resume".to_string(), None, serde_json::Map::new()),
+        CliCommand::ResumeContext => ("resume-context".to_string(), None, serde_json::Map::new()),
 
         CliCommand::Agent { id, dry } => {
             let mut args = serde_json::Map::new();
@@ -641,6 +650,7 @@ fn suggest_commands(typo: &str) -> Vec<String> {
         "help",
         "status",
         "resume",
+        "resume-context",
         "agent",
         "init",
         "register",

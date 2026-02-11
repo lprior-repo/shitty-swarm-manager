@@ -1,5 +1,6 @@
 use super::artifacts::ArtifactType;
 use super::identifiers::{AgentId, BeadId, RepoId};
+use super::observability::FailureDiagnostics;
 use super::stage::Stage;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -208,6 +209,29 @@ pub struct ResumeContextContract {
     pub feedback: Option<String>,
     pub latest_attempt: Option<ResumeStageAttemptContract>,
     pub artifacts: Vec<ResumeArtifactSummaryContract>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResumeArtifactDetailContract {
+    pub artifact_type: String,
+    pub created_at: DateTime<Utc>,
+    pub content: String,
+    pub metadata: Option<Value>,
+    pub content_hash: Option<String>,
+    pub byte_length: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeepResumeContextContract {
+    pub agent_id: u32,
+    pub bead_id: String,
+    pub status: String,
+    pub current_stage: Option<String>,
+    pub implementation_attempt: u32,
+    pub feedback: Option<String>,
+    pub attempts: Vec<ResumeStageAttemptContract>,
+    pub diagnostics: Option<FailureDiagnostics>,
+    pub artifacts: Vec<ResumeArtifactDetailContract>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

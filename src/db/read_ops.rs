@@ -3,12 +3,13 @@ use crate::db::SwarmDb;
 use crate::error::{Result, SwarmError};
 use crate::types::{
     AgentId, AgentMessage, AgentState, AgentStatus, ArtifactType, AvailableAgent, BeadId,
-    ExecutionEvent, FailureDiagnostics, MessageType, ProgressSummary, RepoId,
-    ResumeArtifactSummary, ResumeContextProjection, ResumeStageAttempt, Stage, StageArtifact,
-    SwarmConfig,
+    DeepResumeContextContract, ExecutionEvent, FailureDiagnostics, MessageType, ProgressSummary,
+    RepoId, ResumeArtifactDetailContract, ResumeArtifactSummary, ResumeContextProjection,
+    ResumeStageAttempt, ResumeStageAttemptContract, Stage, StageArtifact, SwarmConfig,
 };
 use serde::Deserialize;
 use sqlx::FromRow;
+use std::collections::HashMap;
 
 #[derive(FromRow)]
 struct AgentStateRow {
@@ -100,6 +101,16 @@ struct ResumeArtifactSummaryJson {
 struct StageArtifactRow {
     id: i64,
     stage_history_id: i64,
+    artifact_type: String,
+    content: String,
+    metadata: Option<serde_json::Value>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    content_hash: Option<String>,
+}
+
+#[derive(FromRow)]
+struct ResumeArtifactDetailRow {
+    bead_id: String,
     artifact_type: String,
     content: String,
     metadata: Option<serde_json::Value>,
@@ -609,6 +620,162 @@ impl SwarmDb {
         Ok(projections)
     }
 
+    pub async fn get_deep_resume_contexts(&self) -> Result<Vec<DeepResumeContextContract>> {
+        let projections = self.get_resume_context_projections().await?;
+        if projections.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let bead_ids = projections
+            .iter()
+            .map(|context| context.bead_id.value().to_string())
+            .collect::<Vec<_>>();
+
+        let diagnostics_map = self.get_latest_diagnostics_for_beads(&bead_ids).await?;
+        let artifacts_map = self.get_latest_artifacts_for_beads(&bead_ids).await?;
+
+        let contexts = projections
+            .into_iter()
+            .map(|projection| {
+                let diagnostics = diagnostics_map.get(projection.bead_id.value()).cloned();
+                let artifacts = artifacts_map
+                    .get(projection.bead_id.value())
+                    .cloned()
+                    .unwrap_or_default();
+                let attempts = projection
+                    .attempts
+                    .iter()
+                    .map(|attempt| ResumeStageAttemptContract {
+                        stage: attempt.stage.as_str().to_string(),
+                        attempt_number: attempt.attempt_number,
+                        status: attempt.status.clone(),
+                        feedback: attempt.feedback.clone(),
+                        started_at: attempt.started_at,
+                        completed_at: attempt.completed_at,
+                    })
+                    .collect::<Vec<_>>();
+
+                DeepResumeContextContract {
+                    agent_id: projection.agent_id,
+                    bead_id: projection.bead_id.value().to_string(),
+                    status: projection.status.as_str().to_string(),
+                    current_stage: projection
+                        .current_stage
+                        .map(|stage| stage.as_str().to_string()),
+                    implementation_attempt: projection.implementation_attempt,
+                    feedback: projection.feedback.clone(),
+                    attempts,
+                    diagnostics,
+                    artifacts,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        Ok(contexts)
+    }
+
+    async fn get_latest_diagnostics_for_beads(
+        &self,
+        bead_ids: &[String],
+    ) -> Result<HashMap<String, FailureDiagnostics>> {
+        if bead_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = sqlx::query_as::<_, ExecutionEventRow>(
+            "SELECT DISTINCT ON (bead_id)
+                seq,
+                schema_version,
+                event_type,
+                entity_id,
+                bead_id,
+                agent_id,
+                stage,
+                causation_id,
+                diagnostics_category,
+                diagnostics_retryable,
+                diagnostics_next_command,
+                diagnostics_detail,
+                payload,
+                created_at
+             FROM execution_events
+             WHERE bead_id = ANY($1::TEXT[])
+               AND diagnostics_category IS NOT NULL
+             ORDER BY bead_id, seq DESC",
+        )
+        .bind(bead_ids)
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| {
+            SwarmError::DatabaseError(format!(
+                "Failed to load diagnostics for resume context: {e}"
+            ))
+        })?;
+
+        let mut map = HashMap::new();
+        for row in rows {
+            if let Some(bead_id) = row.bead_id.clone() {
+                if let Some(diagnostics) = diagnostics_from_row(&row) {
+                    map.insert(bead_id, diagnostics);
+                }
+            }
+        }
+
+        Ok(map)
+    }
+
+    async fn get_latest_artifacts_for_beads(
+        &self,
+        bead_ids: &[String],
+    ) -> Result<HashMap<String, Vec<ResumeArtifactDetailContract>>> {
+        if bead_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let artifact_types = resume_artifact_type_names();
+        let rows = sqlx::query_as::<_, ResumeArtifactDetailRow>(
+            "SELECT DISTINCT ON (sh.bead_id, sa.artifact_type)
+                sh.bead_id,
+                sa.artifact_type,
+                sa.content,
+                sa.metadata,
+                sa.created_at,
+                sa.content_hash
+             FROM stage_artifacts sa
+             JOIN stage_history sh ON sh.id = sa.stage_history_id
+             WHERE sh.bead_id = ANY($1::TEXT[])
+               AND sa.artifact_type = ANY($2::TEXT[])
+             ORDER BY sh.bead_id, sa.artifact_type, sa.created_at DESC, sa.id DESC",
+        )
+        .bind(bead_ids)
+        .bind(artifact_types)
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| {
+            SwarmError::DatabaseError(format!(
+                "Failed to load artifact contents for resume context: {e}"
+            ))
+        })?;
+
+        let mut map: HashMap<String, Vec<ResumeArtifactDetailContract>> = HashMap::new();
+        for row in rows {
+            let bead_id = row.bead_id;
+            let content = row.content;
+            let byte_length = content.as_bytes().len() as u64;
+            let detail = ResumeArtifactDetailContract {
+                artifact_type: row.artifact_type,
+                created_at: row.created_at,
+                content,
+                metadata: row.metadata,
+                content_hash: row.content_hash,
+                byte_length,
+            };
+            map.entry(bead_id).or_default().push(detail);
+        }
+
+        Ok(map)
+    }
+
     /// Retrieves all artifacts for a specific stage history.
     ///
     /// # Errors
@@ -668,6 +835,46 @@ impl SwarmDb {
         .map_err(|e| {
             SwarmError::DatabaseError(format!("Failed to get bead artifacts by type: {e}"))
         })
+        .and_then(|rows| {
+            rows.into_iter()
+                .map(|row| {
+                    ArtifactType::try_from(row.artifact_type.as_str())
+                        .map_err(SwarmError::DatabaseError)
+                        .map(|mapped_type| StageArtifact {
+                            id: row.id,
+                            stage_history_id: row.stage_history_id,
+                            artifact_type: mapped_type,
+                            content: row.content,
+                            metadata: row.metadata,
+                            created_at: row.created_at,
+                            content_hash: row.content_hash,
+                        })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+    }
+
+    /// Retrieves artifacts for a bead with optional type filter.
+    pub async fn get_bead_artifacts(
+        &self,
+        bead_id: &BeadId,
+        artifact_type: Option<ArtifactType>,
+    ) -> Result<Vec<StageArtifact>> {
+        if let Some(kind) = artifact_type {
+            return self.get_bead_artifacts_by_type(bead_id, kind).await;
+        }
+
+        sqlx::query_as::<_, StageArtifactRow>(
+            "SELECT sa.id, sa.stage_history_id, sa.artifact_type, sa.content, sa.metadata, sa.created_at, sa.content_hash
+             FROM stage_artifacts sa
+             JOIN stage_history sh ON sa.stage_history_id = sh.id
+             WHERE sh.bead_id = $1
+             ORDER BY sa.created_at ASC, sa.id ASC",
+        )
+        .bind(bead_id.value())
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to get bead artifacts: {e}")))
         .and_then(|rows| {
             rows.into_iter()
                 .map(|row| {
@@ -909,6 +1116,7 @@ fn resume_artifact_type_names() -> Vec<String> {
         ArtifactType::ValidationReport,
         ArtifactType::TestResults,
         ArtifactType::StageLog,
+        ArtifactType::RetryPacket,
     ]
     .iter()
     .map(|value| value.as_str().to_string())
@@ -917,7 +1125,74 @@ fn resume_artifact_type_names() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::resume_artifact_type_names;
+    use super::{
+        parse_resume_artifacts,
+        parse_resume_attempts,
+        resume_artifact_type_names,
+    };
+    use crate::types::{ArtifactType, Stage};
+    use chrono::Utc;
+    use serde_json::json;
+
+    #[test]
+    fn parse_resume_attempts_decodes_stored_history() {
+        let now = Utc::now();
+        let attempts_json = json!([
+            {
+                "stage": "rust-contract",
+                "attempt_number": 1,
+                "status": "passed",
+                "feedback": null,
+                "started_at": now,
+                "completed_at": now,
+            },
+            {
+                "stage": "implement",
+                "attempt_number": 2,
+                "status": "failed",
+                "feedback": "missing artifact",
+                "started_at": now,
+                "completed_at": null,
+            }
+        ]);
+
+        let attempts = parse_resume_attempts(attempts_json).expect("parse resume attempts");
+
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].stage, Stage::RustContract);
+        assert_eq!(attempts[0].attempt_number, 1);
+        assert_eq!(attempts[1].stage, Stage::Implement);
+        assert_eq!(attempts[1].status, "failed");
+        assert_eq!(attempts[1].feedback.as_deref(), Some("missing artifact"));
+        assert!(attempts[1].completed_at.is_none());
+    }
+
+    #[test]
+    fn parse_resume_artifacts_clamps_negative_byte_lengths_and_maps_types() {
+        let now = Utc::now();
+        let artifacts_json = json!([
+            {
+                "artifact_type": "contract_document",
+                "created_at": now,
+                "content_hash": "doc-hash",
+                "byte_length": 256,
+            },
+            {
+                "artifact_type": "failure_details",
+                "created_at": now,
+                "content_hash": null,
+                "byte_length": -10,
+            }
+        ]);
+
+        let artifacts = parse_resume_artifacts(artifacts_json).expect("parse resume artifacts");
+
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(artifacts[0].artifact_type, ArtifactType::ContractDocument);
+        assert_eq!(artifacts[1].artifact_type, ArtifactType::FailureDetails);
+        assert_eq!(artifacts[1].byte_length, 0);
+        assert_eq!(artifacts[0].content_hash.as_deref(), Some("doc-hash"));
+    }
 
     #[test]
     fn resume_artifact_query_types_include_contract_and_implementation() {
@@ -929,6 +1204,10 @@ mod tests {
         assert!(
             query_types.contains(&"implementation_code".to_string()),
             "implementation artifact missing from query type list"
+        );
+        assert!(
+            query_types.contains(&"retry_packet".to_string()),
+            "retry packet artifact missing from resume query type list"
         );
         assert!(
             !query_types.contains(&"requirements".to_string()),

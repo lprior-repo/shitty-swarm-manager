@@ -19,7 +19,15 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::Instant;
 use swarm::protocol_envelope::ProtocolEnvelope;
-use swarm::{code, AgentId, RepoId, ResumeContextContract, SwarmDb, SwarmError};
+use swarm::{
+    code,
+    AgentId,
+    CANONICAL_COORDINATOR_SCHEMA_PATH,
+    RepoId,
+    ResumeContextContract,
+    SwarmDb,
+    SwarmError,
+};
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -630,6 +638,7 @@ async fn execute_request_no_batch(
         "agent" => handle_agent(&request).await,
         "status" => handle_status(&request).await,
         "resume" => handle_resume(&request).await,
+        "resume-context" => handle_resume_context(&request).await,
         "release" => handle_release(&request).await,
         "init-db" => handle_init_db(&request).await,
         "init-local-db" => handle_init_local_db(&request).await,
@@ -644,7 +653,7 @@ async fn execute_request_no_batch(
                 request.rid.clone(),
                 code::INVALID.to_string(),
                 format!("Unknown command: {other}"),
-            ).with_fix("Use a valid command: init, doctor, status, resume, agent, smoke, prompt, register, release, monitor, init-db, init-local-db, spawn-prompts, batch, bootstrap, state, or ?/help for help".to_string())
+            ).with_fix("Use a valid command: init, doctor, status, resume, resume-context, agent, smoke, prompt, register, release, monitor, init-db, init-local-db, spawn-prompts, batch, bootstrap, state, or ?/help for help".to_string())
             .with_ctx(json!({"cmd": other})))),
     }
 }
@@ -663,6 +672,7 @@ async fn handle_help(
         ("doctor", "Environment health check"),
         ("status", "Show swarm state"),
         ("resume", "Show resumable context projections"),
+        ("resume-context", "Show deep resume context payload"),
         ("agent", "Run single agent"),
         ("monitor", "View agents/progress"),
         ("register", "Register agents"),
@@ -1341,6 +1351,24 @@ async fn handle_resume(
     Ok(CommandSuccess {
         data: json!({
             "contexts": contracts,
+        }),
+        next: "swarm monitor --view failures".to_string(),
+        state: minimal_state_for_request(request).await,
+    })
+}
+
+async fn handle_resume_context(
+    request: &ProtocolRequest,
+) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
+    let db: SwarmDb = db_from_request(request).await?;
+    let contexts = db
+        .get_deep_resume_contexts()
+        .await
+        .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
+
+    Ok(CommandSuccess {
+        data: json!({
+            "contexts": contexts,
         }),
         next: "swarm monitor --view failures".to_string(),
         state: minimal_state_for_request(request).await,
