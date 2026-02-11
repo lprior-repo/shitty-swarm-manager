@@ -217,7 +217,8 @@ async fn execute_implement_stage(
             Some(artifact) => Some(format_retry_packet(&artifact.content)),
             None => {
                 return Ok(failure_output(
-                    "Missing retry packet; cannot resume deterministic implement attempt".to_string(),
+                    "Missing retry packet; cannot resume deterministic implement attempt"
+                        .to_string(),
                 ));
             }
         }
@@ -241,10 +242,7 @@ async fn execute_implement_stage(
         .map(|artifact| artifact.content);
 
     let mut context_sections = Vec::new();
-    context_sections.push(format!(
-        "## Contract Document\n{}",
-        contract_context.trim()
-    ));
+    context_sections.push(format!("## Contract Document\n{}", contract_context.trim()));
     append_section(&mut context_sections, "Retry Packet", &retry_packet_context);
     append_section(&mut context_sections, "Failure Details", &failure_details);
     append_section(&mut context_sections, "Test Results", &test_results);
@@ -403,7 +401,10 @@ mod tests {
                 .and_then(|v| v.as_array())
                 .expect("consumed_context should be an array");
             assert_eq!(consumed.len(), 1);
-            assert_eq!(consumed[0].get("artifact_type").unwrap().as_str(), Some("contract_document"));
+            assert_eq!(
+                consumed[0].get("artifact_type").unwrap().as_str(),
+                Some("contract_document")
+            );
         }
     }
 
@@ -462,7 +463,11 @@ mod tests {
 
             let artifact_types: Vec<String> = consumed
                 .iter()
-                .filter_map(|v| v.get("artifact_type").and_then(|s| s.as_str()).map(|s| s.to_string()))
+                .filter_map(|v| {
+                    v.get("artifact_type")
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.to_string())
+                })
                 .collect();
 
             assert!(artifact_types.contains(&"contract_document".to_string()));

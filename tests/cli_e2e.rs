@@ -1,4 +1,7 @@
 mod support;
+use std::fs;
+use std::path::Path;
+
 use support::contract_harness::{
     assert_contract_test_is_decoupled, assert_protocol_envelope, ProtocolScenarioHarness,
 };
@@ -77,6 +80,66 @@ fn dry_run_lock_uses_standard_dry_shape() -> Result<(), String> {
     assert_eq!(json["d"]["dry"], true);
     assert!(json["d"]["would_do"].is_array());
     assert!(json["d"]["estimated_ms"].is_number());
+
+    Ok(())
+}
+
+#[test]
+fn spawn_prompts_default_template_is_canonical() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness
+        .run_protocol(r#"{"cmd":"spawn-prompts","count":1,"dry":true,"rid":"spawn-template"}"#)?;
+    assert_protocol_envelope(&scenario.output)?;
+    let steps = scenario.output["d"]["would_do"]
+        .as_array()
+        .ok_or_else(|| "missing dry-run steps".to_string())?;
+    let template_step = steps
+        .iter()
+        .find(|step| step["action"] == "read_template")
+        .ok_or_else(|| "read_template step missing".to_string())?;
+    let target = template_step["target"]
+        .as_str()
+        .ok_or_else(|| "read_template target missing".to_string())?;
+
+    let expected = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(".agents")
+        .join("agent_prompt.md")
+        .canonicalize()
+        .map_err(|err| format!("failed to canonicalize canonical prompt path: {err}"))?;
+    let observed = Path::new(target)
+        .canonicalize()
+        .map_err(|err| format!("failed to canonicalize template target path: {err}"))?;
+    if observed != expected {
+        return Err(format!(
+            "spawn-prompts default template should be canonical (observed {observed:?}, expected {expected:?})"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn prompt_command_matches_canonical_template() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"prompt","id":5,"rid":"prompt-parity"}"#)?;
+    assert_protocol_envelope(&scenario.output)?;
+    let prompt = scenario.output["d"]["prompt"]
+        .as_str()
+        .ok_or_else(|| "missing prompt payload".to_string())?;
+
+    let template = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".agents")
+            .join("agent_prompt.md"),
+    )
+    .map_err(|err| format!("failed to load canonical template: {err}"))?;
+    let expected = template.replace("#{N}", "5").replace("{N}", "5");
+    if prompt != expected {
+        return Err(
+            "prompt command must match canonical template after placeholder replacement"
+                .to_string(),
+        );
+    }
 
     Ok(())
 }

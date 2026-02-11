@@ -1,4 +1,3 @@
-use chrono::{DateTime, Utc};
 use crate::db::{mappers::to_u32_i32, SwarmDb};
 use crate::ddd::{
     runtime_determine_transition_decision, validate_completion_implies_push_confirmed,
@@ -10,9 +9,11 @@ use crate::types::{
     StageResult, SwarmStatus,
 };
 use crate::BrSyncStatus;
+use chrono::{DateTime, Utc};
 use serde_json::json;
 use sqlx::Acquire;
 use std::collections::HashSet;
+use std::convert::TryFrom;
 use std::future::Future;
 use std::pin::Pin;
 use tracing::{debug, info};
@@ -365,6 +366,10 @@ impl SwarmDb {
         let status = result.as_str();
         let message = result.message();
 
+        let duration_value = i32::try_from(duration_ms).map_err(|_| {
+            SwarmError::DatabaseError("Duration overflow updating stage history".to_string())
+        })?;
+
         let stage_history_row = sqlx::query!(
             "UPDATE stage_history
              SET status = $5, result = $6, feedback = $7, completed_at = NOW(), duration_ms = $8
@@ -381,7 +386,7 @@ impl SwarmDb {
             &status,
             message,
             message,
-            duration_ms.cast_signed()
+            duration_value
         )
         .fetch_optional(self.pool())
         .await
@@ -398,14 +403,8 @@ impl SwarmDb {
 
         let stage_history_id = stage_history_row.id;
 
-        self.persist_stage_transcript(
-            stage_history_id,
-            stage,
-            attempt,
-            result,
-            completed_at,
-        )
-        .await?;
+        self.persist_stage_transcript(stage_history_id, stage, attempt, result, completed_at)
+            .await?;
 
         self.record_execution_event(
             bead_id,
@@ -485,10 +484,9 @@ impl SwarmDb {
             "metadata": metadata.clone(),
         });
 
-        let transcript_text = serde_json::to_string(&transcript_body)
-            .map_err(|e| SwarmError::DatabaseError(format!(
-                "Failed to serialize stage transcript: {e}"
-            )))?;
+        let transcript_text = serde_json::to_string(&transcript_body).map_err(|e| {
+            SwarmError::DatabaseError(format!("Failed to serialize stage transcript: {e}"))
+        })?;
 
         sqlx::query(
             "UPDATE stage_history\n             SET transcript = $1\n             WHERE id = $2 AND transcript IS DISTINCT FROM $1",
@@ -507,7 +505,9 @@ impl SwarmDb {
             Some(metadata),
         )
         .await
-        .map(|_| ())?
+        .map(|_| ())?;
+
+        Ok(())
     }
 
     async fn get_stage_attempt_number(&self, stage_history_id: i64) -> Result<u32> {
@@ -517,9 +517,7 @@ impl SwarmDb {
                 .fetch_one(self.pool())
                 .await
                 .map_err(|e| {
-                    SwarmError::DatabaseError(format!(
-                        "Failed to load stage attempt number: {e}"
-                    ))
+                    SwarmError::DatabaseError(format!("Failed to load stage attempt number: {e}"))
                 })?;
 
         Ok(to_u32_i32(attempt))
@@ -719,7 +717,7 @@ impl SwarmDb {
         }
     }
 
-    async fn persist_retry_packet(
+    pub(crate) async fn persist_retry_packet(
         &self,
         stage_history_id: Option<i64>,
         stage: Stage,
@@ -832,6 +830,9 @@ impl SwarmDb {
             })),
         )
         .await
+        .map(|_| ())?;
+
+        Ok(())
     }
 
     /// Sets the swarm status.

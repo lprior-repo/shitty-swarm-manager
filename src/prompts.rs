@@ -8,9 +8,7 @@ pub const AGENT_PROMPT_TEMPLATE: &str = include_str!("../.agents/agent_prompt.md
 
 fn replace_agent_placeholders(template: &str, agent_id: u32) -> String {
     let id = agent_id.to_string();
-    template
-        .replace("#{N}", &id)
-        .replace("{N}", &id)
+    template.replace("#{N}", &id).replace("{N}", &id)
 }
 
 #[must_use]

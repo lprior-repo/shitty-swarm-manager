@@ -11,7 +11,6 @@ use std::time::Duration;
 use std::time::Instant;
 use tracing::{error, info, warn};
 
-use serde::Serialize;
 use serde_json::json;
 use swarm::{
     diagnostics::{classify_failure_category, redact_sensitive},
@@ -388,13 +387,13 @@ async fn process_work_state(
         );
 
         if should_persist_retry_packet(transition, swarm_stage) {
-            persist_retry_packet(
-                db,
-                stage_history_id,
+            db.persist_retry_packet(
+                Some(stage_history_id),
                 swarm_stage,
                 attempt,
+                &swarm_bead_id,
+                &swarm_agent_id,
                 result.message(),
-                &stage_artifacts,
             )
             .await?;
         }

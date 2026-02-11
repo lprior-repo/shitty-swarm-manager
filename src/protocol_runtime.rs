@@ -636,7 +636,6 @@ async fn execute_request_no_batch(
         "resume" => handle_resume(&request).await,
         "resume-context" => handle_resume_context(&request).await,
         "artifacts" => handle_artifacts(&request).await,
-        "resume-context" => handle_resume_context(&request).await,
         "release" => handle_release(&request).await,
         "init-db" => handle_init_db(&request).await,
         "init-local-db" => handle_init_local_db(&request).await,
@@ -1361,17 +1360,42 @@ async fn handle_resume(
 async fn handle_resume_context(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
+    let bead_filter = request
+        .args
+        .get("bead_id")
+        .and_then(Value::as_str)
+        .map(std::string::ToString::to_string);
+
     let db: SwarmDb = db_from_request(request).await?;
     let contexts = db
         .get_deep_resume_contexts()
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
 
+    let selected = if let Some(ref bead_id) = bead_filter {
+        let filtered = contexts
+            .into_iter()
+            .filter(|context| context.bead_id == *bead_id)
+            .collect::<Vec<_>>();
+        if filtered.is_empty() {
+            return Err(Box::new(
+                ProtocolEnvelope::error(
+                    request.rid.clone(),
+                    code::NOTFOUND.to_string(),
+                    format!("Bead {bead_id} not found or not resumable"),
+                )
+                .with_fix("swarm resume-context --bead-id <bead-id>".to_string())
+                .with_ctx(json!({"bead_id": bead_id})),
+            ));
+        }
+        filtered
+    } else {
+        contexts
+    };
+
     Ok(CommandSuccess {
-        data: json!({
-            "contexts": contexts,
-        }),
-        next: "swarm resume".to_string(),
+        data: json!({"contexts": selected}),
+        next: "swarm monitor --view failures".to_string(),
         state: minimal_state_for_request(request).await,
     })
 }
@@ -1386,10 +1410,7 @@ async fn handle_artifacts(
         .get_bead_artifacts(&bead_id, artifact_type)
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
-    let artifact_payload = artifacts
-        .iter()
-        .map(artifact_to_json)
-        .collect::<Vec<_>>();
+    let artifact_payload = artifacts.iter().map(artifact_to_json).collect::<Vec<_>>();
 
     Ok(CommandSuccess {
         data: json!({
@@ -1439,16 +1460,12 @@ fn parse_artifact_type(
             .map(Some)
             .map_err(|err| {
                 Box::new(
-                    ProtocolEnvelope::error(
-                        request.rid.clone(),
-                        code::INVALID.to_string(),
-                        err,
-                    )
-                    .with_fix(format!(
-                        "Use artifact_type from: {}",
-                        ArtifactType::names().join(", ")
-                    ))
-                    .with_ctx(json!({"artifact_type": value})),
+                    ProtocolEnvelope::error(request.rid.clone(), code::INVALID.to_string(), err)
+                        .with_fix(format!(
+                            "Use artifact_type from: {}",
+                            ArtifactType::names().join(", ")
+                        ))
+                        .with_ctx(json!({"artifact_type": value})),
                 )
             })
     } else {
@@ -1499,11 +1516,7 @@ mod artifact_tests {
         let err = parse_artifact_bead_id(&request).expect_err("bead_id missing");
         let envelope: &ProtocolEnvelope = err.as_ref();
         assert_eq!(envelope.err.as_ref().unwrap().code, "INVALID");
-        assert!(envelope
-            .fix
-            .as_ref()
-            .unwrap()
-            .contains("bead_id"));
+        assert!(envelope.fix.as_ref().unwrap().contains("bead_id"));
     }
 
     #[test]
@@ -1515,47 +1528,21 @@ mod artifact_tests {
 
     #[test]
     fn parse_artifact_type_accepts_known_value() {
-        let request = request_with_args(&[
-            ("bead_id", "bead-42"),
-            ("artifact_type", "test_output"),
-        ]);
+        let request =
+            request_with_args(&[("bead_id", "bead-42"), ("artifact_type", "test_output")]);
         let artifact_type = parse_artifact_type(&request).expect("valid type");
         assert_eq!(artifact_type, Some(ArtifactType::TestOutput));
     }
 
     #[test]
     fn parse_artifact_type_rejects_unknown_value() {
-        let request = request_with_args(&[
-            ("bead_id", "bead-42"),
-            ("artifact_type", "unknown-type"),
-        ]);
+        let request =
+            request_with_args(&[("bead_id", "bead-42"), ("artifact_type", "unknown-type")]);
         let err = parse_artifact_type(&request).expect_err("unexpected type");
         let envelope: &ProtocolEnvelope = err.as_ref();
         assert_eq!(envelope.err.as_ref().unwrap().code, "INVALID");
-        assert!(envelope
-            .fix
-            .as_ref()
-            .unwrap()
-            .contains("artifact_type"));
+        assert!(envelope.fix.as_ref().unwrap().contains("artifact_type"));
     }
-}
-
-async fn handle_resume_context(
-    request: &ProtocolRequest,
-) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
-    let db: SwarmDb = db_from_request(request).await?;
-    let contexts = db
-        .get_deep_resume_contexts()
-        .await
-        .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
-
-    Ok(CommandSuccess {
-        data: json!({
-            "contexts": contexts,
-        }),
-        next: "swarm resume".to_string(),
-        state: minimal_state_for_request(request).await,
-    })
 }
 
 async fn handle_release(
@@ -1807,10 +1794,7 @@ async fn handle_spawn_prompts(
     let db: SwarmDb = db_from_request(request).await?;
     let config = db.get_config(&RepoId::new("local")).await.ok();
 
-    let (template_text, template_name) = match request
-        .args
-        .get("template")
-        .and_then(Value::as_str)
+    let (template_text, template_name) = match request.args.get("template").and_then(Value::as_str)
     {
         Some(path) => {
             let text = fs::read_to_string(path).await.map_err(|err| {

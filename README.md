@@ -169,6 +169,10 @@ swarm release --agent_id 3
 swarm status
 ```
 
+### Artifact retrieval command
+
+Use `swarm artifacts --bead-id <bead-id> [--artifact-type <type>]` to list persistent artifacts for a bead, including content, metadata, and hashes. Filter by typed artifact values such as `contract_document`, `test_results`, `failure_details`, `stage_log`, or other values documented in `ArtifactType`.
+
 
 ### AI Integration Rules
 

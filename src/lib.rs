@@ -22,7 +22,6 @@ pub use ddd::{
 
 pub use canonical_schema::CANONICAL_COORDINATOR_SCHEMA_PATH;
 
-
 pub use error::Result;
 pub use error::SwarmError as Error;
 pub use error::{code, SwarmError, ERROR_CODES};
