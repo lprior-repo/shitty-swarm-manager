@@ -6,7 +6,12 @@ use std::path::Path;
 use support::contract_harness::{
     assert_contract_test_is_decoupled, assert_protocol_envelope, ProtocolScenarioHarness,
 };
-use swarm::CANONICAL_COORDINATOR_SCHEMA_PATH;
+
+fn e2e_enabled() -> bool {
+    std::env::var("SWARM_E2E")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
 
 #[test]
 fn help_command_returns_protocol_envelope() -> Result<(), String> {
@@ -59,9 +64,9 @@ fn init_db_default_schema_path_is_canonical() -> Result<(), String> {
         .as_str()
         .ok_or_else(|| "apply_schema target is not a string".to_string())?;
 
-    if target != CANONICAL_COORDINATOR_SCHEMA_PATH {
+    if !target.starts_with("embedded:") {
         return Err(format!(
-            "unexpected schema target {target}, expected canonical path {CANONICAL_COORDINATOR_SCHEMA_PATH}",
+            "unexpected schema target {target}, expected embedded schema reference",
         ));
     }
 
@@ -81,6 +86,283 @@ fn dry_run_lock_uses_standard_dry_shape() -> Result<(), String> {
     assert_eq!(json["d"]["dry"], true);
     assert!(json["d"]["would_do"].is_array());
     assert!(json["d"]["estimated_ms"].is_number());
+
+    Ok(())
+}
+
+#[test]
+fn next_command_dry_runs_robot_next_with_minimal_plan() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"next","dry":true}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["d"]["dry"], true);
+
+    let steps = json["d"]["would_do"]
+        .as_array()
+        .ok_or_else(|| "missing dry next steps".to_string())?;
+    let step = steps
+        .first()
+        .ok_or_else(|| "expected one dry-run step for next command".to_string())?;
+
+    assert_eq!(step["action"], "bv_robot_next");
+    assert_eq!(step["target"], "bv --robot-next");
+
+    Ok(())
+}
+
+#[test]
+fn next_cli_dry_flag_short_circuits_bv_execution() -> Result<(), String> {
+    let binary_path = assert_cmd::cargo::cargo_bin!("swarm");
+    let assert = Command::new(binary_path)
+        .args(["next", "--dry"])
+        .assert()
+        .success();
+
+    let raw = String::from_utf8_lossy(&assert.get_output().stdout)
+        .trim()
+        .to_string();
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|err| format!("expected JSON response envelope, got '{raw}': {err}"))?;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["d"]["dry"], true);
+    assert_eq!(json["d"]["would_do"][0]["action"], "bv_robot_next");
+
+    Ok(())
+}
+
+#[test]
+fn claim_next_command_dry_runs_selection_and_claim_plan() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"claim-next","dry":true}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["d"]["dry"], true);
+
+    let steps = json["d"]["would_do"]
+        .as_array()
+        .ok_or_else(|| "missing claim-next dry steps".to_string())?;
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0]["action"], "bv_robot_next");
+    assert_eq!(steps[1]["action"], "br_update");
+
+    Ok(())
+}
+
+#[test]
+fn assign_command_dry_emits_br_synced_plan() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario =
+        harness.run_protocol(r#"{"cmd":"assign","bead_id":"bd-test","agent_id":2,"dry":true}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["d"]["dry"], true);
+
+    let steps = json["d"]["would_do"]
+        .as_array()
+        .ok_or_else(|| "missing assign dry steps".to_string())?;
+    assert_eq!(steps.len(), 4);
+    assert_eq!(steps[0]["action"], "br_show");
+    assert_eq!(steps[1]["action"], "claim_bead");
+    assert_eq!(steps[2]["action"], "br_update");
+    assert_eq!(steps[3]["action"], "br_verify");
+
+    Ok(())
+}
+
+#[test]
+fn run_once_command_dry_emits_compact_orchestration_plan() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"run-once","id":2,"dry":true}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["d"]["dry"], true);
+
+    let steps = json["d"]["would_do"]
+        .as_array()
+        .ok_or_else(|| "missing run-once dry steps".to_string())?;
+    assert_eq!(steps.len(), 5);
+    assert_eq!(steps[0]["action"], "doctor");
+    assert_eq!(steps[3]["action"], "agent");
+
+    Ok(())
+}
+
+#[test]
+fn qa_command_dry_smoke_reports_deterministic_checks() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"qa","target":"smoke","id":1,"dry":true}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["d"]["dry"], true);
+
+    let steps = json["d"]["would_do"]
+        .as_array()
+        .ok_or_else(|| "missing qa dry steps".to_string())?;
+    assert_eq!(steps.len(), 6);
+    assert_eq!(steps[0]["action"], "doctor");
+    assert_eq!(steps[5]["action"], "monitor");
+
+    Ok(())
+}
+
+#[test]
+fn qa_command_rejects_unknown_target() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"qa","target":"unknown"}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["err"]["code"], "INVALID");
+
+    Ok(())
+}
+
+#[test]
+fn claim_next_cli_dry_flag_short_circuits_external_calls() -> Result<(), String> {
+    let binary_path = assert_cmd::cargo::cargo_bin!("swarm");
+    let assert = Command::new(binary_path)
+        .args(["claim-next", "--dry"])
+        .assert()
+        .success();
+
+    let raw = String::from_utf8_lossy(&assert.get_output().stdout)
+        .trim()
+        .to_string();
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|err| format!("expected JSON response envelope, got '{raw}': {err}"))?;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["d"]["dry"], true);
+
+    Ok(())
+}
+
+#[test]
+fn run_once_cli_dry_flag_short_circuits_orchestration() -> Result<(), String> {
+    let binary_path = assert_cmd::cargo::cargo_bin!("swarm");
+    let assert = Command::new(binary_path)
+        .args(["run-once", "--id", "3", "--dry"])
+        .assert()
+        .success();
+
+    let raw = String::from_utf8_lossy(&assert.get_output().stdout)
+        .trim()
+        .to_string();
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|err| format!("expected JSON response envelope, got '{raw}': {err}"))?;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["d"]["dry"], true);
+
+    Ok(())
+}
+
+#[test]
+fn status_command_includes_bead_terminology_timestamp_and_breakdown() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"status"}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], true);
+    assert!(json["d"]["closed"].is_number());
+    assert!(json["d"]["done"].is_number());
+    assert!(json["d"]["timestamp"].is_string());
+    assert!(json["d"]["beads_by_status"].is_object());
+    assert!(json["d"]["beads_by_status"]["open"].is_number());
+    assert!(json["d"]["beads_by_status"]["in_progress"].is_number());
+    assert!(json["d"]["beads_by_status"]["closed"].is_number());
+
+    Ok(())
+}
+
+#[test]
+fn qa_cli_dry_flag_short_circuits_checks() -> Result<(), String> {
+    let binary_path = assert_cmd::cargo::cargo_bin!("swarm");
+    let assert = Command::new(binary_path)
+        .args(["qa", "--target", "smoke", "--id", "1", "--dry"])
+        .assert()
+        .success();
+
+    let raw = String::from_utf8_lossy(&assert.get_output().stdout)
+        .trim()
+        .to_string();
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|err| format!("expected JSON response envelope, got '{raw}': {err}"))?;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["d"]["dry"], true);
+
+    Ok(())
+}
+
+#[test]
+fn run_once_live_executes_when_e2e_enabled() -> Result<(), String> {
+    if !e2e_enabled() {
+        return Ok(());
+    }
+
+    let binary_path = assert_cmd::cargo::cargo_bin!("swarm");
+    let assert = Command::new(binary_path)
+        .args(["run-once", "--id", "1"])
+        .assert()
+        .success();
+
+    let raw = String::from_utf8_lossy(&assert.get_output().stdout)
+        .trim()
+        .to_string();
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|err| format!("expected JSON response envelope, got '{raw}': {err}"))?;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], true);
+    assert!(json["d"]["steps"]["doctor"].is_object());
+    assert!(json["d"]["steps"]["claim_next"].is_object());
+    assert!(json["d"]["steps"]["progress"].is_object());
+
+    Ok(())
+}
+
+#[test]
+fn qa_smoke_live_executes_when_e2e_enabled() -> Result<(), String> {
+    if !e2e_enabled() {
+        return Ok(());
+    }
+
+    let binary_path = assert_cmd::cargo::cargo_bin!("swarm");
+    let assert = Command::new(binary_path)
+        .args(["qa", "--target", "smoke", "--id", "1"])
+        .assert()
+        .success();
+
+    let raw = String::from_utf8_lossy(&assert.get_output().stdout)
+        .trim()
+        .to_string();
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|err| format!("expected JSON response envelope, got '{raw}': {err}"))?;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["d"]["target"], "smoke");
+    assert!(json["d"]["checks"]["doctor"].is_object());
+    assert!(json["d"]["checks"]["status"].is_object());
 
     Ok(())
 }
@@ -308,4 +590,49 @@ fn doctor_with_explicit_unreachable_database_url_marks_database_check_failed() -
     }
 
     Ok(())
+}
+
+#[test]
+fn state_command_reports_repo_scoped_resource_metadata() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"state"}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], true);
+    assert!(json["d"]["repo_id"].is_string());
+    assert!(json["d"]["resources"].is_array());
+    assert!(json["d"]["resources_total"].is_number());
+    assert!(json["d"]["resources_truncated"].is_boolean());
+
+    Ok(())
+}
+
+#[test]
+fn monitor_active_reports_repo_id_and_repo_scoped_rows() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"monitor","view":"active"}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], true);
+
+    let repo_id = json["d"]["repo_id"]
+        .as_str()
+        .ok_or_else(|| "monitor active payload missing repo_id string".to_string())?;
+    let rows = json["d"]["rows"]
+        .as_array()
+        .ok_or_else(|| "monitor active payload missing rows array".to_string())?;
+
+    rows.iter().try_for_each(|row| {
+        let row_repo = row["repo"]
+            .as_str()
+            .ok_or_else(|| format!("row missing repo field: {row}"))?;
+        if row_repo != repo_id {
+            return Err(format!(
+                "monitor active row escaped repo scope: expected {repo_id}, got {row_repo}"
+            ));
+        }
+        Ok(())
+    })
 }

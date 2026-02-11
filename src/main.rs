@@ -29,6 +29,11 @@ const HELP_DATA: &str = r#"{
     ["init", "Initialize swarm (bootstrap + init-db + register)"],
     ["doctor", "Environment health check"],
     ["status", "Show swarm state"],
+    ["next", "Get top bead recommendation"],
+    ["claim-next", "Select and claim top bead"],
+    ["assign", "Assign explicit bead to agent"],
+    ["run-once", "Run one compact orchestration cycle"],
+    ["qa", "Run deterministic QA checks"],
     ["resume", "Show resumable context projections"],
     ["resume-context", "Show deep resume context payload"],
     ["artifacts", "Retrieve bead artifacts"],
@@ -47,6 +52,7 @@ const HELP_DATA: &str = r#"{
   "examples": [
     {"desc": "Quick start", "cmd": "echo '{\"cmd\":\"init\"}' | swarm"},
     {"desc": "Health check", "cmd": "echo '{\"cmd\":\"doctor\"}' | swarm"},
+    {"desc": "Assign bead", "cmd": "echo '{\"cmd\":\"assign\",\"bead_id\":\"bd-abc123\",\"agent_id\":1}' | swarm"},
     {"desc": "Dry run", "cmd": "echo '{\"cmd\":\"agent\",\"id\":1,\"dry\":true}' | swarm"}
   ],
   "resp": {
@@ -63,6 +69,26 @@ pub enum CliCommand {
     Doctor,
     Help,
     Status,
+    Next {
+        dry: Option<bool>,
+    },
+    ClaimNext {
+        dry: Option<bool>,
+    },
+    Assign {
+        bead_id: String,
+        agent_id: u32,
+        dry: Option<bool>,
+    },
+    RunOnce {
+        id: Option<u32>,
+        dry: Option<bool>,
+    },
+    Qa {
+        target: Option<String>,
+        id: Option<u32>,
+        dry: Option<bool>,
+    },
     Resume,
     ResumeContext {
         bead_id: Option<String>,
@@ -186,6 +212,35 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction, CliError> {
         // Commands with no args
         Some("doctor") => Ok(CliAction::Command(CliCommand::Doctor)),
         Some("status") => Ok(CliAction::Command(CliCommand::Status)),
+        Some("next") => {
+            let dry = parse_optional_arg(args, "dry")?;
+            Ok(CliAction::Command(CliCommand::Next { dry }))
+        }
+        Some("claim-next") => {
+            let dry = parse_optional_arg(args, "dry")?;
+            Ok(CliAction::Command(CliCommand::ClaimNext { dry }))
+        }
+        Some("assign") => {
+            let bead_id = parse_required_arg(args, "bead_id")?;
+            let agent_id = parse_required_arg(args, "agent_id")?;
+            let dry = parse_optional_arg(args, "dry")?;
+            Ok(CliAction::Command(CliCommand::Assign {
+                bead_id,
+                agent_id,
+                dry,
+            }))
+        }
+        Some("run-once") => {
+            let id = parse_optional_arg(args, "id")?;
+            let dry = parse_optional_arg(args, "dry")?;
+            Ok(CliAction::Command(CliCommand::RunOnce { id, dry }))
+        }
+        Some("qa") => {
+            let target = parse_optional_arg(args, "target")?;
+            let id = parse_optional_arg(args, "id")?;
+            let dry = parse_optional_arg(args, "dry")?;
+            Ok(CliAction::Command(CliCommand::Qa { target, id, dry }))
+        }
         Some("resume") => Ok(CliAction::Command(CliCommand::Resume)),
         Some("resume-context") => {
             let bead_id = parse_optional_arg(args, "bead_id")?;
@@ -371,6 +426,40 @@ fn cli_command_to_request(cmd: CliCommand) -> String {
         CliCommand::Help => ("?".to_string(), None, serde_json::Map::new()),
 
         CliCommand::Status => ("status".to_string(), None, serde_json::Map::new()),
+
+        CliCommand::Next { dry } => ("next".to_string(), dry, serde_json::Map::new()),
+
+        CliCommand::ClaimNext { dry } => ("claim-next".to_string(), dry, serde_json::Map::new()),
+
+        CliCommand::Assign {
+            bead_id,
+            agent_id,
+            dry,
+        } => {
+            let mut args = serde_json::Map::new();
+            args.insert("bead_id".to_string(), json!(bead_id));
+            args.insert("agent_id".to_string(), json!(agent_id));
+            ("assign".to_string(), dry, args)
+        }
+
+        CliCommand::RunOnce { id, dry } => {
+            let mut args = serde_json::Map::new();
+            if let Some(agent_id) = id {
+                args.insert("id".to_string(), json!(agent_id));
+            }
+            ("run-once".to_string(), dry, args)
+        }
+
+        CliCommand::Qa { target, id, dry } => {
+            let mut args = serde_json::Map::new();
+            if let Some(value) = target {
+                args.insert("target".to_string(), json!(value));
+            }
+            if let Some(agent_id) = id {
+                args.insert("id".to_string(), json!(agent_id));
+            }
+            ("qa".to_string(), dry, args)
+        }
 
         CliCommand::Resume => ("resume".to_string(), None, serde_json::Map::new()),
         CliCommand::Artifacts {
@@ -700,6 +789,11 @@ fn suggest_commands(typo: &str) -> Vec<String> {
         "doctor",
         "help",
         "status",
+        "next",
+        "claim-next",
+        "assign",
+        "run-once",
+        "qa",
         "resume",
         "resume-context",
         "artifacts",

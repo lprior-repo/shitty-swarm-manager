@@ -27,6 +27,10 @@ use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
+const EMBEDDED_COORDINATOR_SCHEMA_SQL: &str =
+    include_str!("../crates/swarm-coordinator/schema.sql");
+const EMBEDDED_COORDINATOR_SCHEMA_REF: &str = "embedded:crates/swarm-coordinator/schema.sql";
+
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct ProtocolRequest {
     pub cmd: String,
@@ -654,6 +658,11 @@ async fn execute_request_no_batch(
         "register" => handle_register(&request).await,
         "agent" => handle_agent(&request).await,
         "status" => handle_status(&request).await,
+        "next" => handle_next(&request).await,
+        "claim-next" => handle_claim_next(&request).await,
+        "assign" => handle_assign(&request).await,
+        "run-once" => handle_run_once(&request).await,
+        "qa" => handle_qa(&request).await,
         "resume" => handle_resume(&request).await,
         "resume-context" => handle_resume_context(&request).await,
         "artifacts" => handle_artifacts(&request).await,
@@ -671,7 +680,7 @@ async fn execute_request_no_batch(
                 request.rid.clone(),
                 code::INVALID.to_string(),
                 format!("Unknown command: {other}"),
-            ).with_fix("Use a valid command: init, doctor, status, resume, artifacts, resume-context, agent, smoke, prompt, register, release, monitor, init-db, init-local-db, spawn-prompts, batch, bootstrap, state, or ?/help for help".to_string())
+            ).with_fix("Use a valid command: init, doctor, status, next, claim-next, assign, run-once, qa, resume, artifacts, resume-context, agent, smoke, prompt, register, release, monitor, init-db, init-local-db, spawn-prompts, batch, bootstrap, state, or ?/help for help".to_string())
             .with_ctx(json!({"cmd": other})))),
     }
 }
@@ -689,6 +698,11 @@ async fn handle_help(
         ("init", "Initialize swarm (bootstrap + init-db + register)"),
         ("doctor", "Environment health check"),
         ("status", "Show swarm state"),
+        ("next", "Get top bead recommendation"),
+        ("claim-next", "Select and claim top bead"),
+        ("assign", "Assign explicit bead to agent"),
+        ("run-once", "Run one compact orchestration cycle"),
+        ("qa", "Run deterministic QA checks"),
         ("resume", "Show resumable context projections"),
         ("resume-context", "Show deep resume context payload"),
         ("artifacts", "Retrieve artifact records"),
@@ -722,17 +736,601 @@ async fn handle_help(
     })
 }
 
+fn project_next_recommendation(payload: &Value) -> Value {
+    if payload.get("id").is_some() {
+        return payload.clone();
+    }
+
+    if let Some(next) = payload.get("next") {
+        return next.clone();
+    }
+
+    if let Some(recommendation) = payload.get("recommendation") {
+        return recommendation.clone();
+    }
+
+    payload
+        .pointer("/triage/quick_ref/top_picks/0")
+        .cloned()
+        .unwrap_or_else(|| payload.clone())
+}
+
+fn bead_id_from_recommendation(recommendation: &Value) -> Option<String> {
+    recommendation
+        .get("id")
+        .and_then(Value::as_str)
+        .map(std::string::ToString::to_string)
+}
+
+async fn run_external_json_command(
+    program: &str,
+    args: &[&str],
+    rid: Option<String>,
+    fix: &str,
+) -> std::result::Result<Value, Box<ProtocolEnvelope>> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .await
+        .map_err(|err| {
+            Box::new(
+                ProtocolEnvelope::error(
+                    rid.clone(),
+                    code::INTERNAL.to_string(),
+                    format!("Failed to execute {program}: {err}"),
+                )
+                .with_fix(fix.to_string()),
+            )
+        })?;
+
+    if !output.status.success() {
+        let exit_code = output.status.code().unwrap_or(1);
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(Box::new(
+            ProtocolEnvelope::error(
+                rid,
+                code::INTERNAL.to_string(),
+                if stderr.is_empty() {
+                    format!("{program} command failed")
+                } else {
+                    format!("{program} command failed: {stderr}")
+                },
+            )
+            .with_fix(fix.to_string())
+            .with_ctx(json!({
+                "program": program,
+                "exit_code": exit_code,
+                "stderr": stderr,
+            })),
+        ));
+    }
+
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    serde_json::from_str::<Value>(&raw).map_err(|err| {
+        Box::new(
+            ProtocolEnvelope::error(
+                rid,
+                code::INVALID.to_string(),
+                format!("{program} returned non-JSON output: {err}"),
+            )
+            .with_fix(fix.to_string())
+            .with_ctx(json!({"raw": raw})),
+        )
+    })
+}
+
+async fn handle_next(
+    request: &ProtocolRequest,
+) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
+    if dry_flag(request) {
+        return Ok(dry_run_success(
+            request,
+            vec![json!({"step": 1, "action": "bv_robot_next", "target": "bv --robot-next"})],
+            "swarm next",
+        ));
+    }
+
+    let parsed = run_external_json_command(
+        "bv",
+        &["--robot-next"],
+        request.rid.clone(),
+        "Run `bv --robot-next` manually and verify beads index is available",
+    )
+    .await?;
+
+    Ok(CommandSuccess {
+        data: json!({
+            "source": "bv --robot-next",
+            "next": project_next_recommendation(&parsed),
+        }),
+        next: "br update <bead-id> --status in_progress".to_string(),
+        state: minimal_state_for_request(request).await,
+    })
+}
+
+async fn handle_claim_next(
+    request: &ProtocolRequest,
+) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
+    if dry_flag(request) {
+        return Ok(dry_run_success(
+            request,
+            vec![
+                json!({"step": 1, "action": "bv_robot_next", "target": "bv --robot-next"}),
+                json!({"step": 2, "action": "br_update", "target": "br update <bead-id> --status in_progress --json"}),
+            ],
+            "swarm status",
+        ));
+    }
+
+    let recommendation_payload = run_external_json_command(
+        "bv",
+        &["--robot-next"],
+        request.rid.clone(),
+        "Run `bv --robot-next` manually and verify beads index is available",
+    )
+    .await?;
+    let recommendation = project_next_recommendation(&recommendation_payload);
+    let bead_id = bead_id_from_recommendation(&recommendation).ok_or_else(|| {
+        Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::INVALID.to_string(),
+                "bv --robot-next returned no bead id".to_string(),
+            )
+            .with_fix("Run `bv --robot-next` and verify it returns an object with id".to_string())
+            .with_ctx(json!({"next": recommendation})),
+        )
+    })?;
+
+    let claim = run_external_json_command(
+        "br",
+        &[
+            "update",
+            bead_id.as_str(),
+            "--status",
+            "in_progress",
+            "--json",
+        ],
+        request.rid.clone(),
+        "Run `br update <bead-id> --status in_progress --json` manually",
+    )
+    .await?;
+
+    Ok(CommandSuccess {
+        data: json!({
+            "selection": recommendation,
+            "claim": claim,
+        }),
+        next: format!("br show {bead_id}"),
+        state: minimal_state_for_request(request).await,
+    })
+}
+
+fn first_issue_from_br_payload(payload: &Value) -> Option<&Value> {
+    if payload.is_object() {
+        return Some(payload);
+    }
+
+    payload.as_array().and_then(|items| items.first())
+}
+
+fn issue_status_from_br_payload(payload: &Value) -> Option<String> {
+    first_issue_from_br_payload(payload)
+        .and_then(|issue| issue.get("status"))
+        .and_then(Value::as_str)
+        .map(std::string::ToString::to_string)
+}
+
+fn issue_id_from_br_payload(payload: &Value) -> Option<String> {
+    first_issue_from_br_payload(payload)
+        .and_then(|issue| issue.get("id"))
+        .and_then(Value::as_str)
+        .map(std::string::ToString::to_string)
+}
+
+async fn valid_agent_ids(db: &SwarmDb, repo_id: &RepoId) -> Vec<u32> {
+    db.get_available_agents(repo_id)
+        .await
+        .map(|agents| {
+            agents
+                .into_iter()
+                .map(|agent| agent.agent_id)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+async fn handle_assign(
+    request: &ProtocolRequest,
+) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
+    let db: SwarmDb = db_from_request(request).await?;
+    let repo_id = repo_id_from_request(request);
+
+    let bead_id = request
+        .args
+        .get("bead_id")
+        .and_then(Value::as_str)
+        .map(std::string::ToString::to_string)
+        .ok_or_else(|| {
+            Box::new(
+                ProtocolEnvelope::error(
+                    request.rid.clone(),
+                    code::INVALID.to_string(),
+                    "Missing required field: bead_id".to_string(),
+                )
+                .with_fix(
+                    "echo '{\"cmd\":\"assign\",\"bead_id\":\"<bead-id>\",\"agent_id\":1}' | swarm"
+                        .to_string(),
+                )
+                .with_ctx(json!({"bead_id": "required"})),
+            )
+        })?;
+
+    let valid_ids = valid_agent_ids(&db, &repo_id).await;
+    let agent_id = request
+        .args
+        .get("agent_id")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            Box::new(
+                ProtocolEnvelope::error(
+                    request.rid.clone(),
+                    code::INVALID.to_string(),
+                    "Missing required field: agent_id".to_string(),
+                )
+                .with_fix(
+                    "echo '{\"cmd\":\"assign\",\"bead_id\":\"<bead-id>\",\"agent_id\":1}' | swarm"
+                        .to_string(),
+                )
+                .with_ctx(json!({"agent_id": "required", "valid_ids": valid_ids})),
+            )
+        })?;
+
+    if dry_flag(request) {
+        return Ok(dry_run_success(
+            request,
+            vec![
+                json!({"step": 1, "action": "br_show", "target": format!("br show {bead_id} --json")}),
+                json!({"step": 2, "action": "claim_bead", "target": format!("agent:{agent_id}, bead:{bead_id}")}),
+                json!({"step": 3, "action": "br_update", "target": format!("br update {bead_id} --status in_progress --assignee swarm-agent-{agent_id} --json")}),
+                json!({"step": 4, "action": "br_verify", "target": format!("br show {bead_id} --json")}),
+            ],
+            "swarm monitor --view active",
+        ));
+    }
+
+    let agent_key = AgentId::new(repo_id.clone(), agent_id);
+    let state = db
+        .get_agent_state(&agent_key)
+        .await
+        .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
+
+    let Some(agent_state) = state else {
+        return Err(Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::NOTFOUND.to_string(),
+                format!("Agent {agent_id} is not registered"),
+            )
+            .with_fix("swarm register --count <n>".to_string())
+            .with_ctx(json!({"agent_id": agent_id, "valid_ids": valid_ids})),
+        ));
+    };
+
+    if agent_state.status.as_str() != "idle" || agent_state.bead_id.is_some() {
+        return Err(Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::CONFLICT.to_string(),
+                format!("Agent {agent_id} is not idle"),
+            )
+            .with_fix(
+                "Choose an idle agent from `swarm monitor --view active` or `swarm state`"
+                    .to_string(),
+            )
+            .with_ctx(json!({
+                "agent_id": agent_id,
+                "agent_status": agent_state.status.as_str(),
+                "current_bead": agent_state.bead_id.map(|b| b.value().to_string()),
+            })),
+        ));
+    }
+
+    let bead_before = run_external_json_command(
+        "br",
+        &["show", bead_id.as_str(), "--json"],
+        request.rid.clone(),
+        "Run `br show <bead-id> --json` and verify bead exists",
+    )
+    .await?;
+
+    let current_status = issue_status_from_br_payload(&bead_before).ok_or_else(|| {
+        Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::INVALID.to_string(),
+                "br show returned payload without status".to_string(),
+            )
+            .with_fix("Run `br show <bead-id> --json` and inspect response shape".to_string())
+            .with_ctx(json!({"payload": bead_before})),
+        )
+    })?;
+
+    if current_status != "open" {
+        return Err(Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::CONFLICT.to_string(),
+                format!("Bead {bead_id} is not assignable: status={current_status}"),
+            )
+            .with_fix("Use an open bead id from `br ready --json`".to_string())
+            .with_ctx(json!({"bead_id": bead_id, "status": current_status})),
+        ));
+    }
+
+    let claimed = db
+        .claim_bead(&agent_key, &BeadId::new(bead_id.clone()))
+        .await
+        .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
+
+    if !claimed {
+        return Err(Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::CONFLICT.to_string(),
+                format!("Failed to claim bead {bead_id} for agent {agent_id}"),
+            )
+            .with_fix("Verify bead is not already claimed and retry".to_string())
+            .with_ctx(json!({"bead_id": bead_id, "agent_id": agent_id})),
+        ));
+    }
+
+    let assignee = format!("swarm-agent-{agent_id}");
+    let update_result = run_external_json_command(
+        "br",
+        &[
+            "update",
+            bead_id.as_str(),
+            "--status",
+            "in_progress",
+            "--assignee",
+            assignee.as_str(),
+            "--json",
+        ],
+        request.rid.clone(),
+        "Run `br update <bead-id> --status in_progress --assignee swarm-agent-<id> --json` manually",
+    )
+    .await;
+
+    let br_update = match update_result {
+        Ok(value) => value,
+        Err(err) => {
+            let _ = db.release_agent(&agent_key).await;
+            return Err(Box::new(
+                ProtocolEnvelope::error(
+                    request.rid.clone(),
+                    code::CONFLICT.to_string(),
+                    format!(
+                        "assign failed during br update and was rolled back for bead {bead_id}"
+                    ),
+                )
+                .with_fix(
+                    "Retry once br command succeeds. Local claim was reverted to avoid drift"
+                        .to_string(),
+                )
+                .with_ctx(json!({"bead_id": bead_id, "agent_id": agent_id, "br_error": err.err})),
+            ));
+        }
+    };
+
+    let bead_after = run_external_json_command(
+        "br",
+        &["show", bead_id.as_str(), "--json"],
+        request.rid.clone(),
+        "Run `br show <bead-id> --json` and verify bead status",
+    )
+    .await?;
+
+    let verified_status = issue_status_from_br_payload(&bead_after);
+    let verified_id = issue_id_from_br_payload(&bead_after);
+
+    Ok(CommandSuccess {
+        data: json!({
+            "bead_id": bead_id,
+            "agent_id": agent_id,
+            "assignee": assignee,
+            "swarm_claim": {
+                "claimed": true,
+                "agent_status": "working",
+            },
+            "br_sync": {
+                "update": br_update,
+                "verify": bead_after,
+                "verified_status": verified_status,
+                "verified_id": verified_id,
+            },
+            "synced": true,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+        }),
+        next: "swarm monitor --view active".to_string(),
+        state: minimal_state_for_request(request).await,
+    })
+}
+
+async fn handle_run_once(
+    request: &ProtocolRequest,
+) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
+    let agent_id = request
+        .args
+        .get("id")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .map_or(1_u32, |value| value);
+
+    if dry_flag(request) {
+        return Ok(dry_run_success(
+            request,
+            vec![
+                json!({"step": 1, "action": "doctor"}),
+                json!({"step": 2, "action": "status"}),
+                json!({"step": 3, "action": "claim_next"}),
+                json!({"step": 4, "action": "agent", "target": agent_id}),
+                json!({"step": 5, "action": "monitor", "target": "progress"}),
+            ],
+            "swarm status",
+        ));
+    }
+
+    let doctor = handle_doctor(request).await?.data;
+    let status_before = handle_status(request).await?.data;
+    let claim = handle_claim_next(request).await?.data;
+
+    let agent_request = ProtocolRequest {
+        cmd: "agent".to_string(),
+        rid: request.rid.clone(),
+        dry: Some(false),
+        args: Map::from_iter(vec![("id".to_string(), Value::from(agent_id))]),
+    };
+    let agent = handle_agent(&agent_request).await?.data;
+
+    let progress_request = ProtocolRequest {
+        cmd: "monitor".to_string(),
+        rid: request.rid.clone(),
+        dry: Some(false),
+        args: Map::from_iter(vec![(
+            "view".to_string(),
+            Value::String("progress".to_string()),
+        )]),
+    };
+    let progress = handle_monitor(&progress_request).await?.data;
+
+    Ok(CommandSuccess {
+        data: json!({
+            "agent_id": agent_id,
+            "steps": {
+                "doctor": doctor,
+                "status_before": status_before,
+                "claim_next": claim,
+                "agent": agent,
+                "progress": progress,
+            },
+        }),
+        next: "swarm monitor --view failures".to_string(),
+        state: minimal_state_for_request(request).await,
+    })
+}
+
+async fn handle_qa(
+    request: &ProtocolRequest,
+) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
+    let target = request
+        .args
+        .get("target")
+        .and_then(Value::as_str)
+        .map_or("smoke", |value| value);
+    let agent_id = request
+        .args
+        .get("id")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .map_or(1_u32, |value| value);
+
+    if target != "smoke" {
+        return Err(Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::INVALID.to_string(),
+                format!("Unknown qa target: {target}"),
+            )
+            .with_fix("Use `swarm qa --target smoke`".to_string())
+            .with_ctx(json!({"target": target})),
+        ));
+    }
+
+    if dry_flag(request) {
+        return Ok(dry_run_success(
+            request,
+            vec![
+                json!({"step": 1, "action": "doctor"}),
+                json!({"step": 2, "action": "state"}),
+                json!({"step": 3, "action": "status"}),
+                json!({"step": 4, "action": "agent", "target": agent_id, "dry": true}),
+                json!({"step": 5, "action": "monitor", "target": "progress"}),
+                json!({"step": 6, "action": "monitor", "target": "failures"}),
+            ],
+            "swarm status",
+        ));
+    }
+
+    let doctor = handle_doctor(request).await?.data;
+    let state = handle_state(request).await?.data;
+    let status = handle_status(request).await?.data;
+
+    let agent_dry_request = ProtocolRequest {
+        cmd: "agent".to_string(),
+        rid: request.rid.clone(),
+        dry: Some(true),
+        args: Map::from_iter(vec![("id".to_string(), Value::from(agent_id))]),
+    };
+    let agent_dry = handle_agent(&agent_dry_request).await?.data;
+
+    let progress_request = ProtocolRequest {
+        cmd: "monitor".to_string(),
+        rid: request.rid.clone(),
+        dry: Some(false),
+        args: Map::from_iter(vec![(
+            "view".to_string(),
+            Value::String("progress".to_string()),
+        )]),
+    };
+    let progress = handle_monitor(&progress_request).await?.data;
+
+    let failures_request = ProtocolRequest {
+        cmd: "monitor".to_string(),
+        rid: request.rid.clone(),
+        dry: Some(false),
+        args: Map::from_iter(vec![(
+            "view".to_string(),
+            Value::String("failures".to_string()),
+        )]),
+    };
+    let failures = handle_monitor(&failures_request).await?.data;
+
+    Ok(CommandSuccess {
+        data: json!({
+            "target": target,
+            "agent_id": agent_id,
+            "checks": {
+                "doctor": doctor,
+                "state": state,
+                "status": status,
+                "agent_dry": agent_dry,
+                "progress": progress,
+                "failures": failures,
+            },
+        }),
+        next: "swarm run-once --id <agent-id>".to_string(),
+        state: minimal_state_for_request(request).await,
+    })
+}
+
 async fn handle_state(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
     let db: SwarmDb = db_from_request(request).await?;
     let repo_id = repo_id_from_request(request);
+    let resource_limit = request
+        .args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map_or(25usize, |value| value as usize);
     let progress = db
         .get_progress(&repo_id)
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
-    let resources = db
-        .get_all_active_agents()
+    let all_resources = db
+        .get_active_agents(&repo_id)
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?
         .into_iter()
@@ -749,6 +1347,11 @@ async fn handle_state(
             },
         )
         .collect::<Vec<_>>();
+    let truncated = all_resources.len() > resource_limit;
+    let resources = all_resources
+        .into_iter()
+        .take(resource_limit)
+        .collect::<Vec<_>>();
 
     let config = match db.get_config(&repo_id).await {
         Ok(cfg) => json!({
@@ -763,7 +1366,10 @@ async fn handle_state(
     Ok(CommandSuccess {
         data: json!({
             "initialized": true,
+            "repo_id": repo_id.value(),
             "resources": resources,
+            "resources_total": progress.working + progress.waiting + progress.errors,
+            "resources_truncated": truncated,
             "health": {
                 "database": true,
                 "api": true,
@@ -1089,8 +1695,9 @@ async fn handle_monitor(
 
     let data = match view {
         "active" => {
+            let repo_id = repo_id_from_request(request);
             let rows = db
-                .get_all_active_agents()
+                .get_active_agents(&repo_id)
                 .await
                 .map_err(|e| to_protocol_failure(e, request.rid.clone()))?
                 .into_iter()
@@ -1098,7 +1705,7 @@ async fn handle_monitor(
                     json!({"repo": repo.value(), "agent_id": agent_id, "bead_id": bead_id, "status": status})
                 })
                 .collect::<Vec<_>>();
-            json!({"view": "active", "rows": rows})
+            json!({"view": "active", "repo_id": repo_id.value(), "rows": rows})
         }
         "progress" => {
             let repo_id = repo_id_from_request(request);
@@ -1106,6 +1713,7 @@ async fn handle_monitor(
                 .get_progress(&repo_id)
                 .await
                 .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
+            let beads_by_status = beads_by_status_summary(request.rid.clone()).await;
             json!({
                 "view": "progress",
                 "total": progress.total_agents,
@@ -1113,7 +1721,11 @@ async fn handle_monitor(
                 "idle": progress.idle,
                 "waiting": progress.waiting,
                 "done": progress.completed,
+                "closed": progress.completed,
                 "errors": progress.errors,
+                "error": progress.errors,
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "beads_by_status": beads_by_status,
             })
         }
         "failures" => {
@@ -1344,18 +1956,67 @@ async fn handle_status(
         .get_progress(&repo_id)
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
+    let beads_by_status = beads_by_status_summary(request.rid.clone()).await;
     Ok(CommandSuccess {
         data: json!({
             "working": progress.working,
             "idle": progress.idle,
             "waiting": progress.waiting,
             "done": progress.completed,
+            "closed": progress.completed,
             "errors": progress.errors,
+            "error": progress.errors,
             "total": progress.total_agents,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "beads_by_status": beads_by_status,
         }),
         next: "swarm monitor --view progress".to_string(),
         state: minimal_state_from_progress(&progress),
     })
+}
+
+async fn beads_by_status_summary(rid: Option<String>) -> Value {
+    let counts = run_external_json_command(
+        "br",
+        &["list", "--json"],
+        rid,
+        "Run `br list --json` manually and verify beads workspace is initialized",
+    )
+    .await
+    .ok()
+    .and_then(|payload| payload.as_array().cloned())
+    .map_or_else(
+        || {
+            BTreeMap::from([
+                ("open".to_string(), 0_u64),
+                ("in_progress".to_string(), 0_u64),
+                ("blocked".to_string(), 0_u64),
+                ("deferred".to_string(), 0_u64),
+                ("closed".to_string(), 0_u64),
+            ])
+        },
+        |rows| {
+            let mut by_status = BTreeMap::from([
+                ("open".to_string(), 0_u64),
+                ("in_progress".to_string(), 0_u64),
+                ("blocked".to_string(), 0_u64),
+                ("deferred".to_string(), 0_u64),
+                ("closed".to_string(), 0_u64),
+            ]);
+
+            for row in rows {
+                if let Some(status) = row.get("status").and_then(Value::as_str) {
+                    let current = by_status.get(status).copied().map_or(0_u64, |value| value);
+                    let next = current.saturating_add(1);
+                    by_status.insert(status.to_string(), next);
+                }
+            }
+
+            by_status
+        },
+    );
+
+    json!(counts)
 }
 
 async fn handle_resume(
@@ -1640,24 +2301,13 @@ async fn handle_release(
 async fn handle_init_db(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
-    let url = match request
-        .args
-        .get("url")
-        .and_then(Value::as_str)
-        .map(std::string::ToString::to_string)
-    {
-        Some(value) => value,
-        None => default_database_url_for_cli(),
-    };
-    let schema = match request
+    let url = resolve_database_url_for_init(request).await?;
+    let schema = request
         .args
         .get("schema")
         .and_then(Value::as_str)
         .map(PathBuf::from)
-    {
-        Some(value) => value,
-        None => PathBuf::from(CANONICAL_COORDINATOR_SCHEMA_PATH),
-    };
+        .map(|value| value.display().to_string());
     let seed_agents = request
         .args
         .get("seed_agents")
@@ -1669,26 +2319,14 @@ async fn handle_init_db(
             request,
             vec![
                 json!({"step": 1, "action": "connect_db", "target": mask_database_url(&url)}),
-                json!({"step": 2, "action": "apply_schema", "target": schema.display().to_string()}),
+                json!({"step": 2, "action": "apply_schema", "target": schema.clone().unwrap_or_else(|| EMBEDDED_COORDINATOR_SCHEMA_REF.to_string())}),
                 json!({"step": 3, "action": "seed_agents", "target": seed_agents}),
             ],
             "swarm state",
         ));
     }
 
-    let schema_sql = fs::read_to_string(&schema).await.map_err(|err| {
-        Box::new(
-            ProtocolEnvelope::error(
-                request.rid.clone(),
-                code::INVALID.to_string(),
-                format!("Failed to read schema: {err}"),
-            )
-            .with_fix(format!(
-                "swarm init-db --schema {CANONICAL_COORDINATOR_SCHEMA_PATH}"
-            ))
-            .with_ctx(json!({"schema": schema.display().to_string()})),
-        )
-    })?;
+    let (schema_sql, schema_ref) = load_schema_sql(request.rid.clone(), schema.as_deref()).await?;
     let db: SwarmDb = SwarmDb::new(&url)
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
@@ -1705,7 +2343,7 @@ async fn handle_init_db(
     Ok(CommandSuccess {
         data: json!({
             "database_url": mask_database_url(&url),
-            "schema": schema.display().to_string(),
+            "schema": schema_ref,
             "seed_agents": seed_agents
         }),
         next: "swarm state".to_string(),
@@ -1740,15 +2378,12 @@ async fn handle_init_local_db(
         .and_then(Value::as_str)
         .map_or("shitty_swarm_manager_db", |value| value)
         .to_string();
-    let schema = match request
+    let schema = request
         .args
         .get("schema")
         .and_then(Value::as_str)
         .map(PathBuf::from)
-    {
-        Some(value) => value,
-        None => PathBuf::from(CANONICAL_COORDINATOR_SCHEMA_PATH),
-    };
+        .map(|value| value.display().to_string());
     let seed_agents = request
         .args
         .get("seed_agents")
@@ -1760,7 +2395,7 @@ async fn handle_init_local_db(
             request,
             vec![
                 json!({"step": 1, "action": "docker_start_or_run", "target": container_name.clone()}),
-                json!({"step": 2, "action": "init_db", "target": schema.display().to_string()}),
+                json!({"step": 2, "action": "init_db", "target": schema.clone().unwrap_or_else(|| EMBEDDED_COORDINATOR_SCHEMA_REF.to_string())}),
             ],
             "swarm state",
         ));
@@ -1822,18 +2457,19 @@ async fn handle_init_local_db(
     };
     let _ = handle_bootstrap(&bootstrap_request).await?;
 
+    let mut init_args = Map::from_iter(vec![
+        ("url".to_string(), Value::String(url.clone())),
+        ("seed_agents".to_string(), Value::from(seed_agents)),
+    ]);
+    if let Some(schema_value) = schema {
+        init_args.insert("schema".to_string(), Value::String(schema_value));
+    }
+
     let init_request = ProtocolRequest {
         cmd: "init-db".to_string(),
         rid: request.rid.clone(),
         dry: Some(false),
-        args: Map::from_iter(vec![
-            ("url".to_string(), Value::String(url.clone())),
-            (
-                "schema".to_string(),
-                Value::String(schema.display().to_string()),
-            ),
-            ("seed_agents".to_string(), Value::from(seed_agents)),
-        ]),
+        args: init_args,
     };
     let _ = handle_init_db(&init_request).await?;
 
@@ -2276,31 +2912,23 @@ async fn handle_init(
         .get("seed_agents")
         .and_then(Value::as_u64)
         .map_or(12, |value| value) as u32;
-    let db_url = match request
+    let db_url = request
         .args
         .get("database_url")
         .and_then(Value::as_str)
-        .map(std::string::ToString::to_string)
-    {
-        Some(value) => value,
-        None => default_database_url_for_cli(),
-    };
-    let schema = match request
+        .map(std::string::ToString::to_string);
+    let schema = request
         .args
         .get("schema")
         .and_then(Value::as_str)
-        .map(PathBuf::from)
-    {
-        Some(value) => value,
-        None => PathBuf::from(CANONICAL_COORDINATOR_SCHEMA_PATH),
-    };
+        .map(std::string::ToString::to_string);
 
     if dry_flag(request) {
         return Ok(dry_run_success(
             request,
             vec![
                 json!({"step": 1, "action": "bootstrap", "target": "repository"}),
-                json!({"step": 2, "action": "init_db", "target": mask_database_url(&db_url)}),
+                json!({"step": 2, "action": "init_db", "target": db_url.as_ref().map_or_else(|| "auto-discover".to_string(), |url| mask_database_url(url))}),
                 json!({"step": 3, "action": "register", "target": seed_agents}),
             ],
             "swarm doctor",
@@ -2326,14 +2954,17 @@ async fn handle_init(
         cmd: "init-db".to_string(),
         rid: request.rid.clone(),
         dry: Some(false),
-        args: Map::from_iter(vec![
-            ("url".to_string(), Value::String(db_url.clone())),
-            (
-                "schema".to_string(),
-                Value::String(schema.display().to_string()),
-            ),
-            ("seed_agents".to_string(), Value::from(seed_agents)),
-        ]),
+        args: {
+            let mut args =
+                Map::from_iter(vec![("seed_agents".to_string(), Value::from(seed_agents))]);
+            if let Some(url) = db_url.clone() {
+                args.insert("url".to_string(), Value::String(url));
+            }
+            if let Some(schema_value) = schema.clone() {
+                args.insert("schema".to_string(), Value::String(schema_value));
+            }
+            args
+        },
     };
     match handle_init_db(&init_db_request).await {
         Ok(success) => {
@@ -2365,7 +2996,7 @@ async fn handle_init(
             data: json!({
                 "initialized": true,
                 "steps": steps,
-                "database_url": mask_database_url(&db_url),
+                "database_url": db_url.as_ref().map_or_else(|| "auto-discover".to_string(), |url| mask_database_url(url)),
                 "seed_agents": seed_agents,
             }),
             next: "swarm doctor".to_string(),
@@ -2420,6 +3051,49 @@ async fn db_from_request(
     SwarmDb::new(&database_url)
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))
+}
+
+async fn resolve_database_url_for_init(
+    request: &ProtocolRequest,
+) -> std::result::Result<String, Box<ProtocolEnvelope>> {
+    if let Some(url) = request
+        .args
+        .get("url")
+        .and_then(Value::as_str)
+        .map(std::string::ToString::to_string)
+    {
+        return Ok(url);
+    }
+
+    if let Some(url) = request
+        .args
+        .get("database_url")
+        .and_then(Value::as_str)
+        .map(std::string::ToString::to_string)
+    {
+        return Ok(url);
+    }
+
+    let candidates = database_url_candidates_for_cli();
+    let (connected, failures) = try_connect_candidates(&candidates).await;
+    if let Some((_db, connected_url)) = connected {
+        return Ok(connected_url);
+    }
+
+    let masked: Vec<String> = candidates
+        .iter()
+        .map(|candidate| mask_database_url(candidate))
+        .collect();
+
+    Err(Box::new(
+        ProtocolEnvelope::error(
+            request.rid.clone(),
+            code::INTERNAL.to_string(),
+            "Unable to resolve a reachable database URL for init-db".to_string(),
+        )
+        .with_fix("Pass --url <database_url> or run 'swarm init-local-db'".to_string())
+        .with_ctx(json!({"tried": masked, "errors": failures})),
+    ))
 }
 
 async fn connect_using_candidates(
@@ -2621,6 +3295,34 @@ fn now_ms() -> i64 {
 
 fn dry_flag(request: &ProtocolRequest) -> bool {
     request.dry.is_some_and(|value| value)
+}
+
+async fn load_schema_sql(
+    rid: Option<String>,
+    schema: Option<&str>,
+) -> std::result::Result<(String, String), Box<ProtocolEnvelope>> {
+    match schema {
+        Some(path) => fs::read_to_string(path)
+            .await
+            .map(|sql| (sql, path.to_string()))
+            .map_err(|err| {
+                Box::new(
+                    ProtocolEnvelope::error(
+                        rid,
+                        code::INVALID.to_string(),
+                        format!("Failed to read schema: {err}"),
+                    )
+                    .with_fix(format!(
+                        "Run from swarm repo root or pass --schema <path> (canonical: {CANONICAL_COORDINATOR_SCHEMA_PATH})"
+                    ))
+                    .with_ctx(json!({"schema": path})),
+                )
+            }),
+        None => Ok((
+            EMBEDDED_COORDINATOR_SCHEMA_SQL.to_string(),
+            EMBEDDED_COORDINATOR_SCHEMA_REF.to_string(),
+        )),
+    }
 }
 
 fn repo_id_from_request(request: &ProtocolRequest) -> RepoId {

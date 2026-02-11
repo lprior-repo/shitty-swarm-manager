@@ -220,9 +220,92 @@ impl SwarmDb {
     ///
     /// Returns `SwarmError::DatabaseError` if the database operation fails.
     pub async fn claim_bead(&self, agent_id: &AgentId, bead_id: &BeadId) -> Result<bool> {
-        self.claim_next_bead(agent_id)
+        let mut tx = self
+            .pool()
+            .begin()
             .await
-            .map(|claimed| claimed.as_ref().map(BeadId::value) == Some(bead_id.value()))
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to begin tx: {e}")))?;
+
+        let conn = tx
+            .acquire()
+            .await
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to acquire tx conn: {e}")))?;
+
+        let already_claimed = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM bead_claims
+                 WHERE repo_id = $1
+                   AND bead_id = $2
+                   AND status = 'in_progress'
+             )",
+        )
+        .bind(agent_id.repo_id().value())
+        .bind(bead_id.value())
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to inspect bead claims: {e}")))?;
+
+        if already_claimed {
+            tx.rollback()
+                .await
+                .map_err(|e| SwarmError::DatabaseError(format!("Failed to rollback tx: {e}")))?;
+            return Ok(false);
+        }
+
+        sqlx::query(
+            "INSERT INTO bead_backlog (repo_id, bead_id, priority, status)
+             VALUES ($1, $2, 'p0', 'in_progress')
+             ON CONFLICT (repo_id, bead_id)
+             DO UPDATE SET status = 'in_progress'",
+        )
+        .bind(agent_id.repo_id().value())
+        .bind(bead_id.value())
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to update backlog bead: {e}")))?;
+
+        let claim_insert = sqlx::query(
+            "INSERT INTO bead_claims (repo_id, bead_id, claimed_by, status, heartbeat_at, lease_expires_at)
+             VALUES ($1, $2, $3, 'in_progress', NOW(), NOW() + INTERVAL '5 minutes')
+             ON CONFLICT (repo_id, bead_id) DO NOTHING",
+        )
+        .bind(agent_id.repo_id().value())
+        .bind(bead_id.value())
+        .bind(agent_id.number().cast_signed())
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to claim bead: {e}")))?;
+
+        if claim_insert.rows_affected() != 1 {
+            tx.rollback()
+                .await
+                .map_err(|e| SwarmError::DatabaseError(format!("Failed to rollback tx: {e}")))?;
+            return Ok(false);
+        }
+
+        sqlx::query(
+            "UPDATE agent_state
+             SET bead_id = $3,
+                 current_stage = 'rust-contract',
+                 stage_started_at = NOW(),
+                 status = 'working',
+                 last_update = NOW()
+             WHERE repo_id = $1
+               AND agent_id = $2",
+        )
+        .bind(agent_id.repo_id().value())
+        .bind(agent_id.number().cast_signed())
+        .bind(bead_id.value())
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to update agent state: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to commit tx: {e}")))?;
+
+        Ok(true)
     }
 
     /// Refreshes lease ownership for an active bead claim.
