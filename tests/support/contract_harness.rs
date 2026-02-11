@@ -54,6 +54,7 @@ pub fn assert_protocol_envelope(output: &Value) -> Result<(), String> {
     }
 }
 
+#[allow(dead_code)]
 pub fn assert_contract_test_is_decoupled(relative_path: &str) -> Result<(), String> {
     let source = read_contract_test_source(relative_path)?;
     let forbidden = [
@@ -93,6 +94,7 @@ pub fn assert_contract_test_is_decoupled(relative_path: &str) -> Result<(), Stri
         })
 }
 
+#[allow(dead_code)]
 fn read_contract_test_source(relative_path: &str) -> Result<String, String> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(relative_path);
     std::fs::read_to_string(&path).map_err(|err| {

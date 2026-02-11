@@ -657,21 +657,42 @@ where
 
 fn parse_optional_arg<T>(args: &[String], name: &str) -> Result<Option<T>, CliError>
 where
-    T: std::str::FromStr,
+    T: std::str::FromStr + 'static,
     T::Err: std::fmt::Display,
 {
     let flag = format!("--{}", name.replace('_', "-"));
-    args.iter()
-        .position(|a| a.as_str() == flag)
-        .and_then(|i| args.get(i + 1))
-        .map(|v| {
-            v.parse::<T>().map_err(|e| CliError::InvalidArgValue {
-                arg_name: name.to_string(),
-                value: format!("{e}"),
-                expected: std::any::type_name::<T>().to_string(),
-            })
-        })
-        .transpose()
+    let position = args.iter().position(|a| a.as_str() == flag);
+
+    match position {
+        None => Ok(None),
+        Some(i) => {
+            let maybe_value = args.get(i + 1);
+            let treat_as_boolean_flag = std::any::TypeId::of::<T>()
+                == std::any::TypeId::of::<bool>()
+                && maybe_value.is_none_or(|v| v.starts_with("--"));
+
+            if treat_as_boolean_flag {
+                return "true"
+                    .parse::<T>()
+                    .map(Some)
+                    .map_err(|e| CliError::InvalidArgValue {
+                        arg_name: name.to_string(),
+                        value: format!("{e}"),
+                        expected: std::any::type_name::<T>().to_string(),
+                    });
+            }
+
+            maybe_value
+                .map(|v| {
+                    v.parse::<T>().map_err(|e| CliError::InvalidArgValue {
+                        arg_name: name.to_string(),
+                        value: format!("{e}"),
+                        expected: std::any::type_name::<T>().to_string(),
+                    })
+                })
+                .transpose()
+        }
+    }
 }
 
 fn suggest_commands(typo: &str) -> Vec<String> {

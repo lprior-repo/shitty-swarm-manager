@@ -190,8 +190,8 @@ async fn execute_implement_stage(
     agent_id: &AgentId,
     db: &SwarmDb,
 ) -> Result<SkillOutput> {
-    let maybe_contract_artifact = db
-        .get_first_bead_artifact_by_type(bead_id, ArtifactType::ContractDocument)
+     let maybe_contract_artifact = db
+        .get_first_bead_artifact_by_type(agent_id.repo_id(), bead_id, ArtifactType::ContractDocument)
         .await?;
 
     let contract_context = match maybe_contract_artifact {
@@ -206,12 +206,11 @@ async fn execute_implement_stage(
     let previous_attempts = db
         .get_agent_state(agent_id)
         .await?
-        .map(|state| state.implementation_attempt)
-        .unwrap_or(0);
+        .map_or(0, |state| state.implementation_attempt);
 
     let retry_packet_context = if previous_attempts > 0 {
         match db
-            .get_latest_bead_artifact_by_type(bead_id, ArtifactType::RetryPacket)
+            .get_latest_bead_artifact_by_type(agent_id.repo_id(), bead_id, ArtifactType::RetryPacket)
             .await?
         {
             Some(artifact) => Some(format_retry_packet(&artifact.content)),
@@ -227,26 +226,38 @@ async fn execute_implement_stage(
     };
 
     let failure_details = db
-        .get_latest_bead_artifact_by_type(bead_id, ArtifactType::FailureDetails)
+        .get_latest_bead_artifact_by_type(agent_id.repo_id(), bead_id, ArtifactType::FailureDetails)
         .await?
         .map(|artifact| artifact.content);
 
     let test_output = db
-        .get_latest_bead_artifact_by_type(bead_id, ArtifactType::TestOutput)
+        .get_latest_bead_artifact_by_type(agent_id.repo_id(), bead_id, ArtifactType::TestOutput)
         .await?
         .map(|artifact| artifact.content);
 
     let test_results = db
-        .get_latest_bead_artifact_by_type(bead_id, ArtifactType::TestResults)
+        .get_latest_bead_artifact_by_type(agent_id.repo_id(), bead_id, ArtifactType::TestResults)
         .await?
         .map(|artifact| artifact.content);
 
     let mut context_sections = Vec::new();
     context_sections.push(format!("## Contract Document\n{}", contract_context.trim()));
-    append_section(&mut context_sections, "Retry Packet", &retry_packet_context);
-    append_section(&mut context_sections, "Failure Details", &failure_details);
-    append_section(&mut context_sections, "Test Results", &test_results);
-    append_section(&mut context_sections, "Test Output", &test_output);
+    append_section(
+        &mut context_sections,
+        "Retry Packet",
+        retry_packet_context.as_deref(),
+    );
+    append_section(
+        &mut context_sections,
+        "Failure Details",
+        failure_details.as_deref(),
+    );
+    append_section(
+        &mut context_sections,
+        "Test Results",
+        test_results.as_deref(),
+    );
+    append_section(&mut context_sections, "Test Output", test_output.as_deref());
 
     let aggregated_context = context_sections.join("\n\n");
 
@@ -282,7 +293,7 @@ async fn execute_qa_stage(
     cache: Option<&GateExecutionCache>,
 ) -> Result<SkillOutput> {
     if !db
-        .bead_has_artifact_type(bead_id, ArtifactType::ImplementationCode)
+        .bead_has_artifact_type(agent_id.repo_id(), bead_id, ArtifactType::ImplementationCode)
         .await?
     {
         return Ok(failure_output(
@@ -317,7 +328,7 @@ async fn execute_red_queen_stage(
     cache: Option<&GateExecutionCache>,
 ) -> Result<SkillOutput> {
     if !db
-        .bead_has_artifact_type(bead_id, ArtifactType::TestResults)
+        .bead_has_artifact_type(agent_id.repo_id(), bead_id, ArtifactType::TestResults)
         .await?
     {
         return Ok(failure_output(
@@ -342,7 +353,7 @@ async fn execute_red_queen_stage(
     Ok(output)
 }
 
-fn append_section(sections: &mut Vec<String>, title: &str, content: &Option<String>) {
+fn append_section(sections: &mut Vec<String>, title: &str, content: Option<&str>) {
     if let Some(body) = content {
         let trimmed = body.trim();
         if !trimmed.is_empty() {
@@ -352,31 +363,49 @@ fn append_section(sections: &mut Vec<String>, title: &str, content: &Option<Stri
 }
 
 fn format_retry_packet(payload: &str) -> String {
-    match serde_json::from_str::<Value>(payload) {
-        Ok(value) => match serde_json::to_string_pretty(&value) {
-            Ok(pretty) => pretty,
-            Err(_) => payload.to_string(),
-        },
-        Err(_) => payload.to_string(),
-    }
+    serde_json::from_str::<Value>(payload).map_or_else(
+        |_| payload.to_string(),
+        |value| serde_json::to_string_pretty(&value).unwrap_or_else(|_| payload.to_string()),
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::error::SwarmError;
     use crate::stage_executors::execute_implement_stage;
-    use crate::types::{ArtifactType, BeadId};
+    use crate::types::{ArtifactType, BeadId, RepoId};
     use crate::{AgentId, SwarmDb};
     use sqlx::PgPool;
 
+    async fn setup_schema(db: &SwarmDb) {
+        db.initialize_schema_from_sql(include_str!("../crates/swarm-coordinator/schema.sql"))
+            .await
+            .expect("Failed to initialize schema");
+    }
+
+    async fn insert_started_stage_history(
+        pool: &PgPool,
+        bead_id: &BeadId,
+        agent_id: &AgentId,
+    ) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "INSERT INTO stage_history (agent_id, bead_id, stage, attempt_number, status, started_at)\n             VALUES ($1, $2, 'implement', 1, 'started', NOW())\n             RETURNING id",
+        )
+        .bind(agent_id.number().cast_signed())
+        .bind(bead_id.value())
+        .fetch_one(pool)
+        .await
+        .expect("Failed to insert stage history")
+    }
+
     #[sqlx::test]
     async fn test_implement_stage_loads_contract_only_for_first_attempt(pool: PgPool) {
-        let db = SwarmDb::new_with_pool(pool);
+        let db = SwarmDb::new_with_pool(pool.clone());
         let bead_id = BeadId::new("test-bead-1");
-        let agent_id = AgentId::new("local", 1);
+        let agent_id = AgentId::new(RepoId::new("local"), 1);
+        setup_schema(&db).await;
 
         // Store contract artifact
-        let stage_history_id = 123;
+        let stage_history_id = insert_started_stage_history(&pool, &bead_id, &agent_id).await;
         db.store_stage_artifact(
             stage_history_id,
             ArtifactType::ContractDocument,
@@ -387,35 +416,39 @@ mod tests {
         .expect("Failed to store contract");
 
         // Execute implement stage for attempt 1
-        let result = execute_implement_stage(&bead_id, &agent_id, &db, 1)
+        let result = execute_implement_stage(&bead_id, &agent_id, &db)
             .await
             .expect("execute_implement_stage should succeed");
 
         assert!(result.success);
         assert!(result.implementation_code.is_some());
 
-        // Verify consumed_context metadata includes only contract
-        if let Some(ref metadata) = result.metadata {
-            let consumed = metadata
-                .get("consumed_context")
-                .and_then(|v| v.as_array())
-                .expect("consumed_context should be an array");
-            assert_eq!(consumed.len(), 1);
-            assert_eq!(
-                consumed[0].get("artifact_type").unwrap().as_str(),
-                Some("contract_document")
-            );
-        }
+        let implementation = result
+            .implementation_code
+            .as_deref()
+            .expect("implementation code should exist");
+        assert!(implementation.contains("## Contract Document\ncontract content"));
+        assert!(!implementation.contains("## Retry Packet"));
+        assert!(!implementation.contains("## Test Output"));
     }
 
     #[sqlx::test]
     async fn test_implement_stage_loads_retry_context_for_attempt_two(pool: PgPool) {
-        let db = SwarmDb::new_with_pool(pool);
+        let db = SwarmDb::new_with_pool(pool.clone());
         let bead_id = BeadId::new("test-bead-2");
-        let agent_id = AgentId::new("local", 1);
+        let agent_id = AgentId::new(RepoId::new("local"), 1);
+        setup_schema(&db).await;
+
+        sqlx::query(
+            "INSERT INTO agent_state (agent_id, status, implementation_attempt) VALUES ($1, 'working', 1)",
+        )
+            .bind(agent_id.number().cast_signed())
+            .execute(&pool)
+            .await
+            .expect("Failed to seed implementation attempt");
 
         // Store contract artifact
-        let stage_history_id = 123;
+        let stage_history_id = insert_started_stage_history(&pool, &bead_id, &agent_id).await;
         db.store_stage_artifact(
             stage_history_id,
             ArtifactType::ContractDocument,
@@ -446,46 +479,34 @@ mod tests {
         .expect("Failed to store test output");
 
         // Execute implement stage for attempt 2
-        let result = execute_implement_stage(&bead_id, &agent_id, &db, 2)
+        let result = execute_implement_stage(&bead_id, &agent_id, &db)
             .await
             .expect("execute_implement_stage should succeed");
 
         assert!(result.success);
         assert!(result.implementation_code.is_some());
 
-        // Verify consumed_context metadata includes contract, retry packet, and test output
-        if let Some(ref metadata) = result.metadata {
-            let consumed = metadata
-                .get("consumed_context")
-                .and_then(|v| v.as_array())
-                .expect("consumed_context should be an array");
-            assert_eq!(consumed.len(), 3);
-
-            let artifact_types: Vec<String> = consumed
-                .iter()
-                .filter_map(|v| {
-                    v.get("artifact_type")
-                        .and_then(|s| s.as_str())
-                        .map(|s| s.to_string())
-                })
-                .collect();
-
-            assert!(artifact_types.contains(&"contract_document".to_string()));
-            assert!(artifact_types.contains(&"retry_packet".to_string()));
-            assert!(artifact_types.contains(&"test_output".to_string()));
-        }
+        let implementation = result
+            .implementation_code
+            .as_deref()
+            .expect("implementation code should exist");
+        assert!(implementation.contains("## Contract Document\ncontract content"));
+        assert!(implementation.contains("## Retry Packet"));
+        assert!(implementation.contains("\"failure_reason\": \"test failed\""));
+        assert!(implementation.contains("## Test Output\ntest failure output"));
     }
 
     #[sqlx::test]
     async fn test_implement_stage_fails_without_contract(pool: PgPool) {
         let db = SwarmDb::new_with_pool(pool);
         let bead_id = BeadId::new("test-bead-3");
-        let agent_id = AgentId::new("local", 1);
+        let agent_id = AgentId::new(RepoId::new("local"), 1);
+        setup_schema(&db).await;
 
         // No contract artifact stored
 
         // Execute implement stage for attempt 1
-        let result = execute_implement_stage(&bead_id, &agent_id, &db, 1)
+        let result = execute_implement_stage(&bead_id, &agent_id, &db)
             .await
             .expect("execute_implement_stage should return error");
 

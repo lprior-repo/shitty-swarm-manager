@@ -1,4 +1,5 @@
 /// Classify a failure message into a normalized diagnostics category.
+#[must_use]
 pub fn classify_failure_category(message: &str) -> &'static str {
     let lowered = message.to_ascii_lowercase();
     if lowered.contains("timeout") {
@@ -13,6 +14,7 @@ pub fn classify_failure_category(message: &str) -> &'static str {
 }
 
 /// Redact sensitive tokens (API keys, passwords, etc.) from a message.
+#[must_use]
 pub fn redact_sensitive(message: &str) -> String {
     message
         .split_whitespace()
@@ -21,6 +23,7 @@ pub fn redact_sensitive(message: &str) -> String {
         .join(" ")
 }
 
+#[must_use]
 fn redact_token(token: &str) -> String {
     token.split_once('=').map_or_else(
         || token.to_string(),

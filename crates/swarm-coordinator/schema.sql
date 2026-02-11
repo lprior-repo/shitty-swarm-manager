@@ -4,6 +4,18 @@
 
 BEGIN;
 
+-- Drop compatibility views before type/constraint upgrades so init-db stays idempotent
+-- even when previous schema versions already created views depending on these columns.
+DROP VIEW IF EXISTS v_resume_context CASCADE;
+DROP VIEW IF EXISTS beads CASCADE;
+DROP VIEW IF EXISTS v_available_agents CASCADE;
+DROP VIEW IF EXISTS v_unread_messages CASCADE;
+DROP VIEW IF EXISTS v_contract_artifacts CASCADE;
+DROP VIEW IF EXISTS v_bead_artifacts CASCADE;
+DROP VIEW IF EXISTS v_feedback_required CASCADE;
+DROP VIEW IF EXISTS v_swarm_progress CASCADE;
+DROP VIEW IF EXISTS v_active_agents CASCADE;
+
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 CREATE TABLE IF NOT EXISTS repos (
@@ -15,6 +27,7 @@ CREATE TABLE IF NOT EXISTS repos (
 );
 
 CREATE TABLE IF NOT EXISTS bead_backlog (
+    repo_id TEXT NOT NULL DEFAULT 'local',
     bead_id TEXT PRIMARY KEY,
     priority TEXT NOT NULL DEFAULT 'p0',
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'in_progress', 'completed', 'blocked')),
@@ -22,6 +35,7 @@ CREATE TABLE IF NOT EXISTS bead_backlog (
 );
 
 CREATE TABLE IF NOT EXISTS bead_claims (
+    repo_id TEXT NOT NULL DEFAULT 'local',
     bead_id TEXT PRIMARY KEY,
     claimed_by INTEGER NOT NULL CHECK (claimed_by >= 1),
     claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -32,6 +46,14 @@ CREATE TABLE IF NOT EXISTS bead_claims (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_bead_claims_bead_owner ON bead_claims(bead_id, claimed_by);
 
+ALTER TABLE bead_backlog ADD COLUMN IF NOT EXISTS repo_id TEXT NOT NULL DEFAULT 'local';
+ALTER TABLE bead_backlog ALTER COLUMN repo_id SET DEFAULT 'local';
+ALTER TABLE bead_backlog ALTER COLUMN repo_id SET NOT NULL;
+
+ALTER TABLE bead_claims ADD COLUMN IF NOT EXISTS repo_id TEXT NOT NULL DEFAULT 'local';
+ALTER TABLE bead_claims ALTER COLUMN repo_id SET DEFAULT 'local';
+ALTER TABLE bead_claims ALTER COLUMN repo_id SET NOT NULL;
+
 ALTER TABLE bead_claims ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 ALTER TABLE bead_claims ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '5 minutes');
 
@@ -39,21 +61,67 @@ ALTER TABLE bead_claims ALTER COLUMN claimed_by TYPE INTEGER;
 ALTER TABLE bead_claims DROP CONSTRAINT IF EXISTS bead_claims_claimed_by_check;
 ALTER TABLE bead_claims ADD CONSTRAINT bead_claims_claimed_by_check CHECK (claimed_by >= 1);
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bead_backlog_repo_bead_unique ON bead_backlog(repo_id, bead_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bead_claims_repo_bead_unique ON bead_claims(repo_id, bead_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bead_claims_repo_bead_owner_unique ON bead_claims(repo_id, bead_id, claimed_by);
+
 CREATE TABLE IF NOT EXISTS agent_state (
-    agent_id INTEGER PRIMARY KEY CHECK (agent_id >= 1),
+    repo_id TEXT NOT NULL DEFAULT 'local',
+    agent_id INTEGER NOT NULL CHECK (agent_id >= 1),
     bead_id TEXT,
     current_stage TEXT CHECK (current_stage IN ('rust-contract', 'implement', 'qa-enforcer', 'red-queen', 'done')),
     stage_started_at TIMESTAMPTZ,
     status TEXT NOT NULL DEFAULT 'idle' CHECK (status IN ('idle', 'working', 'waiting', 'error', 'done')),
     last_update TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     implementation_attempt INTEGER NOT NULL DEFAULT 0 CHECK (implementation_attempt >= 0),
-    feedback TEXT
+    feedback TEXT,
+    PRIMARY KEY (repo_id, agent_id)
 );
+
+ALTER TABLE agent_state ADD COLUMN IF NOT EXISTS repo_id TEXT NOT NULL DEFAULT 'local';
+ALTER TABLE agent_state ALTER COLUMN repo_id SET DEFAULT 'local';
+ALTER TABLE agent_state ALTER COLUMN repo_id SET NOT NULL;
 
 ALTER TABLE agent_state ALTER COLUMN agent_id TYPE INTEGER;
 ALTER TABLE agent_state DROP CONSTRAINT IF EXISTS agent_state_agent_id_check;
 ALTER TABLE agent_state ADD CONSTRAINT agent_state_agent_id_check CHECK (agent_id >= 1);
+
+-- Legacy schemas can lack repo-scoped uniqueness. Deduplicate and enforce
+-- uniqueness on (repo_id, agent_id).
+DELETE FROM agent_state a
+USING agent_state b
+WHERE a.repo_id = b.repo_id
+  AND a.agent_id = b.agent_id
+  AND a.ctid < b.ctid;
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'agent_state_pkey'
+          AND conrelid = 'agent_state'::regclass
+    ) THEN
+        ALTER TABLE agent_state DROP CONSTRAINT agent_state_pkey;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'agent_state_pkey'
+          AND conrelid = 'agent_state'::regclass
+    ) THEN
+        ALTER TABLE agent_state
+            ADD CONSTRAINT agent_state_pkey PRIMARY KEY (repo_id, agent_id);
+    END IF;
+END;
+$$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_state_repo_agent_unique ON agent_state(repo_id, agent_id);
+DROP INDEX IF EXISTS idx_agent_state_agent_id_unique;
+
 ALTER TABLE agent_state DROP CONSTRAINT IF EXISTS agent_state_bead_id_fkey;
+ALTER TABLE agent_state DROP CONSTRAINT IF EXISTS agent_state_bead_claim_owner_fkey;
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -63,8 +131,8 @@ BEGIN
     ) THEN
         ALTER TABLE agent_state
             ADD CONSTRAINT agent_state_bead_claim_owner_fkey
-            FOREIGN KEY (bead_id, agent_id)
-            REFERENCES bead_claims(bead_id, claimed_by)
+            FOREIGN KEY (repo_id, bead_id, agent_id)
+            REFERENCES bead_claims(repo_id, bead_id, claimed_by)
             DEFERRABLE INITIALLY IMMEDIATE;
     END IF;
 END;
@@ -226,10 +294,15 @@ VALUES (TRUE)
 ON CONFLICT (id) DO NOTHING;
 
 CREATE INDEX IF NOT EXISTS idx_bead_backlog_claim ON bead_backlog(status, priority, created_at);
+CREATE INDEX IF NOT EXISTS idx_bead_backlog_repo_claim ON bead_backlog(repo_id, status, priority, created_at);
 CREATE INDEX IF NOT EXISTS idx_bead_claims_status ON bead_claims(status, claimed_at);
+CREATE INDEX IF NOT EXISTS idx_bead_claims_repo_status ON bead_claims(repo_id, status, claimed_at);
 CREATE INDEX IF NOT EXISTS idx_bead_claims_lease_expires ON bead_claims(lease_expires_at)
 WHERE status = 'in_progress';
+CREATE INDEX IF NOT EXISTS idx_bead_claims_repo_lease_expires ON bead_claims(repo_id, lease_expires_at)
+WHERE status = 'in_progress';
 CREATE INDEX IF NOT EXISTS idx_agent_state_status ON agent_state(status, last_update DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_state_repo_status ON agent_state(repo_id, status, last_update DESC);
 CREATE INDEX IF NOT EXISTS idx_stage_history_lookup ON stage_history(bead_id, stage, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_stage_history_bead_id ON stage_history(bead_id, id);
 CREATE INDEX IF NOT EXISTS idx_stage_history_failed ON stage_history(status, completed_at DESC);
@@ -264,31 +337,34 @@ BEFORE UPDATE ON agent_state
 FOR EACH ROW
 EXECUTE FUNCTION set_agent_last_update();
 
-CREATE OR REPLACE FUNCTION recover_expired_bead_claims()
+CREATE OR REPLACE FUNCTION recover_expired_bead_claims(p_repo_id TEXT)
 RETURNS INTEGER AS $$
 DECLARE
     v_recovered_count INTEGER := 0;
 BEGIN
     WITH expired_claims AS (
-        SELECT bead_id, claimed_by
+        SELECT repo_id, bead_id, claimed_by
         FROM bead_claims
-        WHERE status = 'in_progress'
+        WHERE repo_id = p_repo_id
+          AND status = 'in_progress'
           AND lease_expires_at <= NOW()
         FOR UPDATE SKIP LOCKED
     ),
     cleared_claims AS (
         DELETE FROM bead_claims bc
         USING expired_claims ec
-        WHERE bc.bead_id = ec.bead_id
-        RETURNING ec.bead_id, ec.claimed_by
+        WHERE bc.repo_id = ec.repo_id
+          AND bc.bead_id = ec.bead_id
+        RETURNING ec.repo_id, ec.bead_id, ec.claimed_by
     ),
     reset_backlog AS (
         UPDATE bead_backlog bb
         SET status = 'pending'
         FROM cleared_claims cc
-        WHERE bb.bead_id = cc.bead_id
+        WHERE bb.repo_id = cc.repo_id
+          AND bb.bead_id = cc.bead_id
           AND bb.status = 'in_progress'
-        RETURNING bb.bead_id
+        RETURNING bb.repo_id, bb.bead_id
     ),
     reset_agents AS (
         UPDATE agent_state a
@@ -299,9 +375,10 @@ BEGIN
             feedback = NULL,
             implementation_attempt = 0
         FROM cleared_claims cc
-        WHERE a.agent_id = cc.claimed_by
+        WHERE a.repo_id = cc.repo_id
+          AND a.agent_id = cc.claimed_by
           AND a.bead_id = cc.bead_id
-        RETURNING a.agent_id
+        RETURNING a.repo_id, a.agent_id
     )
     SELECT COUNT(*) INTO v_recovered_count
     FROM cleared_claims;
@@ -310,7 +387,15 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION recover_expired_bead_claims()
+RETURNS INTEGER AS $$
+BEGIN
+    RETURN recover_expired_bead_claims('local');
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION heartbeat_bead_claim(
+    p_repo_id TEXT,
     p_agent_id INTEGER,
     p_bead_id TEXT,
     p_lease_extension_ms INTEGER DEFAULT 300000
@@ -322,25 +407,40 @@ BEGIN
     SET heartbeat_at = GREATEST(heartbeat_at, NOW()),
         lease_expires_at = GREATEST(lease_expires_at, NOW())
             + (p_lease_extension_ms * INTERVAL '1 millisecond')
-    WHERE bead_id = p_bead_id
+    WHERE repo_id = p_repo_id
+      AND bead_id = p_bead_id
       AND claimed_by = p_agent_id
       AND status = 'in_progress'
     RETURNING 1 INTO v_updated;
 
-    RETURN v_updated = 1;
+    RETURN COALESCE(v_updated, 0) = 1;
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION claim_next_p0_bead(p_agent_id INTEGER)
+CREATE OR REPLACE FUNCTION heartbeat_bead_claim(
+    p_agent_id INTEGER,
+    p_bead_id TEXT,
+    p_lease_extension_ms INTEGER DEFAULT 300000
+) RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN heartbeat_bead_claim('local', p_agent_id, p_bead_id, p_lease_extension_ms);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION claim_next_p0_bead(
+    p_repo_id TEXT,
+    p_agent_id INTEGER
+)
 RETURNS TEXT AS $$
 DECLARE
     v_bead_id TEXT;
 BEGIN
-    PERFORM recover_expired_bead_claims();
+    PERFORM recover_expired_bead_claims(p_repo_id);
 
     SELECT bead_id INTO v_bead_id
     FROM bead_claims
-    WHERE status = 'in_progress'
+    WHERE repo_id = p_repo_id
+      AND status = 'in_progress'
       AND claimed_by = p_agent_id
       AND lease_expires_at > NOW()
     ORDER BY claimed_at ASC
@@ -353,14 +453,17 @@ BEGIN
             current_stage = 'rust-contract',
             stage_started_at = NOW(),
             status = 'working'
-        WHERE agent_id = p_agent_id;
+        WHERE repo_id = p_repo_id
+          AND agent_id = p_agent_id;
 
         RETURN v_bead_id;
     END IF;
 
     SELECT bead_id INTO v_bead_id
     FROM bead_backlog
-    WHERE status = 'pending' AND priority = 'p0'
+    WHERE repo_id = p_repo_id
+      AND status = 'pending'
+      AND priority = 'p0'
     ORDER BY created_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1;
@@ -371,20 +474,29 @@ BEGIN
 
     UPDATE bead_backlog
     SET status = 'in_progress'
-    WHERE bead_id = v_bead_id;
+    WHERE repo_id = p_repo_id
+      AND bead_id = v_bead_id;
 
-    INSERT INTO bead_claims (bead_id, claimed_by, status, heartbeat_at, lease_expires_at)
-    VALUES (v_bead_id, p_agent_id, 'in_progress', NOW(), NOW() + INTERVAL '5 minutes')
-    ON CONFLICT (bead_id) DO NOTHING;
+    INSERT INTO bead_claims (repo_id, bead_id, claimed_by, status, heartbeat_at, lease_expires_at)
+    VALUES (p_repo_id, v_bead_id, p_agent_id, 'in_progress', NOW(), NOW() + INTERVAL '5 minutes')
+    ON CONFLICT (repo_id, bead_id) DO NOTHING;
 
     UPDATE agent_state
     SET bead_id = v_bead_id,
         current_stage = 'rust-contract',
         stage_started_at = NOW(),
         status = 'working'
-    WHERE agent_id = p_agent_id;
+    WHERE repo_id = p_repo_id
+      AND agent_id = p_agent_id;
 
     RETURN v_bead_id;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION claim_next_p0_bead(p_agent_id INTEGER)
+RETURNS TEXT AS $$
+BEGIN
+    RETURN claim_next_p0_bead('local', p_agent_id);
 END;
 $$ LANGUAGE plpgsql;
 
@@ -523,6 +635,7 @@ $$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE VIEW v_active_agents AS
 SELECT
+    a.repo_id,
     a.agent_id,
     a.bead_id,
     a.current_stage,
@@ -536,28 +649,47 @@ WHERE a.status IN ('working', 'waiting', 'error');
 
 CREATE OR REPLACE VIEW v_swarm_progress AS
 SELECT
+    a.repo_id,
     COUNT(*) FILTER (WHERE status = 'done') AS done_agents,
     COUNT(*) FILTER (WHERE status = 'working') AS working_agents,
     COUNT(*) FILTER (WHERE status = 'waiting') AS waiting_agents,
     COUNT(*) FILTER (WHERE status = 'error') AS error_agents,
     COUNT(*) FILTER (WHERE status = 'idle') AS idle_agents,
     COUNT(*) AS total_agents,
-    (SELECT COUNT(*) FROM bead_claims WHERE status = 'completed') AS completed_beads,
-    (SELECT COUNT(*) FROM bead_claims WHERE status = 'in_progress') AS in_progress_beads,
-    (SELECT COUNT(*) FROM bead_claims WHERE status = 'blocked') AS blocked_beads
-FROM agent_state;
+    (
+        SELECT COUNT(*)
+        FROM bead_claims bc
+        WHERE bc.repo_id = a.repo_id
+          AND bc.status = 'completed'
+    ) AS completed_beads,
+    (
+        SELECT COUNT(*)
+        FROM bead_claims bc
+        WHERE bc.repo_id = a.repo_id
+          AND bc.status = 'in_progress'
+    ) AS in_progress_beads,
+    (
+        SELECT COUNT(*)
+        FROM bead_claims bc
+        WHERE bc.repo_id = a.repo_id
+          AND bc.status = 'blocked'
+    ) AS blocked_beads
+FROM agent_state a
+GROUP BY a.repo_id;
 
 CREATE OR REPLACE VIEW v_feedback_required AS
-SELECT DISTINCT ON (bead_id, stage)
-    bead_id,
-    agent_id,
-    stage,
-    attempt_number,
-    feedback,
-    completed_at
-FROM stage_history
-WHERE status IN ('failed', 'error')
-ORDER BY bead_id, stage, completed_at DESC;
+SELECT DISTINCT ON (bc.repo_id, sh.bead_id, sh.stage)
+    bc.repo_id,
+    sh.bead_id,
+    sh.agent_id,
+    sh.stage,
+    sh.attempt_number,
+    sh.feedback,
+    sh.completed_at
+FROM stage_history sh
+JOIN bead_claims bc ON bc.bead_id = sh.bead_id
+WHERE sh.status IN ('failed', 'error')
+ORDER BY bc.repo_id, sh.bead_id, sh.stage, sh.completed_at DESC;
 
 CREATE OR REPLACE VIEW v_bead_artifacts AS
 SELECT
@@ -604,6 +736,7 @@ ORDER BY am.created_at ASC;
 
 CREATE OR REPLACE VIEW v_available_agents AS
 SELECT
+    a.repo_id,
     a.agent_id,
     a.status,
     a.implementation_attempt,
@@ -617,6 +750,7 @@ WHERE a.status = 'idle'
 -- Compatibility view for agent prompts that reference `beads` directly.
 CREATE OR REPLACE VIEW beads AS
 SELECT
+    b.repo_id,
     b.bead_id,
     b.bead_id AS id,
     b.priority,
@@ -626,6 +760,7 @@ FROM bead_backlog b;
 
 CREATE OR REPLACE VIEW v_resume_context AS
 SELECT
+    a.repo_id,
     a.agent_id,
     a.bead_id,
     a.current_stage,

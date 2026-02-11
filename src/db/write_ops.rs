@@ -1,12 +1,12 @@
-use crate::db::{mappers::to_u32_i32, SwarmDb};
+use crate::db::SwarmDb;
 use crate::ddd::{
     runtime_determine_transition_decision, validate_completion_implies_push_confirmed,
     RuntimeStage, RuntimeStageResult, RuntimeStageTransition,
 };
 use crate::error::{Result, SwarmError};
 use crate::types::{
-    AgentId, ArtifactType, BeadId, EventSchemaVersion, MessageType, RepoId, Stage, StageArtifact,
-    StageResult, SwarmStatus,
+    AgentId, ArtifactType, BeadId, EventSchemaVersion, MessageType, RepoId, Stage, StageResult,
+    SwarmStatus,
 };
 use crate::BrSyncStatus;
 use chrono::{DateTime, Utc};
@@ -14,9 +14,13 @@ use serde_json::json;
 use sqlx::Acquire;
 use std::collections::HashSet;
 use std::convert::TryFrom;
-use std::future::Future;
-use std::pin::Pin;
 use tracing::{debug, info};
+
+const CONTEXT_ARTIFACT_TYPES: [ArtifactType; 3] = [
+    ArtifactType::ImplementationCode,
+    ArtifactType::TestResults,
+    ArtifactType::TestOutput,
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StageTransition {
@@ -24,6 +28,16 @@ enum StageTransition {
     Advance(Stage),
     RetryImplement,
     NoOp,
+}
+
+struct StageTransitionInput<'a> {
+    transition: &'a StageTransition,
+    agent_id: &'a AgentId,
+    bead_id: &'a BeadId,
+    stage: Stage,
+    stage_history_id: Option<i64>,
+    attempt: u32,
+    message: Option<&'a str>,
 }
 
 impl SwarmDb {
@@ -167,16 +181,37 @@ impl SwarmDb {
     ///
     /// Returns `SwarmError::DatabaseError` if the database operation fails.
     pub async fn register_agent(&self, agent_id: &AgentId) -> Result<bool> {
-        sqlx::query(
-            "INSERT INTO agent_state (repo_id, agent_id, status) VALUES ($1, $2, 'idle')
-             ON CONFLICT (repo_id, agent_id) DO NOTHING",
-        )
-        .bind(agent_id.repo_id().value())
-        .bind(agent_id.number().cast_signed())
-        .execute(self.pool())
-        .await
-        .map(|rows| rows.rows_affected() > 0)
-        .map_err(|e| SwarmError::DatabaseError(format!("Failed to register agent: {e}")))
+        let repo_scoped = self.table_has_column("agent_state", "repo_id").await?;
+
+        if repo_scoped {
+            self.register_repo(
+                agent_id.repo_id(),
+                agent_id.repo_id().value(),
+                agent_id.repo_id().value(),
+            )
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO agent_state (repo_id, agent_id, status) VALUES ($1, $2, 'idle')
+                 ON CONFLICT (repo_id, agent_id) DO NOTHING",
+            )
+            .bind(agent_id.repo_id().value())
+            .bind(agent_id.number().cast_signed())
+            .execute(self.pool())
+            .await
+            .map(|rows| rows.rows_affected() > 0)
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to register agent: {e}")))
+        } else {
+            sqlx::query(
+                "INSERT INTO agent_state (agent_id, status) VALUES ($1, 'idle')
+                 ON CONFLICT (agent_id) DO NOTHING",
+            )
+            .bind(agent_id.number().cast_signed())
+            .execute(self.pool())
+            .await
+            .map(|rows| rows.rows_affected() > 0)
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to register agent: {e}")))
+        }
     }
 
     /// Attempts to claim a specific bead for an agent.
@@ -201,7 +236,8 @@ impl SwarmDb {
         bead_id: &BeadId,
         lease_extension_ms: i32,
     ) -> Result<bool> {
-        sqlx::query_scalar::<_, bool>("SELECT heartbeat_bead_claim($1, $2, $3)")
+        sqlx::query_scalar::<_, bool>("SELECT heartbeat_bead_claim($1, $2, $3, $4)")
+            .bind(agent_id.repo_id().value())
             .bind(agent_id.number().cast_signed())
             .bind(bead_id.value())
             .bind(lease_extension_ms)
@@ -263,9 +299,10 @@ impl SwarmDb {
 
         sqlx::query(
             "UPDATE agent_state
-             SET current_stage = $2, stage_started_at = NOW(), status = 'working'
-             WHERE agent_id = $1",
+             SET current_stage = $3, stage_started_at = NOW(), status = 'working'
+             WHERE repo_id = $1 AND agent_id = $2",
         )
+        .bind(agent_id.repo_id().value())
         .bind(agent_id.number().cast_signed())
         .bind(stage.as_str())
         .execute(&mut *conn)
@@ -287,7 +324,7 @@ impl SwarmDb {
         )
         .bind(EventSchemaVersion::V1.as_i32())
         .bind("stage_started")
-        .bind(event_entity_id(bead_id))
+        .bind(event_entity_id(bead_id, agent_id.repo_id()))
         .bind(bead_id.value())
         .bind(agent_id.number().cast_signed())
         .bind(stage.as_str())
@@ -331,15 +368,15 @@ impl SwarmDb {
             )
             .await?;
 
-        self.apply_stage_transition(
-            &determine_transition(stage, &result),
+        self.apply_stage_transition(StageTransitionInput {
+            transition: &determine_transition(stage, &result),
             agent_id,
             bead_id,
             stage,
-            Some(stage_history_id),
+            stage_history_id: Some(stage_history_id),
             attempt,
             message,
-        )
+        })
         .await?;
 
         debug!(
@@ -403,7 +440,7 @@ impl SwarmDb {
 
         let stage_history_id = stage_history_row.id;
 
-        self.persist_stage_transcript(stage_history_id, stage, attempt, result, completed_at)
+        self.persist_stage_transcript(agent_id, stage_history_id, stage, attempt, result, completed_at)
             .await?;
 
         self.record_execution_event(
@@ -423,18 +460,19 @@ impl SwarmDb {
             },
         )
         .await
-        .map(|_| stage_history_id)
+        .map(|()| stage_history_id)
     }
 
     async fn persist_stage_transcript(
         &self,
+        agent_id: &AgentId,
         stage_history_id: i64,
         stage: Stage,
         attempt: u32,
         result: &StageResult,
         completed_at: DateTime<Utc>,
     ) -> Result<()> {
-        let artifacts = self.get_stage_artifacts(stage_history_id).await?;
+        let artifacts = self.get_stage_artifacts(agent_id.repo_id(), stage_history_id).await?;
         let mut sorted_artifacts = artifacts.clone();
         sorted_artifacts.sort_by(|a, b| {
             a.artifact_type
@@ -462,8 +500,7 @@ impl SwarmDb {
 
         let message = result
             .message()
-            .map(ToString::to_string)
-            .unwrap_or_else(String::new);
+            .map_or_else(String::new, ToString::to_string);
 
         let metadata = json!({
             "stage_history_id": stage_history_id,
@@ -508,59 +545,6 @@ impl SwarmDb {
         .map(|_| ())?;
 
         Ok(())
-    }
-
-    async fn get_stage_attempt_number(&self, stage_history_id: i64) -> Result<u32> {
-        let attempt =
-            sqlx::query_scalar::<_, i32>("SELECT attempt_number FROM stage_history WHERE id = $1")
-                .bind(stage_history_id)
-                .fetch_one(self.pool())
-                .await
-                .map_err(|e| {
-                    SwarmError::DatabaseError(format!("Failed to load stage attempt number: {e}"))
-                })?;
-
-        Ok(to_u32_i32(attempt))
-    }
-
-    async fn store_retry_packet_for_transition(
-        &self,
-        stage_history_id: i64,
-        stage: Stage,
-        message: Option<&str>,
-    ) -> Result<()> {
-        let attempt = self.get_stage_attempt_number(stage_history_id).await?;
-        let artifacts = self.get_stage_artifacts(stage_history_id).await?;
-
-        let artifacts_payload = json!({
-            "failure_details": find_artifact_content(&artifacts, ArtifactType::FailureDetails),
-            "test_output": find_artifact_content(&artifacts, ArtifactType::TestOutput),
-            "test_results": find_artifact_content(&artifacts, ArtifactType::TestResults),
-            "error_message": find_artifact_content(&artifacts, ArtifactType::ErrorMessage),
-            "adversarial_report": find_artifact_content(&artifacts, ArtifactType::AdversarialReport),
-        });
-        let retry_payload = json!({
-            "failed_stage": stage.as_str(),
-            "attempt": attempt,
-            "feedback": message.map(str::to_string),
-            "artifacts": artifacts_payload,
-        });
-
-        let payload_text = serde_json::to_string_pretty(&retry_payload).map_err(|e| {
-            SwarmError::DatabaseError(format!("Failed to serialize retry packet: {e}"))
-        })?;
-
-        self.store_stage_artifact(
-            stage_history_id,
-            ArtifactType::RetryPacket,
-            &payload_text,
-            Some(json!({
-                "stage": stage.as_str(),
-                "attempt": attempt,
-            })),
-        )
-        .await
-        .map(|_| ())
     }
 
     /// Stores a stage artifact to the database.
@@ -640,26 +624,20 @@ impl SwarmDb {
             .map_err(|e| SwarmError::DatabaseError(format!("Failed to mark messages read: {e}")))
     }
 
-    async fn apply_stage_transition(
-        &self,
-        transition: &StageTransition,
-        agent_id: &AgentId,
-        bead_id: &BeadId,
-        stage: Stage,
-        stage_history_id: Option<i64>,
-        attempt: u32,
-        message: Option<&str>,
-    ) -> Result<()> {
-        match transition {
+    async fn apply_stage_transition(&self, input: StageTransitionInput<'_>) -> Result<()> {
+        match input.transition {
             StageTransition::Finalize => {
-                self.finalize_agent_and_bead(agent_id, bead_id).await?;
+                self.finalize_agent_and_bead(input.agent_id, input.bead_id)
+                    .await?;
                 self.record_execution_event(
-                    bead_id,
-                    agent_id,
+                    input.bead_id,
+                    input.agent_id,
                     ExecutionEventWriteInput {
-                        stage: Some(stage),
+                        stage: Some(input.stage),
                         event_type: "transition_finalize",
-                        causation_id: stage_history_id.map(|id| format!("stage-history:{id}")),
+                        causation_id: input
+                            .stage_history_id
+                            .map(|id| format!("stage-history:{id}")),
                         payload: json!({"transition": "finalize"}),
                         diagnostics: None,
                     },
@@ -667,14 +645,16 @@ impl SwarmDb {
                 .await
             }
             StageTransition::Advance(next_stage) => {
-                self.advance_to_stage(agent_id, *next_stage).await?;
+                self.advance_to_stage(input.agent_id, *next_stage).await?;
                 self.record_execution_event(
-                    bead_id,
-                    agent_id,
+                    input.bead_id,
+                    input.agent_id,
                     ExecutionEventWriteInput {
-                        stage: Some(stage),
+                        stage: Some(input.stage),
                         event_type: "transition_advance",
-                        causation_id: stage_history_id.map(|id| format!("stage-history:{id}")),
+                        causation_id: input
+                            .stage_history_id
+                            .map(|id| format!("stage-history:{id}")),
                         payload: json!({"transition": "advance", "next_stage": next_stage.as_str()}),
                         diagnostics: None,
                     },
@@ -682,32 +662,42 @@ impl SwarmDb {
                 .await
             }
             StageTransition::RetryImplement => {
-                if let Some(history_id) = stage_history_id {
-                    self.store_retry_packet_for_transition(history_id, stage, message)
-                        .await?;
-                }
-                self.apply_failure_transition(agent_id, message).await?;
+                self.persist_retry_packet(
+                    input.stage_history_id,
+                    input.stage,
+                    input.attempt,
+                    input.bead_id,
+                    input.agent_id,
+                    input.message,
+                )
+                .await?;
+                self.apply_failure_transition(input.agent_id, input.message)
+                    .await?;
                 self.record_execution_event(
-                    bead_id,
-                    agent_id,
+                    input.bead_id,
+                    input.agent_id,
                     ExecutionEventWriteInput {
-                        stage: Some(stage),
+                        stage: Some(input.stage),
                         event_type: "transition_retry",
-                        causation_id: stage_history_id.map(|id| format!("stage-history:{id}")),
+                        causation_id: input
+                            .stage_history_id
+                            .map(|id| format!("stage-history:{id}")),
                         payload: json!({"transition": "retry", "next_stage": Stage::Implement.as_str()}),
-                        diagnostics: Some(build_failure_diagnostics(message)),
+                        diagnostics: Some(build_failure_diagnostics(input.message)),
                     },
                 )
                 .await
             }
             StageTransition::NoOp => {
                 self.record_execution_event(
-                    bead_id,
-                    agent_id,
+                    input.bead_id,
+                    input.agent_id,
                     ExecutionEventWriteInput {
-                        stage: Some(stage),
+                        stage: Some(input.stage),
                         event_type: "transition_noop",
-                        causation_id: stage_history_id.map(|id| format!("stage-history:{id}")),
+                        causation_id: input
+                            .stage_history_id
+                            .map(|id| format!("stage-history:{id}")),
                         payload: json!({"transition": "noop"}),
                         diagnostics: None,
                     },
@@ -717,7 +707,12 @@ impl SwarmDb {
         }
     }
 
-    pub(crate) async fn persist_retry_packet(
+    /// Persists retry diagnostics and artifact references after a retry transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::DatabaseError` when reading or storing retry packet artifacts fails.
+    pub async fn persist_retry_packet(
         &self,
         stage_history_id: Option<i64>,
         stage: Stage,
@@ -726,12 +721,11 @@ impl SwarmDb {
         agent_id: &AgentId,
         message: Option<&str>,
     ) -> Result<()> {
-        let stage_history_id = match stage_history_id {
-            Some(id) => id,
-            None => return Ok(()),
+        let Some(stage_history_id) = stage_history_id else {
+            return Ok(());
         };
 
-        let config = self.get_config(&RepoId::new("local")).await?;
+        let config = self.get_config(agent_id.repo_id()).await?;
         let max_attempts = config.max_implementation_attempts;
         let remaining_attempts = max_attempts.saturating_sub(attempt);
 
@@ -746,7 +740,7 @@ impl SwarmDb {
         let mut seen_ids = HashSet::new();
         let mut seen_types = HashSet::new();
 
-        let stage_artifacts = self.get_stage_artifacts(stage_history_id).await?;
+        let stage_artifacts = self.get_stage_artifacts(agent_id.repo_id(), stage_history_id).await?;
         for artifact in stage_artifacts {
             let artifact_type_name = artifact.artifact_type.as_str().to_string();
             if seen_ids.insert(artifact.id) {
@@ -763,12 +757,6 @@ impl SwarmDb {
             }
         }
 
-        const CONTEXT_ARTIFACT_TYPES: [ArtifactType; 3] = [
-            ArtifactType::ImplementationCode,
-            ArtifactType::TestResults,
-            ArtifactType::TestOutput,
-        ];
-
         for artifact_type in CONTEXT_ARTIFACT_TYPES {
             let artifact_type_name = artifact_type.as_str().to_string();
             if seen_types.contains(&artifact_type_name) {
@@ -776,7 +764,7 @@ impl SwarmDb {
             }
 
             let artifacts = self
-                .get_bead_artifacts_by_type(bead_id, artifact_type)
+                .get_bead_artifacts_by_type(agent_id.repo_id(), bead_id, artifact_type)
                 .await?;
             if let Some(artifact) = artifacts.last() {
                 if seen_ids.insert(artifact.id) {
@@ -812,7 +800,7 @@ impl SwarmDb {
             "remaining_attempts": remaining_attempts,
             "failure_category": failure_category,
             "failure_detail": failure_detail,
-            "failure_message": message.map(|value| redact_sensitive(value)),
+            "failure_message": message.map(redact_sensitive),
             "retryable": retryable,
             "next_command": next_command,
             "artifact_refs": artifact_refs,
@@ -830,9 +818,7 @@ impl SwarmDb {
             })),
         )
         .await
-        .map(|_| ())?;
-
-        Ok(())
+        .map(|_| ())
     }
 
     /// Sets the swarm status.
@@ -840,13 +826,30 @@ impl SwarmDb {
     /// # Errors
     ///
     /// Returns `SwarmError::DatabaseError` if the database operation fails.
-    pub async fn set_swarm_status(&self, _repo_id: &RepoId, status: SwarmStatus) -> Result<()> {
-        sqlx::query("UPDATE swarm_config SET swarm_status = $1 WHERE id = TRUE")
+    pub async fn set_swarm_status(&self, repo_id: &RepoId, status: SwarmStatus) -> Result<()> {
+        let repo_scoped = self.table_has_column("swarm_config", "repo_id").await?;
+
+        if repo_scoped {
+            sqlx::query(
+                "INSERT INTO swarm_config (repo_id, swarm_status)
+                 VALUES ($1, $2)
+                 ON CONFLICT (repo_id) DO UPDATE
+                 SET swarm_status = EXCLUDED.swarm_status",
+            )
+            .bind(repo_id.value())
             .bind(status.as_str())
             .execute(self.pool())
             .await
             .map(|_result| ())
             .map_err(|e| SwarmError::DatabaseError(format!("Failed to update status: {e}")))
+        } else {
+            sqlx::query("UPDATE swarm_config SET swarm_status = $1 WHERE id = TRUE")
+                .bind(status.as_str())
+                .execute(self.pool())
+                .await
+                .map(|_result| ())
+                .map_err(|e| SwarmError::DatabaseError(format!("Failed to update status: {e}")))
+        }
     }
 
     /// Updates the swarm configuration.
@@ -855,7 +858,7 @@ impl SwarmDb {
     ///
     /// Returns `SwarmError::DatabaseError` if the database operation fails.
     pub async fn update_config(&self, max_agents: u32) -> Result<()> {
-        sqlx::query("UPDATE swarm_config SET max_agents = $1 WHERE id = TRUE")
+        sqlx::query("UPDATE swarm_config SET max_agents = $1")
             .bind(max_agents.cast_signed())
             .execute(self.pool())
             .await
@@ -868,12 +871,31 @@ impl SwarmDb {
     /// # Errors
     ///
     /// Returns `SwarmError::DatabaseError` if the database operation fails.
-    pub async fn start_swarm(&self, _repo_id: &RepoId) -> Result<()> {
-        sqlx::query("UPDATE swarm_config SET swarm_status = 'running', swarm_started_at = NOW() WHERE id = TRUE")
+    pub async fn start_swarm(&self, repo_id: &RepoId) -> Result<()> {
+        let repo_scoped = self.table_has_column("swarm_config", "repo_id").await?;
+
+        if repo_scoped {
+            sqlx::query(
+                "INSERT INTO swarm_config (repo_id, swarm_status, swarm_started_at)
+                 VALUES ($1, 'running', NOW())
+                 ON CONFLICT (repo_id) DO UPDATE
+                 SET swarm_status = 'running',
+                     swarm_started_at = NOW()",
+            )
+            .bind(repo_id.value())
             .execute(self.pool())
             .await
             .map(|_| info!("Started swarm"))
             .map_err(|e| SwarmError::DatabaseError(format!("Failed to start swarm: {e}")))
+        } else {
+            sqlx::query(
+                "UPDATE swarm_config SET swarm_status = 'running', swarm_started_at = NOW() WHERE id = TRUE",
+            )
+            .execute(self.pool())
+            .await
+            .map(|_| info!("Started swarm"))
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to start swarm: {e}")))
+        }
     }
 
     /// Initializes the database schema from SQL.
@@ -895,7 +917,189 @@ impl SwarmDb {
     ///
     /// Returns `SwarmError::DatabaseError` if the database operation fails.
     pub async fn seed_idle_agents(&self, count: u32) -> Result<()> {
-        seed_idle_agents_recursive(self, 1, count).await
+        let repo_scoped = self.table_has_column("agent_state", "repo_id").await?;
+        let default_repo = RepoId::new("local");
+
+        if repo_scoped {
+            self.register_repo(&default_repo, default_repo.value(), default_repo.value())
+                .await?;
+        }
+        self.prune_idle_unassigned_agents(repo_scoped, &default_repo, count)
+            .await?;
+
+        let existing_agent_ids = self
+            .load_existing_agent_ids(repo_scoped, &default_repo)
+            .await?;
+
+        let mut occupied_ids = existing_agent_ids
+            .into_iter()
+            .map(i32::cast_unsigned)
+            .collect::<HashSet<_>>();
+
+        let idle_unassigned_count = self
+            .count_idle_unassigned_agents(repo_scoped, &default_repo)
+            .await?;
+
+        let target_count = i64::from(count);
+        if idle_unassigned_count >= target_count {
+            return Ok(());
+        }
+
+        let mut next_candidate = 1_u32;
+        let agents_to_add = target_count - idle_unassigned_count;
+        for _ in 0..agents_to_add {
+            while occupied_ids.contains(&next_candidate) {
+                next_candidate = next_candidate.saturating_add(1);
+            }
+
+            self.insert_idle_agent(repo_scoped, &default_repo, next_candidate)
+                .await?;
+
+            occupied_ids.insert(next_candidate);
+            next_candidate = next_candidate.saturating_add(1);
+        }
+
+        Ok(())
+    }
+
+    async fn prune_idle_unassigned_agents(
+        &self,
+        repo_scoped: bool,
+        default_repo: &RepoId,
+        count: u32,
+    ) -> Result<()> {
+        if repo_scoped {
+            sqlx::query(
+                "DELETE FROM agent_state
+                 WHERE repo_id = $1
+                   AND status = 'idle'
+                   AND bead_id IS NULL
+                   AND agent_id IN (
+                     SELECT agent_id
+                     FROM agent_state
+                     WHERE repo_id = $1 AND status = 'idle' AND bead_id IS NULL
+                     ORDER BY agent_id DESC
+                     OFFSET $2
+                   )",
+            )
+            .bind(default_repo.value())
+            .bind(count.cast_signed())
+            .execute(self.pool())
+            .await
+            .map(|_result| ())
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to prune idle agents: {e}")))
+        } else {
+            sqlx::query(
+                "DELETE FROM agent_state
+                 WHERE status = 'idle'
+                   AND bead_id IS NULL
+                   AND agent_id IN (
+                     SELECT agent_id
+                     FROM agent_state
+                     WHERE status = 'idle' AND bead_id IS NULL
+                     ORDER BY agent_id DESC
+                     OFFSET $1
+                   )",
+            )
+            .bind(count.cast_signed())
+            .execute(self.pool())
+            .await
+            .map(|_result| ())
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to prune idle agents: {e}")))
+        }
+    }
+
+    async fn load_existing_agent_ids(
+        &self,
+        repo_scoped: bool,
+        default_repo: &RepoId,
+    ) -> Result<Vec<i32>> {
+        if repo_scoped {
+            sqlx::query_scalar::<_, i32>(
+                "SELECT agent_id
+                 FROM agent_state
+                 WHERE repo_id = $1
+                 ORDER BY agent_id ASC",
+            )
+            .bind(default_repo.value())
+            .fetch_all(self.pool())
+            .await
+            .map_err(|e| {
+                SwarmError::DatabaseError(format!("Failed to load existing seeded agents: {e}"))
+            })
+        } else {
+            sqlx::query_scalar::<_, i32>("SELECT agent_id FROM agent_state ORDER BY agent_id ASC")
+                .fetch_all(self.pool())
+                .await
+                .map_err(|e| {
+                    SwarmError::DatabaseError(format!("Failed to load existing seeded agents: {e}"))
+                })
+        }
+    }
+
+    async fn count_idle_unassigned_agents(
+        &self,
+        repo_scoped: bool,
+        default_repo: &RepoId,
+    ) -> Result<i64> {
+        if repo_scoped {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*)
+                 FROM agent_state
+                 WHERE repo_id = $1 AND status = 'idle' AND bead_id IS NULL",
+            )
+            .bind(default_repo.value())
+            .fetch_one(self.pool())
+            .await
+            .map_err(|e| {
+                SwarmError::DatabaseError(format!("Failed to count idle unassigned agents: {e}"))
+            })
+        } else {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_state WHERE status = 'idle' AND bead_id IS NULL",
+            )
+            .fetch_one(self.pool())
+            .await
+            .map_err(|e| {
+                SwarmError::DatabaseError(format!("Failed to count idle unassigned agents: {e}"))
+            })
+        }
+    }
+
+    async fn insert_idle_agent(
+        &self,
+        repo_scoped: bool,
+        default_repo: &RepoId,
+        agent_number: u32,
+    ) -> Result<()> {
+        if repo_scoped {
+            sqlx::query(
+                "INSERT INTO agent_state (repo_id, agent_id, status)
+                 VALUES ($1, $2, 'idle')
+                 ON CONFLICT (agent_id) DO NOTHING",
+            )
+            .bind(default_repo.value())
+            .bind(agent_number.cast_signed())
+            .execute(self.pool())
+            .await
+            .map(|_result| ())
+            .map_err(|e| {
+                SwarmError::DatabaseError(format!("Failed to seed agent {agent_number}: {e}"))
+            })
+        } else {
+            sqlx::query(
+                "INSERT INTO agent_state (agent_id, status)
+                 VALUES ($1, 'idle')
+                 ON CONFLICT (agent_id) DO NOTHING",
+            )
+            .bind(agent_number.cast_signed())
+            .execute(self.pool())
+            .await
+            .map(|_result| ())
+            .map_err(|e| {
+                SwarmError::DatabaseError(format!("Failed to seed agent {agent_number}: {e}"))
+            })
+        }
     }
 
     /// Enqueues a batch of beads into the backlog.
@@ -942,10 +1146,12 @@ impl SwarmDb {
         let claim_update = sqlx::query(
             "UPDATE bead_claims
              SET status = 'blocked'
-             WHERE bead_id = $1
-               AND claimed_by = $2
+             WHERE repo_id = $1
+               AND bead_id = $2
+               AND claimed_by = $3
                AND status = 'in_progress'",
         )
+        .bind(agent_id.repo_id().value())
         .bind(bead_id.value())
         .bind(agent_id.number().cast_signed())
         .execute(&mut *conn)
@@ -960,18 +1166,26 @@ impl SwarmDb {
             )));
         }
 
-        sqlx::query("UPDATE bead_backlog SET status = 'blocked' WHERE bead_id = $1")
-            .bind(bead_id.value())
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| SwarmError::DatabaseError(format!("Failed to block backlog bead: {e}")))?;
+        sqlx::query(
+            "UPDATE bead_backlog SET status = 'blocked' WHERE repo_id = $1 AND bead_id = $2",
+        )
+        .bind(agent_id.repo_id().value())
+        .bind(bead_id.value())
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to block backlog bead: {e}")))?;
 
-        sqlx::query("UPDATE agent_state SET status = 'error', feedback = $2 WHERE agent_id = $1")
-            .bind(agent_id.number().cast_signed())
-            .bind(reason)
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| SwarmError::DatabaseError(format!("Failed to mark agent error: {e}")))?;
+        sqlx::query(
+            "UPDATE agent_state
+             SET status = 'error', feedback = $3
+             WHERE repo_id = $1 AND agent_id = $2",
+        )
+        .bind(agent_id.repo_id().value())
+        .bind(agent_id.number().cast_signed())
+        .bind(reason)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to mark agent error: {e}")))?;
 
         tx.commit()
             .await
@@ -1014,8 +1228,12 @@ impl SwarmDb {
             .map_err(|e| SwarmError::DatabaseError(format!("Failed to acquire tx conn: {e}")))?;
 
         let bead = sqlx::query_scalar::<_, Option<String>>(
-            "SELECT bead_id FROM agent_state WHERE agent_id = $1 FOR UPDATE",
+            "SELECT bead_id
+             FROM agent_state
+             WHERE repo_id = $1 AND agent_id = $2
+             FOR UPDATE",
         )
+        .bind(agent_id.repo_id().value())
         .bind(agent_id.number().cast_signed())
         .fetch_optional(&mut *conn)
         .await
@@ -1023,7 +1241,34 @@ impl SwarmDb {
         .flatten();
 
         if let Some(bead_id) = bead.as_deref() {
-            sqlx::query("DELETE FROM bead_claims WHERE bead_id = $1")
+            sqlx::query(
+                "UPDATE agent_state
+                 SET bead_id = NULL,
+                     current_stage = NULL,
+                     stage_started_at = NULL,
+                     status = 'idle',
+                     feedback = NULL,
+                     implementation_attempt = 0
+                 WHERE repo_id = $1 AND agent_id = $2",
+            )
+            .bind(agent_id.repo_id().value())
+            .bind(agent_id.number().cast_signed())
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to reset agent state: {e}")))?;
+
+            sqlx::query("DELETE FROM agent_messages WHERE bead_id = $1")
+                .bind(bead_id)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| {
+                    SwarmError::DatabaseError(format!(
+                        "Failed to clear bead messages on release: {e}"
+                    ))
+                })?;
+
+            sqlx::query("DELETE FROM bead_claims WHERE repo_id = $1 AND bead_id = $2")
+                .bind(agent_id.repo_id().value())
                 .bind(bead_id)
                 .execute(&mut *conn)
                 .await
@@ -1034,8 +1279,11 @@ impl SwarmDb {
             sqlx::query(
                 "UPDATE bead_backlog
                  SET status = 'pending'
-                 WHERE bead_id = $1 AND status <> 'completed'",
+                 WHERE repo_id = $1
+                   AND bead_id = $2
+                   AND status <> 'completed'",
             )
+            .bind(agent_id.repo_id().value())
             .bind(bead_id)
             .execute(&mut *conn)
             .await
@@ -1044,20 +1292,23 @@ impl SwarmDb {
             })?;
         }
 
-        sqlx::query(
-            "UPDATE agent_state
-             SET bead_id = NULL,
-                 current_stage = NULL,
-                 stage_started_at = NULL,
-                 status = 'idle',
-                 feedback = NULL,
-                 implementation_attempt = 0
-             WHERE agent_id = $1",
-        )
-        .bind(agent_id.number().cast_signed())
-        .execute(&mut *conn)
-        .await
-        .map_err(|e| SwarmError::DatabaseError(format!("Failed to reset agent state: {e}")))?;
+        if bead.is_none() {
+            sqlx::query(
+                "UPDATE agent_state
+                 SET bead_id = NULL,
+                     current_stage = NULL,
+                     stage_started_at = NULL,
+                     status = 'idle',
+                     feedback = NULL,
+                     implementation_attempt = 0
+                 WHERE repo_id = $1 AND agent_id = $2",
+            )
+            .bind(agent_id.repo_id().value())
+            .bind(agent_id.number().cast_signed())
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to reset agent state: {e}")))?;
+        }
 
         tx.commit()
             .await
@@ -1100,9 +1351,10 @@ impl SwarmDb {
     pub async fn mark_landing_retryable(&self, agent_id: &AgentId, reason: &str) -> Result<()> {
         sqlx::query(
             "UPDATE agent_state
-             SET status = 'waiting', feedback = $2, current_stage = 'red-queen'
-             WHERE agent_id = $1",
+             SET status = 'waiting', feedback = $3, current_stage = 'red-queen'
+             WHERE repo_id = $1 AND agent_id = $2",
         )
+        .bind(agent_id.repo_id().value())
         .bind(agent_id.number().cast_signed())
         .bind(reason)
         .execute(self.pool())
@@ -1202,8 +1454,9 @@ impl SwarmDb {
         sqlx::query(
             "UPDATE agent_state
              SET status = 'done', current_stage = 'done'
-             WHERE agent_id = $1 AND bead_id = $2",
+             WHERE repo_id = $1 AND agent_id = $2 AND bead_id = $3",
         )
+        .bind(agent_id.repo_id().value())
         .bind(agent_id.number().cast_signed())
         .bind(bead_id.value())
         .execute(&mut *conn)
@@ -1218,9 +1471,10 @@ impl SwarmDb {
     async fn advance_to_stage(&self, agent_id: &AgentId, next_stage: Stage) -> Result<()> {
         sqlx::query(
             "UPDATE agent_state
-             SET current_stage = $2, stage_started_at = NOW(), status = 'working'
-             WHERE agent_id = $1",
+             SET current_stage = $3, stage_started_at = NOW(), status = 'working'
+             WHERE repo_id = $1 AND agent_id = $2",
         )
+        .bind(agent_id.repo_id().value())
         .bind(agent_id.number().cast_signed())
         .bind(next_stage.as_str())
         .execute(self.pool())
@@ -1230,12 +1484,26 @@ impl SwarmDb {
     }
 
     async fn lookup_agent_bead(&self, agent_id: &AgentId) -> Result<Option<BeadId>> {
-        sqlx::query_scalar::<_, String>("SELECT bead_id FROM agent_state WHERE agent_id = $1")
+        let repo_scoped = self.table_has_column("agent_state", "repo_id").await?;
+
+        if repo_scoped {
+            sqlx::query_scalar::<_, String>(
+                "SELECT bead_id FROM agent_state WHERE repo_id = $1 AND agent_id = $2",
+            )
+            .bind(agent_id.repo_id().value())
             .bind(agent_id.number().cast_signed())
             .fetch_optional(self.pool())
             .await
             .map(|bead| bead.map(BeadId::new))
             .map_err(|e| SwarmError::DatabaseError(format!("Failed to lookup agent bead: {e}")))
+        } else {
+            sqlx::query_scalar::<_, String>("SELECT bead_id FROM agent_state WHERE agent_id = $1")
+                .bind(agent_id.number().cast_signed())
+                .fetch_optional(self.pool())
+                .await
+                .map(|bead| bead.map(BeadId::new))
+                .map_err(|e| SwarmError::DatabaseError(format!("Failed to lookup agent bead: {e}")))
+        }
     }
 
     async fn record_execution_event(
@@ -1277,7 +1545,7 @@ impl SwarmDb {
         )
         .bind(EventSchemaVersion::V1.as_i32())
         .bind(input.event_type)
-        .bind(event_entity_id(bead_id))
+        .bind(event_entity_id(bead_id, agent_id.repo_id()))
         .bind(bead_id.value())
         .bind(agent_id.number().cast_signed())
         .bind(input.stage.map(|value| value.as_str()))
@@ -1302,7 +1570,7 @@ impl SwarmDb {
         let should_insert = match input.causation_id.as_deref() {
             Some(causation_id) => {
                 !self
-                    .execution_event_exists(bead_id, input.event_type, causation_id)
+                    .execution_event_exists(bead_id, agent_id, input.event_type, causation_id)
                     .await?
             }
             None => true,
@@ -1318,9 +1586,13 @@ impl SwarmDb {
     async fn execution_event_exists(
         &self,
         bead_id: &BeadId,
+        agent_id: &AgentId,
         event_type: &str,
         causation_id: &str,
     ) -> Result<bool> {
+        let repo_entity_id = event_entity_id(bead_id, agent_id.repo_id());
+        let legacy_entity_id = format!("bead:{}", bead_id.value());
+
         sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (
                 SELECT 1
@@ -1328,11 +1600,14 @@ impl SwarmDb {
                 WHERE bead_id = $1
                   AND event_type = $2
                   AND causation_id = $3
+                  AND (entity_id = $4 OR entity_id = $5)
             )",
         )
         .bind(bead_id.value())
         .bind(event_type)
         .bind(causation_id)
+        .bind(repo_entity_id)
+        .bind(legacy_entity_id)
         .fetch_one(self.pool())
         .await
         .map_err(|e| {
@@ -1371,15 +1646,37 @@ impl SwarmDb {
     ) -> Result<()> {
         sqlx::query(
             "UPDATE agent_state
-             SET status = 'waiting', feedback = $2, implementation_attempt = implementation_attempt + 1, current_stage = 'implement'
-             WHERE agent_id = $1",
+             SET status = 'waiting', feedback = $3, implementation_attempt = implementation_attempt + 1, current_stage = 'implement'
+             WHERE repo_id = $1 AND agent_id = $2",
         )
+        .bind(agent_id.repo_id().value())
         .bind(agent_id.number().cast_signed())
         .bind(message)
         .execute(self.pool())
         .await
         .map(|_result| ())
         .map_err(|e| SwarmError::DatabaseError(format!("Failed to record failed stage: {e}")))
+    }
+
+    async fn table_has_column(&self, table_name: &str, column_name: &str) -> Result<bool> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = $1
+                  AND column_name = $2
+            )",
+        )
+        .bind(table_name)
+        .bind(column_name)
+        .fetch_one(self.pool())
+        .await
+        .map_err(|e| {
+            SwarmError::DatabaseError(format!(
+                "Failed to inspect schema for {table_name}.{column_name}: {e}"
+            ))
+        })
     }
 }
 
@@ -1517,44 +1814,8 @@ fn redact_token(token: &str) -> String {
     )
 }
 
-fn event_entity_id(bead_id: &BeadId) -> String {
-    format!("bead:{}", bead_id.value())
-}
-
-fn seed_idle_agents_recursive<'a>(
-    db: &'a SwarmDb,
-    next: u32,
-    count: u32,
-) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
-    Box::pin(async move {
-        if next > count {
-            Ok(())
-        } else {
-            sqlx::query(
-                "INSERT INTO agent_state (agent_id, status)
-                 VALUES ($1, 'idle')
-                 ON CONFLICT (agent_id) DO UPDATE
-                 SET status = 'idle', bead_id = NULL, current_stage = NULL, stage_started_at = NULL,
-                     feedback = NULL, implementation_attempt = 0",
-            )
-            .bind(next.cast_signed())
-            .execute(db.pool())
-            .await
-            .map_err(|e| SwarmError::DatabaseError(format!("Failed to seed agent {next}: {e}")))?;
-
-            seed_idle_agents_recursive(db, next.saturating_add(1), count).await
-        }
-    })
-}
-
-fn find_artifact_content(
-    artifacts: &[StageArtifact],
-    artifact_type: ArtifactType,
-) -> Option<String> {
-    artifacts
-        .iter()
-        .find(|artifact| artifact.artifact_type == artifact_type)
-        .map(|artifact| artifact.content.clone())
+fn event_entity_id(bead_id: &BeadId, repo_id: &RepoId) -> String {
+    format!("repo:{}:bead:{}", repo_id.value(), bead_id.value())
 }
 
 fn determine_transition(stage: Stage, result: &StageResult) -> StageTransition {

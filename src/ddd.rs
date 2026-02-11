@@ -612,8 +612,9 @@ impl RuntimePgAgentRepository {
     /// Returns [`RuntimeError::InvariantViolation`] when persisted state violates invariants.
     pub async fn find_by_id(&self, agent_id: &RuntimeAgentId) -> Result<Option<RuntimeAgentState>> {
         let maybe_row = sqlx::query_as::<_, (Option<String>, Option<String>, String, i32)>(
-            "SELECT bead_id, current_stage, status, implementation_attempt FROM agent_state WHERE agent_id = $1",
+            "SELECT bead_id, current_stage, status, implementation_attempt FROM agent_state WHERE repo_id = $1 AND agent_id = $2",
         )
+        .bind(agent_id.repo_id().value())
         .bind(agent_id.number().cast_signed())
         .fetch_optional(&self.pool)
         .await
@@ -665,9 +666,10 @@ impl RuntimePgAgentRepository {
         agent_id: &RuntimeAgentId,
         status: RuntimeAgentStatus,
     ) -> Result<()> {
-        sqlx::query("UPDATE agent_state SET status = $2, last_update = NOW() WHERE agent_id = $1")
-            .bind(agent_id.number().cast_signed())
+        sqlx::query("UPDATE agent_state SET status = $2, last_update = NOW() WHERE repo_id = $1 AND agent_id = $3")
+            .bind(agent_id.repo_id().value())
             .bind(status.as_str())
+            .bind(agent_id.number().cast_signed())
             .execute(&self.pool)
             .await
             .map_err(|e| RuntimeError::RepositoryError(format!("update_status: {e}")))
@@ -706,7 +708,8 @@ impl RuntimePgBeadRepository {
     /// # Errors
     /// Returns [`RuntimeError::RepositoryError`] when persistence fails.
     pub async fn release(&self, agent_id: &RuntimeAgentId) -> Result<()> {
-        sqlx::query("UPDATE agent_state SET bead_id = NULL, current_stage = NULL, status = 'idle' WHERE agent_id = $1")
+        sqlx::query("UPDATE agent_state SET bead_id = NULL, current_stage = NULL, status = 'idle' WHERE repo_id = $1 AND agent_id = $2")
+            .bind(agent_id.repo_id().value())
             .bind(agent_id.number().cast_signed())
             .execute(&self.pool)
             .await

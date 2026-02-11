@@ -142,7 +142,7 @@ This is the **prompt for each agent**. Use `{N}` as placeholder for agent number
    │ Output: Contract document                   │
    │                                             │
    │ Update DB: INSERT INTO stage_history...     │
-   │          UPDATE agent_state SET stage=...   │
+   │          UPDATE agent_state SET stage=... WHERE repo_id=... AND agent_id=...   │
    └─────────────────────────────────────────────┘
                         │
                         ▼
@@ -190,8 +190,8 @@ This is the **prompt for each agent**. Use `{N}` as placeholder for agent number
                         ▼
 4. SUCCESS
    - br update {bead_id} --status completed
-   - UPDATE agent_state SET status='done', stage='done'
-   - UPDATE bead_claims SET status='completed'
+   - UPDATE agent_state SET status='done', current_stage='done' WHERE repo_id='{repo_id}' AND agent_id={agent_id}
+   - UPDATE bead_claims SET status='completed' WHERE repo_id='{repo_id}' AND bead_id='{bead_id}'
    - jj commit -m "Completed bead {bead_id}"
    - br sync --flush-only
    - git add .beads/ && git commit -m "sync beads"

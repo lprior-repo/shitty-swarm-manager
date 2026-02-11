@@ -426,6 +426,9 @@ DATABASE_URL=postgresql://shitty_swarm_manager@localhost:5432/shitty_swarm_manag
 
 # Optional: dedicated test DB URL for ignored DB integration tests
 SWARM_TEST_DATABASE_URL=postgresql://shitty_swarm_manager@localhost:5432/shitty_swarm_manager_test_db
+
+# One-command ephemeral DB + Flyway migrate/seed + ignored DB tests
+moon run :db-test-full
 ```
 
 Or set `.swarm/config.toml`:

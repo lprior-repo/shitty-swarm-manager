@@ -1,5 +1,4 @@
 use super::{determine_transition, StageTransition};
-use crate::db::write_ops::persist_retry_packet;
 use crate::db::SwarmDb;
 use crate::error::SwarmError;
 use crate::types::{
@@ -287,7 +286,7 @@ async fn record_stage_complete_persists_transcript_for_success() {
         .any(|artifact| artifact["artifact_type"] == Value::from("contract_document")));
 
     let stage_log_artifact = db
-        .get_stage_artifacts(stage_history_id)
+        .get_stage_artifacts(agent_id.repo_id(), stage_history_id)
         .await
         .unwrap_or_else(|e| panic!("get_stage_artifacts failed: {}", e))
         .into_iter()
@@ -360,7 +359,7 @@ async fn record_stage_complete_persists_transcript_for_failure() {
     assert_eq!(transcript_value["message"], Value::from(failure_message));
 
     let stage_log_artifact = db
-        .get_stage_artifacts(stage_history_id)
+        .get_stage_artifacts(agent_id.repo_id(), stage_history_id)
         .await
         .unwrap_or_else(|e| panic!("get_stage_artifacts failed: {}", e))
         .into_iter()
@@ -1121,12 +1120,12 @@ async fn artifact_lookup_helpers_avoid_overfetch_and_preserve_ordering() {
     .unwrap_or_else(|e| panic!("store second contract failed: {}", e));
 
     let has_contract = db
-        .bead_has_artifact_type(&bead_id, ArtifactType::ContractDocument)
-        .await
+         .bead_has_artifact_type(agent_id.repo_id(), &bead_id, ArtifactType::ContractDocument)
+         .await
         .unwrap_or_else(|e| panic!("bead_has_artifact_type failed: {}", e));
-    let has_test_results = db
-        .bead_has_artifact_type(&bead_id, ArtifactType::TestResults)
-        .await
+   let has_test_results = db
+         .bead_has_artifact_type(agent_id.repo_id(), &bead_id, ArtifactType::TestResults)
+         .await
         .unwrap_or_else(|e| panic!("bead_has_artifact_type missing failed: {}", e));
 
     assert!(has_contract);
@@ -1430,13 +1429,13 @@ async fn transition_retry_records_retry_packet_for_qa_failure() {
         ),
     ];
 
-    persist_retry_packet(
-        &db,
+    db.persist_retry_packet(
         stage_history_id,
         Stage::QaEnforcer,
         1,
+        &bead_id,
+        &agent_id,
         Some("qa tests failed password=secret"),
-        &artifacts,
     )
     .await
     .unwrap_or_else(|e| panic!("persist_retry_packet failed: {}", e));
@@ -1678,7 +1677,7 @@ async fn given_qa_failure_with_retries_remaining_when_transition_retry_is_record
     .unwrap_or_else(|e| panic!("record_stage_complete failed: {}", e));
 
     let retry_packet = db
-        .get_stage_artifacts(stage_history_id)
+        .get_stage_artifacts(agent_id.repo_id(), stage_history_id)
         .await
         .unwrap_or_else(|e| panic!("get_stage_artifacts failed: {}", e))
         .into_iter()
@@ -1872,7 +1871,7 @@ async fn given_missing_failure_diagnostics_when_retry_packet_creation_runs_then_
     assert!(row.1.is_none());
 
     let retry_packet = db
-        .get_stage_artifacts(stage_history_id)
+        .get_stage_artifacts(agent_id.repo_id(), stage_history_id)
         .await
         .unwrap()
         .into_iter()
@@ -1926,7 +1925,7 @@ async fn given_invalid_artifact_references_when_retry_packet_creation_runs_then_
     .unwrap_or_else(|e| panic!("record_stage_complete failed: {}", e));
 
     let retry_packet = db
-        .get_stage_artifacts(stage_history_id)
+        .get_stage_artifacts(agent_id.repo_id(), stage_history_id)
         .await
         .unwrap()
         .into_iter()
@@ -2007,4 +2006,247 @@ async fn release_agent_resets_agent_and_requeues_bead() {
             .await
             .unwrap_or_else(|e| panic!("fetch claim count failed: {}", e));
     assert_eq!(claim_count, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
+async fn record_stage_started_is_repo_scoped_for_same_agent_number() {
+    let db = test_db().await;
+    setup_schema(&db).await;
+    reset_runtime_tables(&db).await;
+
+    let repo_a = RepoId::new(format!("repo-a-{}", Uuid::new_v4()));
+    let repo_b = RepoId::new(format!("repo-b-{}", Uuid::new_v4()));
+    db.register_repo(&repo_a, "repo-a", ".")
+        .await
+        .unwrap_or_else(|e| panic!("register_repo A failed: {e}"));
+    db.register_repo(&repo_b, "repo-b", ".")
+        .await
+        .unwrap_or_else(|e| panic!("register_repo B failed: {e}"));
+
+    let agent_a = AgentId::new(repo_a.clone(), 1);
+    let agent_b = AgentId::new(repo_b.clone(), 1);
+    db.register_agent(&agent_a)
+        .await
+        .unwrap_or_else(|e| panic!("register_agent A failed: {e}"));
+    db.register_agent(&agent_b)
+        .await
+        .unwrap_or_else(|e| panic!("register_agent B failed: {e}"));
+
+    let bead_a = BeadId::new(unique_bead("bead-stage-start-a"));
+    let bead_b = BeadId::new(unique_bead("bead-stage-start-b"));
+    sqlx::query(
+        "INSERT INTO bead_backlog (repo_id, bead_id, priority, status) VALUES ($1, $2, 'p0', 'pending')",
+    )
+    .bind(repo_a.value())
+    .bind(bead_a.value())
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("insert backlog A failed: {e}"));
+    sqlx::query(
+        "INSERT INTO bead_backlog (repo_id, bead_id, priority, status) VALUES ($1, $2, 'p0', 'pending')",
+    )
+    .bind(repo_b.value())
+    .bind(bead_b.value())
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("insert backlog B failed: {e}"));
+
+    db.claim_next_bead(&agent_a)
+        .await
+        .unwrap_or_else(|e| panic!("claim_next_bead A failed: {e}"));
+    db.claim_next_bead(&agent_b)
+        .await
+        .unwrap_or_else(|e| panic!("claim_next_bead B failed: {e}"));
+
+    sqlx::query(
+        "UPDATE agent_state SET current_stage = 'implement' WHERE repo_id = $1 AND agent_id = $2",
+    )
+    .bind(repo_b.value())
+    .bind(agent_b.number() as i32)
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("preset repo B stage failed: {e}"));
+
+    db.record_stage_started(&agent_a, &bead_a, Stage::QaEnforcer, 1)
+        .await
+        .unwrap_or_else(|e| panic!("record_stage_started failed: {e}"));
+
+    let stage_a = sqlx::query_scalar::<_, String>(
+        "SELECT current_stage FROM agent_state WHERE repo_id = $1 AND agent_id = $2",
+    )
+    .bind(repo_a.value())
+    .bind(agent_a.number() as i32)
+    .fetch_one(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("fetch repo A stage failed: {e}"));
+    let stage_b = sqlx::query_scalar::<_, String>(
+        "SELECT current_stage FROM agent_state WHERE repo_id = $1 AND agent_id = $2",
+    )
+    .bind(repo_b.value())
+    .bind(agent_b.number() as i32)
+    .fetch_one(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("fetch repo B stage failed: {e}"));
+
+    assert_eq!(stage_a, Stage::QaEnforcer.as_str());
+    assert_eq!(stage_b, Stage::Implement.as_str());
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
+async fn transition_advance_is_repo_scoped_for_same_agent_number() {
+    let db = test_db().await;
+    setup_schema(&db).await;
+    reset_runtime_tables(&db).await;
+
+    let repo_a = RepoId::new(format!("repo-a-{}", Uuid::new_v4()));
+    let repo_b = RepoId::new(format!("repo-b-{}", Uuid::new_v4()));
+    db.register_repo(&repo_a, "repo-a", ".")
+        .await
+        .unwrap_or_else(|e| panic!("register_repo A failed: {e}"));
+    db.register_repo(&repo_b, "repo-b", ".")
+        .await
+        .unwrap_or_else(|e| panic!("register_repo B failed: {e}"));
+
+    let agent_a = AgentId::new(repo_a.clone(), 1);
+    let agent_b = AgentId::new(repo_b.clone(), 1);
+    db.register_agent(&agent_a)
+        .await
+        .unwrap_or_else(|e| panic!("register_agent A failed: {e}"));
+    db.register_agent(&agent_b)
+        .await
+        .unwrap_or_else(|e| panic!("register_agent B failed: {e}"));
+
+    let bead_a = BeadId::new(unique_bead("bead-advance-a"));
+    let bead_b = BeadId::new(unique_bead("bead-advance-b"));
+    sqlx::query(
+        "INSERT INTO bead_backlog (repo_id, bead_id, priority, status) VALUES ($1, $2, 'p0', 'pending')",
+    )
+    .bind(repo_a.value())
+    .bind(bead_a.value())
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("insert backlog A failed: {e}"));
+    sqlx::query(
+        "INSERT INTO bead_backlog (repo_id, bead_id, priority, status) VALUES ($1, $2, 'p0', 'pending')",
+    )
+    .bind(repo_b.value())
+    .bind(bead_b.value())
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("insert backlog B failed: {e}"));
+
+    db.claim_next_bead(&agent_a)
+        .await
+        .unwrap_or_else(|e| panic!("claim_next_bead A failed: {e}"));
+    db.claim_next_bead(&agent_b)
+        .await
+        .unwrap_or_else(|e| panic!("claim_next_bead B failed: {e}"));
+
+    db.record_stage_started(&agent_a, &bead_a, Stage::RustContract, 1)
+        .await
+        .unwrap_or_else(|e| panic!("record_stage_started A failed: {e}"));
+
+    sqlx::query(
+        "UPDATE agent_state SET current_stage = 'red-queen', status = 'working' WHERE repo_id = $1 AND agent_id = $2",
+    )
+    .bind(repo_b.value())
+    .bind(agent_b.number() as i32)
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("preset repo B stage failed: {e}"));
+
+    db.record_stage_complete(
+        &agent_a,
+        &bead_a,
+        Stage::RustContract,
+        1,
+        StageResult::Passed,
+        1,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("record_stage_complete A failed: {e}"));
+
+    let stage_a = sqlx::query_scalar::<_, String>(
+        "SELECT current_stage FROM agent_state WHERE repo_id = $1 AND agent_id = $2",
+    )
+    .bind(repo_a.value())
+    .bind(agent_a.number() as i32)
+    .fetch_one(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("fetch repo A stage failed: {e}"));
+    let stage_b = sqlx::query_scalar::<_, String>(
+        "SELECT current_stage FROM agent_state WHERE repo_id = $1 AND agent_id = $2",
+    )
+    .bind(repo_b.value())
+    .bind(agent_b.number() as i32)
+    .fetch_one(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("fetch repo B stage failed: {e}"));
+
+    assert_eq!(stage_a, Stage::Implement.as_str());
+    assert_eq!(stage_b, Stage::RedQueen.as_str());
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
+async fn mark_landing_retryable_is_repo_scoped_for_same_agent_number() {
+    let db = test_db().await;
+    setup_schema(&db).await;
+    reset_runtime_tables(&db).await;
+
+    let repo_a = RepoId::new(format!("repo-a-{}", Uuid::new_v4()));
+    let repo_b = RepoId::new(format!("repo-b-{}", Uuid::new_v4()));
+    db.register_repo(&repo_a, "repo-a", ".")
+        .await
+        .unwrap_or_else(|e| panic!("register_repo A failed: {e}"));
+    db.register_repo(&repo_b, "repo-b", ".")
+        .await
+        .unwrap_or_else(|e| panic!("register_repo B failed: {e}"));
+
+    let agent_a = AgentId::new(repo_a.clone(), 1);
+    let agent_b = AgentId::new(repo_b.clone(), 1);
+    db.register_agent(&agent_a)
+        .await
+        .unwrap_or_else(|e| panic!("register_agent A failed: {e}"));
+    db.register_agent(&agent_b)
+        .await
+        .unwrap_or_else(|e| panic!("register_agent B failed: {e}"));
+
+    sqlx::query(
+        "UPDATE agent_state SET status = 'working', current_stage = 'red-queen', feedback = NULL",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("preset agent states failed: {e}"));
+
+    db.mark_landing_retryable(&agent_a, "landing failed in repo A")
+        .await
+        .unwrap_or_else(|e| panic!("mark_landing_retryable failed: {e}"));
+
+    let repo_a_state = sqlx::query_as::<_, (String, Option<String>, String)>(
+        "SELECT status, feedback, current_stage FROM agent_state WHERE repo_id = $1 AND agent_id = $2",
+    )
+    .bind(repo_a.value())
+    .bind(agent_a.number() as i32)
+    .fetch_one(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("fetch repo A state failed: {e}"));
+    let repo_b_state = sqlx::query_as::<_, (String, Option<String>, String)>(
+        "SELECT status, feedback, current_stage FROM agent_state WHERE repo_id = $1 AND agent_id = $2",
+    )
+    .bind(repo_b.value())
+    .bind(agent_b.number() as i32)
+    .fetch_one(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("fetch repo B state failed: {e}"));
+
+    assert_eq!(repo_a_state.0, "waiting");
+    assert_eq!(repo_a_state.1.as_deref(), Some("landing failed in repo A"));
+    assert_eq!(repo_a_state.2, Stage::RedQueen.as_str());
+
+    assert_eq!(repo_b_state.0, "working");
+    assert_eq!(repo_b_state.1, None);
+    assert_eq!(repo_b_state.2, Stage::RedQueen.as_str());
 }

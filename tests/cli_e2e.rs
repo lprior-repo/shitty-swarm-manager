@@ -1,4 +1,5 @@
 mod support;
+use assert_cmd::Command;
 use std::fs;
 use std::path::Path;
 
@@ -80,6 +81,34 @@ fn dry_run_lock_uses_standard_dry_shape() -> Result<(), String> {
     assert_eq!(json["d"]["dry"], true);
     assert!(json["d"]["would_do"].is_array());
     assert!(json["d"]["estimated_ms"].is_number());
+
+    Ok(())
+}
+
+#[test]
+fn agent_cli_dry_flag_short_circuits_agent_loop() -> Result<(), String> {
+    let binary_path = assert_cmd::cargo::cargo_bin!("swarm");
+    let assert = Command::new(binary_path)
+        .args(["agent", "--id", "1", "--dry"])
+        .assert()
+        .success();
+
+    let raw = String::from_utf8_lossy(&assert.get_output().stdout)
+        .trim()
+        .to_string();
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|err| format!("expected JSON response envelope, got '{raw}': {err}"))?;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["d"]["dry"], true);
+    assert_eq!(json["d"]["would_do"][0]["action"], "run_agent");
+
+    if json["d"].get("status").is_some() || json["d"].get("agent_id").is_some() {
+        return Err(
+            "dry agent path should not return full loop completion payload fields".to_string(),
+        );
+    }
 
     Ok(())
 }
@@ -196,6 +225,86 @@ fn resume_context_with_unknown_bead_returns_notfound() -> Result<(), String> {
     }
     if json["err"]["code"] != serde_json::Value::String("NOTFOUND".to_string()) {
         return Err(format!("expected NOTFOUND error code, got: {json}"));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn init_dry_response_masks_database_password() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(
+        r#"{"cmd":"init","dry":true,"seed_agents":4,"database_url":"postgres://swarm_user:supersecret@localhost:5432/swarm_db"}"#,
+    )?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], true);
+
+    let steps = json["d"]["would_do"]
+        .as_array()
+        .ok_or_else(|| "missing init dry-run steps".to_string())?;
+    let init_db_step = steps
+        .iter()
+        .find(|step| step["action"] == "init_db")
+        .ok_or_else(|| "init_db step missing from dry-run output".to_string())?;
+    let target = init_db_step["target"]
+        .as_str()
+        .ok_or_else(|| "init_db target is not a string".to_string())?;
+
+    if !target.contains("********") {
+        return Err(format!(
+            "expected masked password in init_db target, got '{target}'"
+        ));
+    }
+    if target.contains("supersecret") || json.to_string().contains("supersecret") {
+        return Err("init response leaked raw database password".to_string());
+    }
+
+    Ok(())
+}
+
+#[test]
+fn empty_stdin_returns_structured_invalid_envelope() -> Result<(), String> {
+    let binary_path = assert_cmd::cargo::cargo_bin!("swarm");
+    let assert = Command::new(binary_path).assert().success();
+
+    let raw = String::from_utf8_lossy(&assert.get_output().stdout)
+        .trim()
+        .to_string();
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|err| format!("expected JSON response envelope, got '{raw}': {err}"))?;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["err"]["code"], "INVALID");
+
+    Ok(())
+}
+
+#[test]
+fn doctor_with_explicit_unreachable_database_url_marks_database_check_failed() -> Result<(), String>
+{
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness
+        .run_protocol(r#"{"cmd":"doctor","database_url":"postgresql://nope@127.0.0.1:1/no_db"}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], true);
+
+    let checks = json["d"]["c"]
+        .as_array()
+        .ok_or_else(|| "doctor response missing checks array".to_string())?;
+    let database_check = checks
+        .iter()
+        .find(|check| check["n"] == "database")
+        .ok_or_else(|| "doctor response missing database check".to_string())?;
+
+    if database_check["ok"] != serde_json::Value::Bool(false) {
+        return Err(format!(
+            "expected explicit unreachable database_url to fail database check, got {database_check}"
+        ));
     }
 
     Ok(())

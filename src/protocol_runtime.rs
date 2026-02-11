@@ -11,7 +11,6 @@
 
 use crate::agent_runtime::{run_agent, run_smoke_once};
 use crate::config::{database_url_candidates_for_cli, default_database_url_for_cli, load_config};
-use itertools::Itertools;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -508,23 +507,45 @@ struct BatchAcc {
 
 pub async fn run_protocol_loop() -> std::result::Result<(), SwarmError> {
     let stdin = BufReader::new(tokio::io::stdin());
-    let lines = stdin.lines();
-    run_protocol_loop_recursive(lines).await
+    let mut lines = stdin.lines();
+    let mut processed_non_empty_line = false;
+
+    while let Some(line) = lines.next_line().await.map_err(SwarmError::IoError)? {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        processed_non_empty_line = true;
+        process_protocol_line(&line).await?;
+    }
+
+    if !processed_non_empty_line {
+        emit_no_input_envelope().await?;
+    }
+
+    Ok(())
 }
 
-fn run_protocol_loop_recursive(
-    mut lines: tokio::io::Lines<BufReader<tokio::io::Stdin>>,
-) -> Pin<Box<dyn Future<Output = std::result::Result<(), SwarmError>> + Send>> {
-    Box::pin(async move {
-        match lines.next_line().await.map_err(SwarmError::IoError)? {
-            Some(line) if !line.trim().is_empty() => {
-                process_protocol_line(&line).await?;
-                run_protocol_loop_recursive(lines).await
-            }
-            Some(_) => run_protocol_loop_recursive(lines).await,
-            None => Ok(()),
-        }
-    })
+async fn emit_no_input_envelope() -> std::result::Result<(), SwarmError> {
+    let mut stdout = tokio::io::stdout();
+    let envelope = ProtocolEnvelope::error(
+        None,
+        code::INVALID.to_string(),
+        "No input received on stdin".to_string(),
+    )
+    .with_fix(
+        "Provide one JSON command per line. Example: echo '{\"cmd\":\"doctor\"}' | swarm"
+            .to_string(),
+    )
+    .with_ctx(json!({"stdin": "empty"}))
+    .with_ms(0);
+
+    let response_text = serde_json::to_string(&envelope).map_err(SwarmError::SerializationError)?;
+    stdout
+        .write_all(response_text.as_bytes())
+        .await
+        .map_err(SwarmError::IoError)?;
+    stdout.write_all(b"\n").await.map_err(SwarmError::IoError)
 }
 
 pub async fn process_protocol_line(line: &str) -> std::result::Result<(), SwarmError> {
@@ -705,8 +726,9 @@ async fn handle_state(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
     let db: SwarmDb = db_from_request(request).await?;
+    let repo_id = repo_id_from_request(request);
     let progress = db
-        .get_progress(&RepoId::new("local"))
+        .get_progress(&repo_id)
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
     let resources = db
@@ -728,7 +750,7 @@ async fn handle_state(
         )
         .collect::<Vec<_>>();
 
-    let config = match db.get_config(&RepoId::new("local")).await {
+    let config = match db.get_config(&repo_id).await {
         Ok(cfg) => json!({
             "max_agents": cfg.max_agents,
             "max_implementation_attempts": cfg.max_implementation_attempts,
@@ -1079,8 +1101,9 @@ async fn handle_monitor(
             json!({"view": "active", "rows": rows})
         }
         "progress" => {
+            let repo_id = repo_id_from_request(request);
             let progress = db
-                .get_progress(&RepoId::new("local"))
+                .get_progress(&repo_id)
                 .await
                 .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
             json!({
@@ -1094,8 +1117,9 @@ async fn handle_monitor(
             })
         }
         "failures" => {
+            let repo_id = repo_id_from_request(request);
             let rows = db
-                .get_execution_events(None, 200)
+                .get_execution_events(&repo_id, None, 200)
                 .await
                 .map_err(|e| to_protocol_failure(e, request.rid.clone()))?
                 .into_iter()
@@ -1121,8 +1145,9 @@ async fn handle_monitor(
         }
         "events" => {
             let bead_filter = request.args.get("bead_id").and_then(Value::as_str);
+            let repo_id = repo_id_from_request(request);
             let rows = db
-                .get_execution_events(bead_filter, 200)
+                .get_execution_events(&repo_id, bead_filter, 200)
                 .await
                 .map_err(|e| to_protocol_failure(e, request.rid.clone()))?
                 .into_iter()
@@ -1189,9 +1214,8 @@ async fn handle_register(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
     let db: SwarmDb = db_from_request(request).await?;
-    let config = db.get_config(&RepoId::new("local")).await.ok();
-    let repo_root = current_repo_root().await?;
-    let repo_root = current_repo_root().await?;
+    let repo_id_from_context = repo_id_from_request(request);
+    let config = db.get_config(&repo_id_from_context).await.ok();
 
     let count = request
         .args
@@ -1274,7 +1298,7 @@ async fn handle_agent(
         )
     })?;
 
-    if input.dry.unwrap_or(false) {
+    if dry_flag(request) || input.dry.unwrap_or(false) {
         return Ok(dry_run_success(
             request,
             vec![json!({"step": 1, "action": "run_agent", "target": input.id})],
@@ -1285,9 +1309,7 @@ async fn handle_agent(
     let config = load_config(None, false)
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
-    let db: SwarmDb = SwarmDb::new(&config.database_url)
-        .await
-        .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
+    let db: SwarmDb = db_from_request(request).await?;
     let repo_id = RepoId::from_current_dir().ok_or_else(|| {
         Box::new(
             ProtocolEnvelope::error(
@@ -1317,8 +1339,9 @@ async fn handle_status(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
     let db: SwarmDb = db_from_request(request).await?;
+    let repo_id = repo_id_from_request(request);
     let progress = db
-        .get_progress(&RepoId::new("local"))
+        .get_progress(&repo_id)
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
     Ok(CommandSuccess {
@@ -1339,8 +1362,9 @@ async fn handle_resume(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
     let db: SwarmDb = db_from_request(request).await?;
+    let repo_id = repo_id_from_request(request);
     let contexts = db
-        .get_resume_context_projections()
+        .get_resume_context_projections(&repo_id)
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
     let contracts = contexts
@@ -1367,8 +1391,9 @@ async fn handle_resume_context(
         .map(std::string::ToString::to_string);
 
     let db: SwarmDb = db_from_request(request).await?;
+    let repo_id = repo_id_from_request(request);
     let contexts = db
-        .get_deep_resume_contexts()
+        .get_deep_resume_contexts(&repo_id)
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
 
@@ -1406,8 +1431,9 @@ async fn handle_artifacts(
     let bead_id = parse_artifact_bead_id(request)?;
     let artifact_type = parse_artifact_type(request)?;
     let db: SwarmDb = db_from_request(request).await?;
+    let repo_id = repo_id_from_request(request);
     let artifacts = db
-        .get_bead_artifacts(&bead_id, artifact_type)
+        .get_bead_artifacts(&repo_id, &bead_id, artifact_type)
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
     let artifact_payload = artifacts.iter().map(artifact_to_json).collect::<Vec<_>>();
@@ -1453,7 +1479,7 @@ fn parse_artifact_type(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(|value| value.to_owned());
+        .map(ToOwned::to_owned);
 
     if let Some(value) = candidate {
         ArtifactType::try_from(value.as_str())
@@ -1573,8 +1599,9 @@ async fn handle_release(
     }
 
     let db: SwarmDb = db_from_request(request).await?;
+    let repo_id = repo_id_from_request(request);
     let released = db
-        .release_agent(&AgentId::new(RepoId::new("local"), agent_id))
+        .release_agent(&AgentId::new(repo_id, agent_id))
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
 
@@ -1610,13 +1637,13 @@ async fn handle_init_db(
         .args
         .get("seed_agents")
         .and_then(Value::as_u64)
-        .map_or(10, |value| value) as u32;
+        .map_or(12, |value| value) as u32;
 
     if dry_flag(request) {
         return Ok(dry_run_success(
             request,
             vec![
-                json!({"step": 1, "action": "connect_db", "target": url.clone()}),
+                json!({"step": 1, "action": "connect_db", "target": mask_database_url(&url)}),
                 json!({"step": 2, "action": "apply_schema", "target": schema.display().to_string()}),
                 json!({"step": 3, "action": "seed_agents", "target": seed_agents}),
             ],
@@ -1651,7 +1678,11 @@ async fn handle_init_db(
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
 
     Ok(CommandSuccess {
-        data: json!({"database_url": url, "schema": schema.display().to_string(), "seed_agents": seed_agents}),
+        data: json!({
+            "database_url": mask_database_url(&url),
+            "schema": schema.display().to_string(),
+            "seed_agents": seed_agents
+        }),
         next: "swarm state".to_string(),
         state: minimal_state_for_request(request).await,
     })
@@ -1697,7 +1728,7 @@ async fn handle_init_local_db(
         .args
         .get("seed_agents")
         .and_then(Value::as_u64)
-        .map_or(10, |value| value) as u32;
+        .map_or(12, |value| value) as u32;
 
     if dry_flag(request) {
         return Ok(dry_run_success(
@@ -1782,7 +1813,11 @@ async fn handle_init_local_db(
     let _ = handle_init_db(&init_request).await?;
 
     Ok(CommandSuccess {
-        data: json!({"container": container_name, "database_url": url, "seed_agents": seed_agents}),
+        data: json!({
+            "container": container_name,
+            "database_url": mask_database_url(&url),
+            "seed_agents": seed_agents
+        }),
         next: "swarm state".to_string(),
         state: minimal_state_for_request(request).await,
     })
@@ -1792,11 +1827,11 @@ async fn handle_spawn_prompts(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
     let db: SwarmDb = db_from_request(request).await?;
-    let config = db.get_config(&RepoId::new("local")).await.ok();
+    let repo_id = repo_id_from_request(request);
+    let config = db.get_config(&repo_id).await.ok();
 
-    let (template_text, template_name) = match request.args.get("template").and_then(Value::as_str)
-    {
-        Some(path) => {
+    let (template_text, template_name) =
+        if let Some(path) = request.args.get("template").and_then(Value::as_str) {
             let text = fs::read_to_string(path).await.map_err(|err| {
                 Box::new(
                     ProtocolEnvelope::error(
@@ -1809,15 +1844,14 @@ async fn handle_spawn_prompts(
                 )
             })?;
             (text, path.to_string())
-        }
-        None => {
+        } else {
+            let repo_root = current_repo_root().await?;
             let template_path = swarm::prompts::canonical_agent_prompt_path(&repo_root);
             let text = swarm::prompts::load_agent_prompt_template(&repo_root)
                 .await
                 .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
             (text, template_path.to_string_lossy().to_string())
-        }
-    };
+        };
 
     let out_dir = request
         .args
@@ -1940,7 +1974,8 @@ async fn handle_smoke(
     }
 
     let db: SwarmDb = db_from_request(request).await?;
-    run_smoke_once(&db, &AgentId::new(RepoId::new("local"), id))
+    let repo_id = repo_id_from_request(request);
+    run_smoke_once(&db, &AgentId::new(repo_id, id))
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
 
@@ -1961,7 +1996,7 @@ async fn handle_doctor(
         check_command("zjj").await,
         check_command("psql").await,
     ];
-    checks.push(check_database_connectivity().await);
+    checks.push(check_database_connectivity(request).await);
     let failed = checks
         .iter()
         .filter(|check| !check["ok"].as_bool().is_some_and(|value| value))
@@ -2026,6 +2061,7 @@ async fn handle_load_profile(
     }
 
     let db: SwarmDb = db_from_request(request).await?;
+    let repo_id = repo_id_from_request(request);
     db.seed_idle_agents(agents)
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
@@ -2033,8 +2069,16 @@ async fn handle_load_profile(
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
 
-    let stats =
-        load_profile_recursive(&db, 0, rounds, agents, timeout_ms, LoadStats::default()).await?;
+    let stats = load_profile_recursive(
+        &db,
+        &repo_id,
+        0,
+        rounds,
+        agents,
+        timeout_ms,
+        LoadStats::default(),
+    )
+    .await?;
 
     Ok(CommandSuccess {
         data: json!({
@@ -2052,6 +2096,7 @@ async fn handle_load_profile(
 
 fn load_profile_recursive<'a>(
     db: &'a SwarmDb,
+    repo_id: &'a RepoId,
     current_round: u32,
     total_rounds: u32,
     agents_per_round: u32,
@@ -2065,6 +2110,7 @@ fn load_profile_recursive<'a>(
         } else {
             let round_stats = load_profile_round_recursive(
                 db,
+                repo_id,
                 1,
                 agents_per_round,
                 timeout_ms,
@@ -2081,6 +2127,7 @@ fn load_profile_recursive<'a>(
 
             load_profile_recursive(
                 db,
+                repo_id,
                 current_round.saturating_add(1),
                 total_rounds,
                 agents_per_round,
@@ -2094,6 +2141,7 @@ fn load_profile_recursive<'a>(
 
 fn load_profile_round_recursive<'a>(
     db: &'a SwarmDb,
+    repo_id: &'a RepoId,
     agent_num: u32,
     total_agents: u32,
     timeout_ms: u64,
@@ -2107,7 +2155,7 @@ fn load_profile_round_recursive<'a>(
             let timeout_dur = tokio::time::Duration::from_millis(timeout_ms);
             let claim = tokio::time::timeout(
                 timeout_dur,
-                db.claim_next_bead(&AgentId::new(RepoId::new("local"), agent_num)),
+                db.claim_next_bead(&AgentId::new(repo_id.clone(), agent_num)),
             )
             .await;
 
@@ -2120,6 +2168,7 @@ fn load_profile_round_recursive<'a>(
 
             load_profile_round_recursive(
                 db,
+                repo_id,
                 agent_num.saturating_add(1),
                 total_agents,
                 timeout_ms,
@@ -2201,7 +2250,7 @@ async fn handle_init(
         .args
         .get("seed_agents")
         .and_then(Value::as_u64)
-        .map_or(10, |value| value) as u32;
+        .map_or(12, |value| value) as u32;
     let db_url = match request
         .args
         .get("database_url")
@@ -2226,7 +2275,7 @@ async fn handle_init(
             request,
             vec![
                 json!({"step": 1, "action": "bootstrap", "target": "repository"}),
-                json!({"step": 2, "action": "init_db", "target": db_url.clone()}),
+                json!({"step": 2, "action": "init_db", "target": mask_database_url(&db_url)}),
                 json!({"step": 3, "action": "register", "target": seed_agents}),
             ],
             "swarm doctor",
@@ -2291,7 +2340,7 @@ async fn handle_init(
             data: json!({
                 "initialized": true,
                 "steps": steps,
-                "database_url": db_url,
+                "database_url": mask_database_url(&db_url),
                 "seed_agents": seed_agents,
             }),
             next: "swarm doctor".to_string(),
@@ -2390,8 +2439,9 @@ async fn try_connect_candidates(candidates: &[String]) -> (Option<(SwarmDb, Stri
 }
 
 async fn minimal_state_for_request(request: &ProtocolRequest) -> Value {
+    let repo_id = repo_id_from_request(request);
     match db_from_request(request).await {
-        Ok(db) => match db.get_progress(&RepoId::new("local")).await {
+        Ok(db) => match db.get_progress(&repo_id).await {
             Ok(progress) => minimal_state_from_progress(&progress),
             Err(_) => json!({"total": 0, "active": 0}),
         },
@@ -2428,17 +2478,34 @@ async fn check_command(command: &str) -> Value {
     }
 }
 
-async fn check_database_connectivity() -> Value {
+async fn check_database_connectivity(request: &ProtocolRequest) -> Value {
+    if let Some(explicit_url) = request.args.get("database_url").and_then(Value::as_str) {
+        return match SwarmDb::new(explicit_url).await {
+            Ok(_) => {
+                json!({"name": "database", "ok": true, "url": mask_database_url(explicit_url), "source": "request.database_url"})
+            }
+            Err(err) => json!({
+                "name": "database",
+                "ok": false,
+                "url": mask_database_url(explicit_url),
+                "source": "request.database_url",
+                "fix": "Check request.database_url and verify postgres is reachable",
+                "errors": [err.to_string()],
+            }),
+        };
+    }
+
     let candidates = database_url_candidates_for_cli();
     let (connected, failures) = try_connect_candidates(&candidates).await;
 
     match connected {
         Some((_db, connected_url)) => {
-            json!({"name": "database", "ok": true, "url": mask_database_url(&connected_url)})
+            json!({"name": "database", "ok": true, "url": mask_database_url(&connected_url), "source": "discovered"})
         }
         None => json!({
             "name": "database",
             "ok": false,
+            "source": "discovered",
             "fix": "Set DATABASE_URL, verify postgres is reachable, or run 'swarm init-local-db'",
             "errors": failures,
         }),
@@ -2529,6 +2596,18 @@ fn now_ms() -> i64 {
 
 fn dry_flag(request: &ProtocolRequest) -> bool {
     request.dry.is_some_and(|value| value)
+}
+
+fn repo_id_from_request(request: &ProtocolRequest) -> RepoId {
+    request
+        .args
+        .get("repo_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(RepoId::new)
+        .or_else(RepoId::from_current_dir)
+        .unwrap_or_else(|| RepoId::new("local"))
 }
 
 fn process_batch_items<'a>(

@@ -10,7 +10,6 @@ use swarm::{Result, SwarmError};
 
 #[derive(Debug)]
 pub struct Config {
-    pub database_url: String,
     pub stage_commands: StageCommands,
 }
 
@@ -26,7 +25,6 @@ pub async fn load_config(path: Option<PathBuf>, claude_mode: bool) -> Result<Con
     let config_path = path.unwrap_or_else(|| PathBuf::from(".swarm/config.toml"));
     if !config_path.exists() {
         return Ok(Config {
-            database_url: default_database_url(),
             stage_commands: StageCommands::for_mode(claude_mode),
         });
     }
@@ -35,7 +33,7 @@ pub async fn load_config(path: Option<PathBuf>, claude_mode: bool) -> Result<Con
         .await
         .map_err(|e| SwarmError::ConfigError(format!("Failed to read config: {e}")))?;
 
-    let (database_url, stage_commands) = parse_config_content(&content);
+    let (_database_url, stage_commands) = parse_config_content(&content);
     let adjusted = if claude_mode {
         stage_commands.with_claude_fallbacks()
     } else {
@@ -43,9 +41,6 @@ pub async fn load_config(path: Option<PathBuf>, claude_mode: bool) -> Result<Con
     };
 
     Ok(Config {
-        database_url: database_url
-            .filter(|url| !url.is_empty())
-            .unwrap_or_else(default_database_url),
         stage_commands: adjusted,
     })
 }
@@ -142,10 +137,6 @@ impl StageCommands {
             red_queen: self.red_queen,
         }
     }
-}
-
-fn default_database_url() -> String {
-    non_empty_env_var("DATABASE_URL").unwrap_or_else(computed_default_database_url)
 }
 
 pub fn default_database_url_for_cli() -> String {

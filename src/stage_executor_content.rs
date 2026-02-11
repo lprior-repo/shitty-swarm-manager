@@ -9,14 +9,15 @@ use std::{
 #[must_use]
 pub fn contract_document_and_artifacts(bead_id: &BeadId) -> (String, HashMap<String, String>) {
     let issue = load_bead_issue(bead_id.value());
-    let bead_reference = issue
-        .as_ref()
-        .map(|issue| format!("{} — {}", bead_id.value(), issue.title))
-        .unwrap_or_else(|| bead_id.value().to_string());
-    let issue_goal = issue
-        .as_ref()
-        .map(|issue| format!("- Issue goal: {}\n", issue.title))
-        .unwrap_or_default();
+    let (bead_reference, issue_goal) = issue.as_ref().map_or_else(
+        || (bead_id.value().to_string(), String::new()),
+        |issue| {
+            (
+                format!("{} — {}", bead_id.value(), issue.title),
+                format!("- Issue goal: {}\n", issue.title),
+            )
+        },
+    );
     let requirements = format!(
         "- Implement bead {bead_id}\n- Preserve deterministic stage transitions\n- Persist artifacts for downstream stages\n{issue_goal}"
     );
@@ -41,15 +42,79 @@ pub fn contract_document_and_artifacts(bead_id: &BeadId) -> (String, HashMap<Str
     let validation_gates = "moon run :quick then moon run :test".to_string();
     let success_metrics =
         "Successful artifact handoff between stages and readable full message payloads".to_string();
-    let metadata_section = issue
-        .as_ref()
-        .map(render_issue_metadata)
-        .unwrap_or_else(|| "Bead metadata unavailable; refer to backlog.".to_string());
+    let metadata_section = issue.as_ref().map_or_else(
+        || "Bead metadata unavailable; refer to backlog.".to_string(),
+        render_issue_metadata,
+    );
     let issue_description_block = issue.as_ref().map(|issue| issue.description.clone());
     let ai_hints_block = issue
         .as_ref()
         .and_then(|issue| parse_ai_hints(&issue.description));
 
+    let sections = ContractSections {
+        bead_reference: &bead_reference,
+        metadata_section: &metadata_section,
+        requirements: &requirements,
+        system_context: &system_context,
+        invariants: &invariants,
+        data_flow: &data_flow,
+        error_handling: &error_handling,
+        test_scenarios: &test_scenarios,
+        validation_gates: &validation_gates,
+        success_metrics: &success_metrics,
+    };
+    let contract_document = render_contract_document(
+        &sections,
+        issue_description_block.as_deref(),
+        ai_hints_block.as_ref(),
+    );
+
+    let mut artifacts = vec![
+        ("requirements".to_string(), requirements),
+        ("system_context".to_string(), system_context),
+        ("invariants".to_string(), invariants),
+        ("data_flow".to_string(), data_flow),
+        ("implementation_plan".to_string(), implementation_plan),
+        ("acceptance_criteria".to_string(), acceptance_criteria),
+        ("error_handling".to_string(), error_handling),
+        ("test_scenarios".to_string(), test_scenarios),
+        ("validation_gates".to_string(), validation_gates),
+        ("success_metrics".to_string(), success_metrics),
+    ];
+
+    if issue.is_some() {
+        artifacts.push(("issue_metadata".to_string(), metadata_section));
+        if let Some(description) = &issue_description_block {
+            artifacts.push(("issue_description".to_string(), description.clone()));
+        }
+        if let Some(ai_hints) = &ai_hints_block {
+            artifacts.push(("ai_hints".to_string(), render_ai_hints(ai_hints)));
+        }
+    }
+
+    let artifacts = artifacts.into_iter().collect::<HashMap<_, _>>();
+
+    (contract_document, artifacts)
+}
+
+struct ContractSections<'a> {
+    bead_reference: &'a str,
+    metadata_section: &'a str,
+    requirements: &'a str,
+    system_context: &'a str,
+    invariants: &'a str,
+    data_flow: &'a str,
+    error_handling: &'a str,
+    test_scenarios: &'a str,
+    validation_gates: &'a str,
+    success_metrics: &'a str,
+}
+
+fn render_contract_document(
+    sections: &ContractSections<'_>,
+    issue_description: Option<&str>,
+    ai_hints: Option<&AiHints>,
+) -> String {
     let mut contract_document = format!(
         "# Contract for {bead_reference}\n\n\
          ## Goal\n\
@@ -85,46 +150,32 @@ pub fn contract_document_and_artifacts(bead_id: &BeadId) -> (String, HashMap<Str
          {validation_gates}\n\n\
          ## Success Metrics\n\
          {success_metrics}\n\n"
+        ,
+        bead_reference = sections.bead_reference,
+        metadata_section = sections.metadata_section,
+        requirements = sections.requirements,
+        system_context = sections.system_context,
+        invariants = sections.invariants,
+        data_flow = sections.data_flow,
+        error_handling = sections.error_handling,
+        test_scenarios = sections.test_scenarios,
+        validation_gates = sections.validation_gates,
+        success_metrics = sections.success_metrics
     );
 
-    if let Some(description) = &issue_description_block {
+    if let Some(description) = issue_description {
         contract_document.push_str("## Backlog Description\n```cue\n");
         contract_document.push_str(description.trim());
         contract_document.push_str("\n```\n\n");
     }
 
-    if let Some(ai_hints) = &ai_hints_block {
+    if let Some(hints) = ai_hints {
         contract_document.push_str("## AI Hints\n");
-        contract_document.push_str(&render_ai_hints(ai_hints));
+        contract_document.push_str(&render_ai_hints(hints));
         contract_document.push('\n');
     }
 
-    let mut artifacts = vec![
-        ("requirements".to_string(), requirements.clone()),
-        ("system_context".to_string(), system_context),
-        ("invariants".to_string(), invariants),
-        ("data_flow".to_string(), data_flow),
-        ("implementation_plan".to_string(), implementation_plan),
-        ("acceptance_criteria".to_string(), acceptance_criteria),
-        ("error_handling".to_string(), error_handling),
-        ("test_scenarios".to_string(), test_scenarios),
-        ("validation_gates".to_string(), validation_gates),
-        ("success_metrics".to_string(), success_metrics),
-    ];
-
-    if issue.is_some() {
-        artifacts.push(("issue_metadata".to_string(), metadata_section.clone()));
-        if let Some(description) = issue_description_block.clone() {
-            artifacts.push(("issue_description".to_string(), description));
-        }
-        if let Some(ai_hints) = ai_hints_block {
-            artifacts.push(("ai_hints".to_string(), render_ai_hints(&ai_hints)));
-        }
-    }
-
-    let artifacts = artifacts.into_iter().collect::<HashMap<_, _>>();
-
-    (contract_document, artifacts)
+    contract_document
 }
 
 #[must_use]
@@ -191,17 +242,11 @@ fn load_bead_issue(bead_id: &str) -> Option<BeadIssue> {
     let file = File::open(".beads/issues.jsonl").ok()?;
     let reader = BufReader::new(file);
 
-    for line in reader.lines() {
-        if let Ok(record) = line {
-            if let Ok(issue) = serde_json::from_str::<BeadIssue>(&record) {
-                if issue.id == bead_id {
-                    return Some(issue);
-                }
-            }
-        }
-    }
-
-    None
+    reader
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|record| serde_json::from_str::<BeadIssue>(&record).ok())
+        .find(|issue| issue.id == bead_id)
 }
 
 fn render_issue_metadata(issue: &BeadIssue) -> String {
@@ -211,7 +256,7 @@ fn render_issue_metadata(issue: &BeadIssue) -> String {
     ];
 
     if let Some(status) = &issue.status {
-        lines.push(format!("- Status: {}", status));
+        lines.push(format!("- Status: {status}"));
     }
 
     if let Some(priority) = issue.priority {

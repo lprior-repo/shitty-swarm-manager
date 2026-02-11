@@ -52,6 +52,7 @@ struct SwarmConfigRow {
 
 #[derive(FromRow)]
 struct ActiveAgentRow {
+    repo_id: String,
     agent_id: i32,
     bead_id: Option<String>,
     status: String,
@@ -266,8 +267,9 @@ impl SwarmDb {
         let agent_id_number = agent_id.number();
         sqlx::query_as::<_, AgentStateRow>(
             "SELECT bead_id, current_stage, stage_started_at, status, last_update, implementation_attempt, feedback
-             FROM agent_state WHERE agent_id = $1",
+             FROM agent_state WHERE repo_id = $1 AND agent_id = $2",
         )
+            .bind(agent_id.repo_id().value())
             .bind(agent_id_number.cast_signed())
             .fetch_optional(self.pool())
             .await
@@ -298,11 +300,12 @@ impl SwarmDb {
     ///
     /// Returns `SwarmError::DatabaseError` if the database query fails.
     pub async fn get_available_agents(&self, repo_id: &RepoId) -> Result<Vec<AvailableAgent>> {
-        let local_repo = repo_id.clone();
         sqlx::query_as::<_, AvailableAgentRow>(
             "SELECT agent_id, status, implementation_attempt, max_implementation_attempts, max_agents
-             FROM v_available_agents",
+             FROM v_available_agents
+             WHERE repo_id = $1",
         )
+            .bind(repo_id.value())
             .fetch_all(self.pool())
             .await
             .map_err(|e| SwarmError::DatabaseError(format!("Failed to get available agents: {e}")))
@@ -312,7 +315,7 @@ impl SwarmDb {
                         AgentStatus::try_from(row.status.as_str())
                             .map_err(SwarmError::DatabaseError)
                             .map(|status| AvailableAgent {
-                                repo_id: local_repo.clone(),
+                                repo_id: repo_id.clone(),
                                 agent_id: to_u32_i32(row.agent_id),
                                 status,
                                 implementation_attempt: to_u32_i32(row.implementation_attempt),
@@ -329,7 +332,7 @@ impl SwarmDb {
     /// # Errors
     ///
     /// Returns `SwarmError::DatabaseError` if the database query fails.
-    pub async fn get_progress(&self, _repo_id: &RepoId) -> Result<ProgressSummary> {
+    pub async fn get_progress(&self, repo_id: &RepoId) -> Result<ProgressSummary> {
         sqlx::query_as::<_, ProgressRow>(
             "SELECT
                 done_agents AS done,
@@ -338,18 +341,30 @@ impl SwarmDb {
                 error_agents AS error,
                 idle_agents AS idle,
                 total_agents AS total
-             FROM v_swarm_progress",
+             FROM v_swarm_progress
+             WHERE repo_id = $1",
         )
-        .fetch_one(self.pool())
+        .bind(repo_id.value())
+        .fetch_optional(self.pool())
         .await
         .map_err(|e| SwarmError::DatabaseError(format!("Failed to get progress: {e}")))
-        .map(|row| ProgressSummary {
-            completed: row.done.cast_unsigned(),
-            working: row.working.cast_unsigned(),
-            waiting: row.waiting.cast_unsigned(),
-            errors: row.error.cast_unsigned(),
-            idle: row.idle.cast_unsigned(),
-            total_agents: row.total.cast_unsigned(),
+        .map(|row_opt| {
+            let row = row_opt.unwrap_or(ProgressRow {
+                done: 0,
+                working: 0,
+                waiting: 0,
+                error: 0,
+                idle: 0,
+                total: 0,
+            });
+            ProgressSummary {
+                completed: row.done.cast_unsigned(),
+                working: row.working.cast_unsigned(),
+                waiting: row.waiting.cast_unsigned(),
+                errors: row.error.cast_unsigned(),
+                idle: row.idle.cast_unsigned(),
+                total_agents: row.total.cast_unsigned(),
+            }
         })
     }
 
@@ -383,7 +398,8 @@ impl SwarmDb {
     ///
     /// Returns `SwarmError::DatabaseError` if the database query fails.
     pub fn list_repos(&self) -> Result<Vec<(RepoId, String)>> {
-        Ok(vec![(RepoId::new("local"), "local".to_string())])
+        let repo_id = repo_id_from_context();
+        Ok(vec![(repo_id.clone(), repo_id.value().to_string())])
     }
 
     /// Gets all active agents across all repositories.
@@ -395,7 +411,7 @@ impl SwarmDb {
         &self,
     ) -> Result<Vec<(RepoId, u32, Option<String>, String)>> {
         sqlx::query_as::<_, ActiveAgentRow>(
-            "SELECT agent_id, bead_id, status FROM v_active_agents ORDER BY last_update DESC",
+            "SELECT repo_id, agent_id, bead_id, status FROM v_active_agents ORDER BY last_update DESC",
         )
         .fetch_all(self.pool())
         .await
@@ -404,7 +420,7 @@ impl SwarmDb {
             rows.into_iter()
                 .map(|row| {
                     (
-                        RepoId::new("local"),
+                        RepoId::new(row.repo_id),
                         to_u32_i32(row.agent_id),
                         row.bead_id,
                         row.status,
@@ -421,7 +437,8 @@ impl SwarmDb {
     /// Returns `SwarmError::DatabaseError` if the database query fails.
     pub async fn claim_next_bead(&self, agent_id: &AgentId) -> Result<Option<BeadId>> {
         let claim_agent_id = agent_id.number();
-        sqlx::query_scalar::<_, Option<String>>("SELECT claim_next_p0_bead($1)")
+        sqlx::query_scalar::<_, Option<String>>("SELECT claim_next_p0_bead($1, $2)")
+            .bind(agent_id.repo_id().value())
             .bind(claim_agent_id.cast_signed())
             .fetch_one(self.pool())
             .await
@@ -436,9 +453,9 @@ impl SwarmDb {
     /// Returns `SwarmError::DatabaseError` if the database query fails.
     pub async fn get_feedback_required(
         &self,
-    ) -> Result<Vec<(String, u32, String, u32, Option<String>, Option<String>)>> {
-        sqlx::query_as::<_, FeedbackRow>(
-            "SELECT bead_id, agent_id, stage, attempt_number, feedback, completed_at::TEXT
+    ) -> Result<Vec<(RepoId, u32, String, u32, Option<String>, Option<String>)>> {
+        sqlx::query_as::<_, (String, String, i32, String, i32, Option<String>, Option<String>)>(
+            "SELECT repo_id, bead_id, agent_id, stage, attempt_number, feedback, completed_at::TEXT
              FROM v_feedback_required
              ORDER BY completed_at DESC NULLS LAST",
         )
@@ -449,12 +466,12 @@ impl SwarmDb {
             rows.into_iter()
                 .map(|row| {
                     (
-                        row.bead_id,
-                        to_u32_i32(row.agent_id),
-                        row.stage,
-                        to_u32_i32(row.attempt_number),
-                        row.feedback,
-                        row.completed_at,
+                        RepoId::new(row.0),
+                        to_u32_i32(row.2),
+                        row.3,
+                        to_u32_i32(row.4),
+                        row.5,
+                        row.6,
                     )
                 })
                 .collect::<Vec<_>>()
@@ -468,6 +485,7 @@ impl SwarmDb {
     /// Returns `SwarmError::DatabaseError` if the database query fails.
     pub async fn get_execution_events(
         &self,
+        repo_id: &RepoId,
         bead_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<ExecutionEvent>> {
@@ -488,10 +506,14 @@ impl SwarmDb {
                 payload,
                 created_at
              FROM execution_events
-             WHERE ($1::TEXT IS NULL OR bead_id = $1)
+             WHERE bead_id IN (
+                 SELECT bc.bead_id FROM bead_claims bc WHERE bc.repo_id = $1
+             )
+             AND ($2::TEXT IS NULL OR bead_id = $2)
              ORDER BY seq DESC
-             LIMIT $2",
+             LIMIT $3",
         )
+        .bind(repo_id.value())
         .bind(bead_id)
         .bind(limit)
         .fetch_all(self.pool())
@@ -519,12 +541,12 @@ impl SwarmDb {
         })
     }
 
-    /// Retrieves resumable execution context for each active bead.
+    /// Retrieves resumable execution context for each active bead in a repository.
     ///
     /// # Errors
     ///
     /// Returns `SwarmError::DatabaseError` if the database query fails.
-    pub async fn get_resume_context_projections(&self) -> Result<Vec<ResumeContextProjection>> {
+    pub async fn get_resume_context_projections(&self, repo_id: &RepoId) -> Result<Vec<ResumeContextProjection>> {
         let artifact_types = resume_artifact_type_names();
         let contexts = sqlx::query_as::<_, ResumeContextAggregateRow>(
             "SELECT
@@ -548,7 +570,8 @@ impl SwarmDb {
                             ORDER BY sh.attempt_number ASC, sh.started_at ASC, sh.id ASC
                         )
                         FROM stage_history sh
-                        WHERE sh.bead_id = a.bead_id
+                        JOIN bead_claims bc ON bc.bead_id = sh.bead_id
+                        WHERE sh.bead_id = a.bead_id AND bc.repo_id = $1
                     ),
                     '[]'::json
                 ) AS attempts_json,
@@ -571,18 +594,22 @@ impl SwarmDb {
                                 OCTET_LENGTH(sa.content)::BIGINT AS byte_length
                             FROM stage_artifacts sa
                             JOIN stage_history sh ON sh.id = sa.stage_history_id
-                            WHERE sh.bead_id = a.bead_id
-                              AND sa.artifact_type = ANY($1::TEXT[])
+                            JOIN bead_claims bc ON bc.bead_id = sh.bead_id
+                            WHERE sh.bead_id = a.bead_id AND bc.repo_id = $1
+                              AND sa.artifact_type = ANY($2::TEXT[])
                             ORDER BY sa.artifact_type, sa.created_at DESC, sa.id DESC
                         ) AS latest
                     ),
                     '[]'::json
                 ) AS artifacts_json
              FROM agent_state a
+             JOIN bead_claims bc ON bc.bead_id = a.bead_id
              WHERE a.bead_id IS NOT NULL
                AND a.status IN ('working', 'waiting', 'error')
+               AND bc.repo_id = $1
              ORDER BY a.bead_id ASC, a.agent_id ASC",
         )
+        .bind(repo_id.value())
         .bind(artifact_types)
         .fetch_all(self.pool())
         .await
@@ -620,8 +647,13 @@ impl SwarmDb {
         Ok(projections)
     }
 
-    pub async fn get_deep_resume_contexts(&self) -> Result<Vec<DeepResumeContextContract>> {
-        let projections = self.get_resume_context_projections().await?;
+    /// Retrieves enriched resumable execution context, including latest diagnostics and artifacts.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::DatabaseError` if any database query fails.
+    pub async fn get_deep_resume_contexts(&self, repo_id: &RepoId) -> Result<Vec<DeepResumeContextContract>> {
+        let projections = self.get_resume_context_projections(repo_id).await?;
         if projections.is_empty() {
             return Ok(Vec::new());
         }
@@ -631,8 +663,8 @@ impl SwarmDb {
             .map(|context| context.bead_id.value().to_string())
             .collect::<Vec<_>>();
 
-        let diagnostics_map = self.get_latest_diagnostics_for_beads(&bead_ids).await?;
-        let artifacts_map = self.get_latest_artifacts_for_beads(&bead_ids).await?;
+        let diagnostics_map = self.get_latest_diagnostics_for_beads(repo_id, &bead_ids).await?;
+        let artifacts_map = self.get_latest_artifacts_for_beads(repo_id, &bead_ids).await?;
 
         let contexts = projections
             .into_iter()
@@ -676,6 +708,7 @@ impl SwarmDb {
 
     async fn get_latest_diagnostics_for_beads(
         &self,
+        repo_id: &RepoId,
         bead_ids: &[String],
     ) -> Result<HashMap<String, FailureDiagnostics>> {
         if bead_ids.is_empty() {
@@ -700,10 +733,12 @@ impl SwarmDb {
                 created_at
              FROM execution_events
              WHERE bead_id = ANY($1::TEXT[])
+               AND bead_id IN (SELECT bc.bead_id FROM bead_claims bc WHERE bc.repo_id = $2)
                AND diagnostics_category IS NOT NULL
              ORDER BY bead_id, seq DESC",
         )
         .bind(bead_ids)
+        .bind(repo_id.value())
         .fetch_all(self.pool())
         .await
         .map_err(|e| {
@@ -726,6 +761,7 @@ impl SwarmDb {
 
     async fn get_latest_artifacts_for_beads(
         &self,
+        repo_id: &RepoId,
         bead_ids: &[String],
     ) -> Result<HashMap<String, Vec<ResumeArtifactDetailContract>>> {
         if bead_ids.is_empty() {
@@ -744,10 +780,12 @@ impl SwarmDb {
              FROM stage_artifacts sa
              JOIN stage_history sh ON sh.id = sa.stage_history_id
              WHERE sh.bead_id = ANY($1::TEXT[])
-               AND sa.artifact_type = ANY($2::TEXT[])
+               AND sh.bead_id IN (SELECT bc.bead_id FROM bead_claims bc WHERE bc.repo_id = $2)
+               AND sa.artifact_type = ANY($3::TEXT[])
              ORDER BY sh.bead_id, sa.artifact_type, sa.created_at DESC, sa.id DESC",
         )
         .bind(bead_ids)
+        .bind(repo_id.value())
         .bind(artifact_types)
         .fetch_all(self.pool())
         .await
@@ -761,7 +799,7 @@ impl SwarmDb {
         for row in rows {
             let bead_id = row.bead_id;
             let content = row.content;
-            let byte_length = content.as_bytes().len() as u64;
+            let byte_length = content.len() as u64;
             let detail = ResumeArtifactDetailContract {
                 artifact_type: row.artifact_type,
                 created_at: row.created_at,
@@ -781,14 +819,21 @@ impl SwarmDb {
     /// # Errors
     ///
     /// Returns `SwarmError::DatabaseError` if the database query fails.
-    pub async fn get_stage_artifacts(&self, stage_history_id: i64) -> Result<Vec<StageArtifact>> {
+    pub async fn get_stage_artifacts(
+        &self,
+        repo_id: &RepoId,
+        stage_history_id: i64,
+    ) -> Result<Vec<StageArtifact>> {
         sqlx::query_as::<_, StageArtifactRow>(
-            "SELECT id, stage_history_id, artifact_type, content, metadata, created_at, content_hash
-             FROM stage_artifacts
-             WHERE stage_history_id = $1
-             ORDER BY created_at ASC",
+            "SELECT sa.id, sa.stage_history_id, sa.artifact_type, sa.content, sa.metadata, sa.created_at, sa.content_hash
+             FROM stage_artifacts sa
+             JOIN stage_history sh ON sa.stage_history_id = sh.id
+             JOIN bead_claims bc ON bc.bead_id = sh.bead_id
+             WHERE sa.stage_history_id = $1 AND bc.repo_id = $2
+             ORDER BY sa.created_at ASC",
         )
         .bind(stage_history_id)
+        .bind(repo_id.value())
         .fetch_all(self.pool())
         .await
         .map_err(|e| SwarmError::DatabaseError(format!("Failed to get stage artifacts: {e}")))
@@ -818,6 +863,7 @@ impl SwarmDb {
     /// Returns `SwarmError::DatabaseError` if the database query fails.
     pub async fn get_bead_artifacts_by_type(
         &self,
+        repo_id: &RepoId,
         bead_id: &BeadId,
         artifact_type: ArtifactType,
     ) -> Result<Vec<StageArtifact>> {
@@ -825,10 +871,12 @@ impl SwarmDb {
             "SELECT sa.id, sa.stage_history_id, sa.artifact_type, sa.content, sa.metadata, sa.created_at, sa.content_hash
              FROM stage_artifacts sa
              JOIN stage_history sh ON sa.stage_history_id = sh.id
-             WHERE sh.bead_id = $1 AND sa.artifact_type = $2
+             JOIN bead_claims bc ON bc.bead_id = sh.bead_id
+             WHERE sh.bead_id = $1 AND bc.repo_id = $2 AND sa.artifact_type = $3
              ORDER BY sa.created_at ASC",
         )
         .bind(bead_id.value())
+        .bind(repo_id.value())
         .bind(artifact_type.as_str())
         .fetch_all(self.pool())
         .await
@@ -855,23 +903,30 @@ impl SwarmDb {
     }
 
     /// Retrieves artifacts for a bead with optional type filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::DatabaseError` when artifact rows cannot be fetched or mapped.
     pub async fn get_bead_artifacts(
         &self,
+        repo_id: &RepoId,
         bead_id: &BeadId,
         artifact_type: Option<ArtifactType>,
     ) -> Result<Vec<StageArtifact>> {
         if let Some(kind) = artifact_type {
-            return self.get_bead_artifacts_by_type(bead_id, kind).await;
+            return self.get_bead_artifacts_by_type(repo_id, bead_id, kind).await;
         }
 
         sqlx::query_as::<_, StageArtifactRow>(
             "SELECT sa.id, sa.stage_history_id, sa.artifact_type, sa.content, sa.metadata, sa.created_at, sa.content_hash
              FROM stage_artifacts sa
              JOIN stage_history sh ON sa.stage_history_id = sh.id
-             WHERE sh.bead_id = $1
+             JOIN bead_claims bc ON bc.bead_id = sh.bead_id
+             WHERE sh.bead_id = $1 AND bc.repo_id = $2
              ORDER BY sa.created_at ASC, sa.id ASC",
         )
         .bind(bead_id.value())
+        .bind(repo_id.value())
         .fetch_all(self.pool())
         .await
         .map_err(|e| SwarmError::DatabaseError(format!("Failed to get bead artifacts: {e}")))
@@ -901,6 +956,7 @@ impl SwarmDb {
     /// Returns `SwarmError::DatabaseError` if the database query fails.
     pub async fn get_latest_bead_artifact_by_type(
         &self,
+        repo_id: &RepoId,
         bead_id: &BeadId,
         artifact_type: ArtifactType,
     ) -> Result<Option<StageArtifact>> {
@@ -908,11 +964,13 @@ impl SwarmDb {
             "SELECT sa.id, sa.stage_history_id, sa.artifact_type, sa.content, sa.metadata, sa.created_at, sa.content_hash
              FROM stage_artifacts sa
              JOIN stage_history sh ON sa.stage_history_id = sh.id
-             WHERE sh.bead_id = $1 AND sa.artifact_type = $2
+             JOIN bead_claims bc ON bc.bead_id = sh.bead_id
+             WHERE sh.bead_id = $1 AND bc.repo_id = $2 AND sa.artifact_type = $3
              ORDER BY sa.created_at DESC, sa.id DESC
              LIMIT 1",
         )
         .bind(bead_id.value())
+        .bind(repo_id.value())
         .bind(artifact_type.as_str())
         .fetch_optional(self.pool())
         .await
@@ -945,6 +1003,7 @@ impl SwarmDb {
     /// Returns `SwarmError::DatabaseError` if the database query fails.
     pub async fn get_first_bead_artifact_by_type(
         &self,
+        repo_id: &RepoId,
         bead_id: &BeadId,
         artifact_type: ArtifactType,
     ) -> Result<Option<StageArtifact>> {
@@ -952,11 +1011,13 @@ impl SwarmDb {
             "SELECT sa.id, sa.stage_history_id, sa.artifact_type, sa.content, sa.metadata, sa.created_at, sa.content_hash
              FROM stage_artifacts sa
              JOIN stage_history sh ON sa.stage_history_id = sh.id
-             WHERE sh.bead_id = $1 AND sa.artifact_type = $2
+             JOIN bead_claims bc ON bc.bead_id = sh.bead_id
+             WHERE sh.bead_id = $1 AND bc.repo_id = $2 AND sa.artifact_type = $3
              ORDER BY sa.created_at ASC
              LIMIT 1",
         )
         .bind(bead_id.value())
+        .bind(repo_id.value())
         .bind(artifact_type.as_str())
         .fetch_optional(self.pool())
         .await
@@ -989,6 +1050,7 @@ impl SwarmDb {
     /// Returns `SwarmError::DatabaseError` if the database query fails.
     pub async fn bead_has_artifact_type(
         &self,
+        repo_id: &RepoId,
         bead_id: &BeadId,
         artifact_type: ArtifactType,
     ) -> Result<bool> {
@@ -997,7 +1059,8 @@ impl SwarmDb {
                  SELECT 1
                  FROM stage_artifacts sa
                  JOIN stage_history sh ON sa.stage_history_id = sh.id
-                 WHERE sh.bead_id = $1 AND sa.artifact_type = $2
+                 JOIN bead_claims bc ON bc.bead_id = sh.bead_id
+                 WHERE sh.bead_id = $1 AND bc.repo_id = $2 AND sa.artifact_type = $3
              )",
         )
         .bind(bead_id.value())
@@ -1097,6 +1160,10 @@ impl SwarmDb {
     }
 }
 
+fn repo_id_from_context() -> RepoId {
+    RepoId::from_current_dir().unwrap_or_else(|| RepoId::new("local"))
+}
+
 fn diagnostics_from_row(row: &ExecutionEventRow) -> Option<FailureDiagnostics> {
     row.diagnostics_category
         .as_ref()
@@ -1150,6 +1217,7 @@ fn parse_resume_artifacts(json: serde_json::Value) -> Result<Vec<ResumeArtifactS
         })
 }
 
+#[must_use]
 fn resume_artifact_type_names() -> Vec<String> {
     [
         ArtifactType::ContractDocument,

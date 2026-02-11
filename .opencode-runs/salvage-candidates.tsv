@@ -1,0 +1,10 @@
+commit	description	files_changed	insertions	deletions
+dbeb66e57dda	add deep resume-context command	4	347	6
+edada54dfda1	add deep resume-context command	2	133	16
+ef090cd743a1	add deep resume-context command	2	27	4
+3194140368f5	refine resume-context handler	8	937	1141
+50f13c095108	Add resume persistence parser tests	?	?	?
+58beee94b6e7	test: cover crash-resume persistence payloads	?	?	?
+676bf7906398	test: cover crash-resume persistence payloads	8	560	8
+87c4c51ef127	swm-3qw contract formatting	23	2073	890
+234ad24e271b	Fix contract document builder (main)	?	?	?
