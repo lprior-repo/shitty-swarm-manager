@@ -10,14 +10,14 @@
 #![allow(clippy::too_many_lines)]
 
 use crate::agent_runtime::{run_agent, run_smoke_once};
-use crate::config::{database_url_candidates_for_cli, default_database_url_for_cli, load_config};
+use crate::config::{database_url_candidates_for_cli, load_config};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use swarm::protocol_envelope::ProtocolEnvelope;
 use swarm::{
     code, AgentId, ArtifactType, BeadId, RepoId, ResumeContextContract, StageArtifact, SwarmDb,
@@ -30,6 +30,9 @@ use tokio::process::Command;
 const EMBEDDED_COORDINATOR_SCHEMA_SQL: &str =
     include_str!("../crates/swarm-coordinator/schema.sql");
 const EMBEDDED_COORDINATOR_SCHEMA_REF: &str = "embedded:crates/swarm-coordinator/schema.sql";
+const DEFAULT_DB_CONNECT_TIMEOUT_MS: u64 = 3_000;
+const MIN_DB_CONNECT_TIMEOUT_MS: u64 = 100;
+const MAX_DB_CONNECT_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct ProtocolRequest {
@@ -622,16 +625,25 @@ pub async fn process_protocol_line(line: &str) -> std::result::Result<(), SwarmE
         }
     }
 
-    let _ = audit_request(
+    let candidates = database_url_candidates_for_cli();
+    match audit_request(
         &audit_cmd,
         maybe_rid.as_deref(),
         audit_args,
         envelope.ok,
         started.elapsed().as_millis() as u64,
         envelope.err.as_ref().map(|e| e.code.as_str()),
+        &candidates,
     )
-    .await;
-    Ok(())
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Log audit failure but don't fail the request
+            eprintln!("WARN: Audit trail recording failed: {e}");
+            Ok(())
+        }
+    }
 }
 
 async fn execute_request(
@@ -730,6 +742,11 @@ async fn handle_help(
             "v": env!("CARGO_PKG_VERSION"),
             "commands": command_map,
             "cmds": commands,
+            "batch_input": {
+                "required": "ops",
+                "not": "cmds",
+                "example": "echo '{\"cmd\":\"batch\",\"ops\":[{\"cmd\":\"doctor\"},{\"cmd\":\"status\"}]}' | swarm",
+            }
         }),
         next: "swarm state".to_string(),
         state: minimal_state_for_request(_request).await,
@@ -768,20 +785,33 @@ async fn run_external_json_command(
     rid: Option<String>,
     fix: &str,
 ) -> std::result::Result<Value, Box<ProtocolEnvelope>> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .await
-        .map_err(|err| {
-            Box::new(
-                ProtocolEnvelope::error(
-                    rid.clone(),
-                    code::INTERNAL.to_string(),
-                    format!("Failed to execute {program}: {err}"),
-                )
-                .with_fix(fix.to_string()),
+    let timeout_ms = 15_000_u64;
+    let output = tokio::time::timeout(
+        tokio::time::Duration::from_millis(timeout_ms),
+        Command::new(program).args(args).output(),
+    )
+    .await
+    .map_err(|_| {
+        Box::new(
+            ProtocolEnvelope::error(
+                rid.clone(),
+                code::INTERNAL.to_string(),
+                format!("{program} command timed out"),
             )
-        })?;
+            .with_fix(fix.to_string())
+            .with_ctx(json!({"program": program, "args": args, "timeout_ms": timeout_ms})),
+        )
+    })?
+    .map_err(|err| {
+        Box::new(
+            ProtocolEnvelope::error(
+                rid.clone(),
+                code::INTERNAL.to_string(),
+                format!("Failed to execute {program}: {err}"),
+            )
+            .with_fix(fix.to_string()),
+        )
+    })?;
 
     if !output.status.success() {
         let exit_code = output.status.code().unwrap_or(1);
@@ -819,9 +849,27 @@ async fn run_external_json_command(
     })
 }
 
+async fn run_external_json_command_with_ms(
+    program: &str,
+    args: &[&str],
+    rid: Option<String>,
+    fix: &str,
+) -> std::result::Result<(Value, u64), Box<ProtocolEnvelope>> {
+    let start = Instant::now();
+    run_external_json_command(program, args, rid, fix)
+        .await
+        .map(|value| (value, elapsed_ms(start)))
+}
+
+fn elapsed_ms(start: Instant) -> u64 {
+    let ms = start.elapsed().as_millis();
+    u64::try_from(ms).map_or(u64::MAX, |value| value)
+}
+
 async fn handle_next(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
+    let total_start = Instant::now();
     if dry_flag(request) {
         return Ok(dry_run_success(
             request,
@@ -830,7 +878,7 @@ async fn handle_next(
         ));
     }
 
-    let parsed = run_external_json_command(
+    let (parsed, bv_ms) = run_external_json_command_with_ms(
         "bv",
         &["--robot-next"],
         request.rid.clone(),
@@ -842,6 +890,12 @@ async fn handle_next(
         data: json!({
             "source": "bv --robot-next",
             "next": project_next_recommendation(&parsed),
+            "timing": {
+                "external": {
+                    "bv_robot_next_ms": bv_ms,
+                },
+                "total_ms": elapsed_ms(total_start),
+            }
         }),
         next: "br update <bead-id> --status in_progress".to_string(),
         state: minimal_state_for_request(request).await,
@@ -851,6 +905,7 @@ async fn handle_next(
 async fn handle_claim_next(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
+    let total_start = Instant::now();
     if dry_flag(request) {
         return Ok(dry_run_success(
             request,
@@ -862,7 +917,7 @@ async fn handle_claim_next(
         ));
     }
 
-    let recommendation_payload = run_external_json_command(
+    let (recommendation_payload, bv_robot_next_ms) = run_external_json_command_with_ms(
         "bv",
         &["--robot-next"],
         request.rid.clone(),
@@ -882,7 +937,7 @@ async fn handle_claim_next(
         )
     })?;
 
-    let claim = run_external_json_command(
+    let (claim, br_update_ms) = run_external_json_command_with_ms(
         "br",
         &[
             "update",
@@ -900,6 +955,13 @@ async fn handle_claim_next(
         data: json!({
             "selection": recommendation,
             "claim": claim,
+            "timing": {
+                "external": {
+                    "bv_robot_next_ms": bv_robot_next_ms,
+                    "br_update_ms": br_update_ms,
+                },
+                "total_ms": elapsed_ms(total_start),
+            }
         }),
         next: format!("br show {bead_id}"),
         state: minimal_state_for_request(request).await,
@@ -1161,6 +1223,7 @@ async fn handle_assign(
 async fn handle_run_once(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
+    let total_start = Instant::now();
     let agent_id = request
         .args
         .get("id")
@@ -1182,9 +1245,15 @@ async fn handle_run_once(
         ));
     }
 
+    let doctor_start = Instant::now();
     let doctor = handle_doctor(request).await?.data;
+    let doctor_ms = elapsed_ms(doctor_start);
+    let status_before_start = Instant::now();
     let status_before = handle_status(request).await?.data;
+    let status_before_ms = elapsed_ms(status_before_start);
+    let claim_start = Instant::now();
     let claim = handle_claim_next(request).await?.data;
+    let claim_ms = elapsed_ms(claim_start);
 
     let agent_request = ProtocolRequest {
         cmd: "agent".to_string(),
@@ -1192,7 +1261,9 @@ async fn handle_run_once(
         dry: Some(false),
         args: Map::from_iter(vec![("id".to_string(), Value::from(agent_id))]),
     };
+    let agent_start = Instant::now();
     let agent = handle_agent(&agent_request).await?.data;
+    let agent_ms = elapsed_ms(agent_start);
 
     let progress_request = ProtocolRequest {
         cmd: "monitor".to_string(),
@@ -1203,7 +1274,9 @@ async fn handle_run_once(
             Value::String("progress".to_string()),
         )]),
     };
+    let progress_start = Instant::now();
     let progress = handle_monitor(&progress_request).await?.data;
+    let progress_ms = elapsed_ms(progress_start);
 
     Ok(CommandSuccess {
         data: json!({
@@ -1215,6 +1288,16 @@ async fn handle_run_once(
                 "agent": agent,
                 "progress": progress,
             },
+            "timing": {
+                "steps_ms": {
+                    "doctor": doctor_ms,
+                    "status_before": status_before_ms,
+                    "claim_next": claim_ms,
+                    "agent": agent_ms,
+                    "progress": progress_ms,
+                },
+                "total_ms": elapsed_ms(total_start),
+            }
         }),
         next: "swarm monitor --view failures".to_string(),
         state: minimal_state_for_request(request).await,
@@ -1598,18 +1681,24 @@ async fn handle_broadcast(
 async fn handle_batch(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
+    let cmds_alias_present = request.args.contains_key("cmds");
     let ops = request
         .args
         .get("ops")
         .and_then(Value::as_array)
         .ok_or_else(|| {
+            let fix_hint = if cmds_alias_present {
+                "Use 'ops' (not 'cmds') for batch input. Example: echo '{\"cmd\":\"batch\",\"ops\":[{\"cmd\":\"doctor\"}]}' | swarm"
+            } else {
+                "Add 'ops' array to batch request. Example: echo '{\"cmd\":\"batch\",\"ops\":[{\"cmd\":\"doctor\"}]}' | swarm"
+            };
             Box::new(ProtocolEnvelope::error(
                 request.rid.clone(),
                 code::INVALID.to_string(),
                 "Missing ops array".to_string(),
             )
-            .with_fix("Add 'ops' array to batch request. Example: echo '{\"cmd\":\"batch\",\"ops\":[\"cmd\":\"doctor\"}]}' | swarm".to_string())
-            .with_ctx(json!({"ops": "required"})))
+            .with_fix(fix_hint.to_string())
+            .with_ctx(json!({"ops": "required", "cmds": "not supported"})))
         })?;
 
     if dry_flag(request) {
@@ -1713,7 +1802,8 @@ async fn handle_monitor(
                 .get_progress(&repo_id)
                 .await
                 .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
-            let beads_by_status = beads_by_status_summary(request.rid.clone()).await;
+            let (beads_by_status, beads_by_status_ms) =
+                beads_by_status_summary_with_timing(request.rid.clone()).await;
             json!({
                 "view": "progress",
                 "total": progress.total_agents,
@@ -1726,6 +1816,11 @@ async fn handle_monitor(
                 "error": progress.errors,
                 "timestamp": chrono::Utc::now().to_rfc3339(),
                 "beads_by_status": beads_by_status,
+                "timing": {
+                    "external": {
+                        "br_list_ms": beads_by_status_ms,
+                    }
+                },
             })
         }
         "failures" => {
@@ -1950,13 +2045,19 @@ async fn handle_agent(
 async fn handle_status(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
+    let total_start = Instant::now();
+    let connect_start = Instant::now();
     let db: SwarmDb = db_from_request(request).await?;
+    let db_connect_ms = elapsed_ms(connect_start);
     let repo_id = repo_id_from_request(request);
+    let progress_start = Instant::now();
     let progress = db
         .get_progress(&repo_id)
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
-    let beads_by_status = beads_by_status_summary(request.rid.clone()).await;
+    let db_progress_ms = elapsed_ms(progress_start);
+    let (beads_by_status, beads_by_status_ms) =
+        beads_by_status_summary_with_timing(request.rid.clone()).await;
     Ok(CommandSuccess {
         data: json!({
             "working": progress.working,
@@ -1969,23 +2070,36 @@ async fn handle_status(
             "total": progress.total_agents,
             "timestamp": chrono::Utc::now().to_rfc3339(),
             "beads_by_status": beads_by_status,
+            "timing": {
+                "db": {
+                    "connect_ms": db_connect_ms,
+                    "get_progress_ms": db_progress_ms,
+                },
+                "external": {
+                    "br_list_ms": beads_by_status_ms,
+                },
+                "total_ms": elapsed_ms(total_start),
+            }
         }),
         next: "swarm monitor --view progress".to_string(),
         state: minimal_state_from_progress(&progress),
     })
 }
 
-async fn beads_by_status_summary(rid: Option<String>) -> Value {
-    let counts = run_external_json_command(
+async fn beads_by_status_summary_with_timing(rid: Option<String>) -> (Value, u64) {
+    let (payload, elapsed) = run_external_json_command_with_ms(
         "br",
         &["list", "--json"],
         rid,
         "Run `br list --json` manually and verify beads workspace is initialized",
     )
     .await
-    .ok()
-    .and_then(|payload| payload.as_array().cloned())
     .map_or_else(
+        |_| (Value::Array(Vec::new()), 0_u64),
+        |(value, ms)| (value, ms),
+    );
+
+    let counts = payload.as_array().cloned().map_or_else(
         || {
             BTreeMap::from([
                 ("open".to_string(), 0_u64),
@@ -2016,7 +2130,7 @@ async fn beads_by_status_summary(rid: Option<String>) -> Value {
         },
     );
 
-    json!(counts)
+    (json!(counts), elapsed)
 }
 
 async fn handle_resume(
@@ -2650,14 +2764,27 @@ async fn handle_smoke(
 async fn handle_doctor(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
-    let mut checks = vec![
-        check_command("moon").await,
-        check_command("br").await,
-        check_command("jj").await,
-        check_command("zjj").await,
-        check_command("psql").await,
-    ];
-    checks.push(check_database_connectivity(request).await);
+    let total_start = Instant::now();
+    let moon_start = Instant::now();
+    let moon = check_command("moon").await;
+    let moon_ms = elapsed_ms(moon_start);
+    let br_start = Instant::now();
+    let br = check_command("br").await;
+    let br_ms = elapsed_ms(br_start);
+    let jj_start = Instant::now();
+    let jj = check_command("jj").await;
+    let jj_ms = elapsed_ms(jj_start);
+    let zjj_start = Instant::now();
+    let zjj = check_command("zjj").await;
+    let zjj_ms = elapsed_ms(zjj_start);
+    let psql_start = Instant::now();
+    let psql = check_command("psql").await;
+    let psql_ms = elapsed_ms(psql_start);
+    let database_start = Instant::now();
+    let database = check_database_connectivity(request).await;
+    let database_ms = elapsed_ms(database_start);
+    let mut checks = vec![moon, br, jj, zjj, psql];
+    checks.push(database);
     let failed = checks
         .iter()
         .filter(|check| !check["ok"].as_bool().is_some_and(|value| value))
@@ -2681,7 +2808,18 @@ async fn handle_doctor(
             "h": failed == 0,
             "p": passed,
             "f": failed,
-            "c": check_results
+            "c": check_results,
+            "timing": {
+                "checks_ms": {
+                    "moon": moon_ms,
+                    "br": br_ms,
+                    "jj": jj_ms,
+                    "zjj": zjj_ms,
+                    "psql": psql_ms,
+                    "database": database_ms,
+                },
+                "total_ms": elapsed_ms(total_start),
+            }
         }),
         next: if failed == 0 {
             "swarm state".to_string()
@@ -3038,19 +3176,15 @@ fn required_string_arg(
 async fn db_from_request(
     request: &ProtocolRequest,
 ) -> std::result::Result<SwarmDb, Box<ProtocolEnvelope>> {
-    let Some(database_url) = request
+    let explicit_database_url = request
         .args
         .get("database_url")
         .and_then(Value::as_str)
-        .map(std::string::ToString::to_string)
-    else {
-        let candidates = database_url_candidates_for_cli();
-        return connect_using_candidates(candidates, request.rid.clone()).await;
-    };
-
-    SwarmDb::new(&database_url)
-        .await
-        .map_err(|e| to_protocol_failure(e, request.rid.clone()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let candidates =
+        compose_database_url_candidates(explicit_database_url, database_url_candidates_for_cli());
+    connect_using_candidates(candidates, request.rid.clone()).await
 }
 
 async fn resolve_database_url_for_init(
@@ -3126,15 +3260,35 @@ async fn connect_using_candidates(
 
 async fn try_connect_candidates(candidates: &[String]) -> (Option<(SwarmDb, String)>, Vec<String>) {
     let mut failures = Vec::new();
+    let timeout_ms = database_connect_timeout_ms();
+    let timeout = Duration::from_millis(timeout_ms);
 
     for candidate in candidates {
-        match SwarmDb::new(candidate).await {
-            Ok(db) => return (Some((db, candidate.clone())), failures),
-            Err(err) => failures.push(format!("{}: {}", mask_database_url(candidate), err)),
+        match tokio::time::timeout(timeout, SwarmDb::new(candidate)).await {
+            Ok(Ok(db)) => return (Some((db, candidate.clone())), failures),
+            Ok(Err(err)) => failures.push(format!("{}: {}", mask_database_url(candidate), err)),
+            Err(_) => failures.push(format!(
+                "{}: connection attempt timed out after {}ms",
+                mask_database_url(candidate),
+                timeout_ms
+            )),
         }
     }
 
     (None, failures)
+}
+
+fn database_connect_timeout_ms() -> u64 {
+    parse_database_connect_timeout_ms(std::env::var("SWARM_DB_CONNECT_TIMEOUT_MS").ok().as_deref())
+}
+
+fn parse_database_connect_timeout_ms(raw: Option<&str>) -> u64 {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(DEFAULT_DB_CONNECT_TIMEOUT_MS, |value| {
+            value.clamp(MIN_DB_CONNECT_TIMEOUT_MS, MAX_DB_CONNECT_TIMEOUT_MS)
+        })
 }
 
 async fn minimal_state_for_request(request: &ProtocolRequest) -> Value {
@@ -3178,36 +3332,152 @@ async fn check_command(command: &str) -> Value {
 }
 
 async fn check_database_connectivity(request: &ProtocolRequest) -> Value {
-    if let Some(explicit_url) = request.args.get("database_url").and_then(Value::as_str) {
-        return match SwarmDb::new(explicit_url).await {
-            Ok(_) => {
-                json!({"name": "database", "ok": true, "url": mask_database_url(explicit_url), "source": "request.database_url"})
-            }
-            Err(err) => json!({
-                "name": "database",
-                "ok": false,
-                "url": mask_database_url(explicit_url),
-                "source": "request.database_url",
-                "fix": "Check request.database_url and verify postgres is reachable",
-                "errors": [err.to_string()],
-            }),
-        };
-    }
-
-    let candidates = database_url_candidates_for_cli();
+    let explicit_database_url = request
+        .args
+        .get("database_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let candidates =
+        compose_database_url_candidates(explicit_database_url, database_url_candidates_for_cli());
     let (connected, failures) = try_connect_candidates(&candidates).await;
 
     match connected {
         Some((_db, connected_url)) => {
-            json!({"name": "database", "ok": true, "url": mask_database_url(&connected_url), "source": "discovered"})
+            let source = if explicit_database_url == Some(connected_url.as_str()) {
+                "request.database_url"
+            } else {
+                "discovered"
+            };
+            json!({"name": "database", "ok": true, "url": mask_database_url(&connected_url), "source": source})
         }
         None => json!({
             "name": "database",
             "ok": false,
-            "source": "discovered",
-            "fix": "Set DATABASE_URL, verify postgres is reachable, or run 'swarm init-local-db'",
+            "source": if explicit_database_url.is_some() { "request.database_url+fallback" } else { "discovered" },
+            "fix": if explicit_database_url.is_some() {
+                "Check request.database_url, set DATABASE_URL, verify postgres is reachable, or run 'swarm init-local-db'"
+            } else {
+                "Set DATABASE_URL, verify postgres is reachable, or run 'swarm init-local-db'"
+            },
             "errors": failures,
         }),
+    }
+}
+
+fn compose_database_url_candidates(
+    explicit_database_url: Option<&str>,
+    discovered_candidates: Vec<String>,
+) -> Vec<String> {
+    let mut candidates = Vec::new();
+
+    if let Some(explicit) = explicit_database_url {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() {
+            candidates.push(trimmed.to_string());
+        }
+    }
+
+    for candidate in discovered_candidates {
+        if !candidates.iter().any(|existing| existing == &candidate) {
+            candidates.push(candidate);
+        }
+    }
+
+    candidates
+}
+
+#[cfg(test)]
+mod database_candidate_tests {
+    use super::{
+        compose_database_url_candidates, parse_database_connect_timeout_ms,
+        DEFAULT_DB_CONNECT_TIMEOUT_MS, MAX_DB_CONNECT_TIMEOUT_MS, MIN_DB_CONNECT_TIMEOUT_MS,
+    };
+
+    #[test]
+    fn explicit_database_url_is_preferred_and_deduplicated() {
+        let candidates = compose_database_url_candidates(
+            Some("postgres://explicit/db"),
+            vec![
+                "postgres://explicit/db".to_string(),
+                "postgres://env/db".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            candidates,
+            vec![
+                "postgres://explicit/db".to_string(),
+                "postgres://env/db".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_explicit_database_url_is_ignored() {
+        let candidates = compose_database_url_candidates(
+            Some("   "),
+            vec![
+                "postgres://env/db".to_string(),
+                "postgres://default/db".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            candidates,
+            vec![
+                "postgres://env/db".to_string(),
+                "postgres://default/db".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn discovered_candidates_are_preserved_when_no_explicit_url() {
+        let candidates = compose_database_url_candidates(
+            None,
+            vec![
+                "postgres://env/db".to_string(),
+                "postgres://default/db".to_string(),
+            ],
+        );
+
+        assert_eq!(
+            candidates,
+            vec![
+                "postgres://env/db".to_string(),
+                "postgres://default/db".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_connect_timeout_defaults_when_missing_or_invalid() {
+        assert_eq!(
+            parse_database_connect_timeout_ms(None),
+            DEFAULT_DB_CONNECT_TIMEOUT_MS
+        );
+        assert_eq!(
+            parse_database_connect_timeout_ms(Some("")),
+            DEFAULT_DB_CONNECT_TIMEOUT_MS
+        );
+        assert_eq!(
+            parse_database_connect_timeout_ms(Some("not-a-number")),
+            DEFAULT_DB_CONNECT_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn parse_connect_timeout_enforces_bounds() {
+        assert_eq!(
+            parse_database_connect_timeout_ms(Some("1")),
+            MIN_DB_CONNECT_TIMEOUT_MS
+        );
+        assert_eq!(
+            parse_database_connect_timeout_ms(Some("999999")),
+            MAX_DB_CONNECT_TIMEOUT_MS
+        );
+        assert_eq!(parse_database_connect_timeout_ms(Some("2500")), 2500);
     }
 }
 
@@ -3255,10 +3525,18 @@ async fn audit_request(
     ok: bool,
     ms: u64,
     error_code: Option<&str>,
+    candidates: &[String],
 ) -> std::result::Result<(), SwarmError> {
-    let db: SwarmDb = SwarmDb::new(&default_database_url_for_cli()).await?;
-    db.record_command_audit(cmd, rid, args, ok, ms, error_code)
-        .await
+    let (connected, _failures) = try_connect_candidates(candidates).await;
+    match connected {
+        Some((db, _used_url)) => {
+            db.record_command_audit(cmd, rid, args, ok, ms, error_code)
+                .await
+        }
+        None => Err(SwarmError::DatabaseError(
+            "Audit database connection failed: no candidates succeeded".to_string(),
+        )),
+    }
 }
 
 fn dry_run_success(_request: &ProtocolRequest, steps: Vec<Value>, next: &str) -> CommandSuccess {

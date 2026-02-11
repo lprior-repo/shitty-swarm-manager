@@ -139,6 +139,7 @@ impl StageCommands {
     }
 }
 
+#[allow(dead_code)]
 pub fn default_database_url_for_cli() -> String {
     database_url_candidates_for_cli()
         .into_iter()
