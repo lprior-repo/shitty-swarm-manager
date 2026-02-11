@@ -9,6 +9,7 @@ use crate::skill_execution::{store_skill_artifacts, SkillOutput};
 use crate::stage_executor_content::{contract_document_and_artifacts, implementation_scaffold};
 use crate::types::{ArtifactType, Stage};
 use crate::{AgentId, BeadId, SwarmDb};
+use serde_json::Value;
 use std::collections::HashMap;
 use tokio::process::Command;
 
@@ -202,7 +203,56 @@ async fn execute_implement_stage(
         }
     };
 
-    let implementation_code = implementation_scaffold(bead_id, &contract_context);
+    let previous_attempts = db
+        .get_agent_state(agent_id)
+        .await?
+        .map(|state| state.implementation_attempt)
+        .unwrap_or(0);
+
+    let retry_packet_context = if previous_attempts > 0 {
+        match db
+            .get_latest_bead_artifact_by_type(bead_id, ArtifactType::RetryPacket)
+            .await?
+        {
+            Some(artifact) => Some(format_retry_packet(&artifact.content)),
+            None => {
+                return Ok(failure_output(
+                    "Missing retry packet; cannot resume deterministic implement attempt".to_string(),
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    let failure_details = db
+        .get_latest_bead_artifact_by_type(bead_id, ArtifactType::FailureDetails)
+        .await?
+        .map(|artifact| artifact.content);
+
+    let test_output = db
+        .get_latest_bead_artifact_by_type(bead_id, ArtifactType::TestOutput)
+        .await?
+        .map(|artifact| artifact.content);
+
+    let test_results = db
+        .get_latest_bead_artifact_by_type(bead_id, ArtifactType::TestResults)
+        .await?
+        .map(|artifact| artifact.content);
+
+    let mut context_sections = Vec::new();
+    context_sections.push(format!(
+        "## Contract Document\n{}",
+        contract_context.trim()
+    ));
+    append_section(&mut context_sections, "Retry Packet", &retry_packet_context);
+    append_section(&mut context_sections, "Failure Details", &failure_details);
+    append_section(&mut context_sections, "Test Results", &test_results);
+    append_section(&mut context_sections, "Test Output", &test_output);
+
+    let aggregated_context = context_sections.join("\n\n");
+
+    let implementation_code = implementation_scaffold(bead_id, &aggregated_context);
 
     tracing::info!(
         "Agent {} generated implementation artifact for bead {}",
@@ -292,6 +342,25 @@ async fn execute_red_queen_stage(
     }
 
     Ok(output)
+}
+
+fn append_section(sections: &mut Vec<String>, title: &str, content: &Option<String>) {
+    if let Some(body) = content {
+        let trimmed = body.trim();
+        if !trimmed.is_empty() {
+            sections.push(format!("## {title}\n{trimmed}"));
+        }
+    }
+}
+
+fn format_retry_packet(payload: &str) -> String {
+    match serde_json::from_str::<Value>(payload) {
+        Ok(value) => match serde_json::to_string_pretty(&value) {
+            Ok(pretty) => pretty,
+            Err(_) => payload.to_string(),
+        },
+        Err(_) => payload.to_string(),
+    }
 }
 
 #[cfg(test)]

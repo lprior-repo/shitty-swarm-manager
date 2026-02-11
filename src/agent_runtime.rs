@@ -739,7 +739,7 @@ fn should_persist_retry_packet(transition: StageTransitionKey, stage: Stage) -> 
         && matches!(stage, Stage::QaEnforcer | Stage::RedQueen)
 }
 
-async fn persist_retry_packet(
+pub(crate) async fn persist_retry_packet(
     db: &SwarmDb,
     stage_history_id: i64,
     stage: Stage,

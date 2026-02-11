@@ -12,6 +12,7 @@ use crate::types::{
 use crate::BrSyncStatus;
 use serde_json::json;
 use sqlx::Acquire;
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use tracing::{debug, info};
@@ -373,15 +374,15 @@ impl SwarmDb {
                 ORDER BY started_at DESC LIMIT 1
              )
              RETURNING id, completed_at",
+            agent_id.number().cast_signed(),
+            bead_id.value(),
+            stage.as_str(),
+            attempt.cast_signed(),
+            &status,
+            message,
+            message,
+            duration_ms.cast_signed()
         )
-        .bind(agent_id.number().cast_signed())
-        .bind(bead_id.value())
-        .bind(stage.as_str())
-        .bind(attempt.cast_signed())
-        .bind(&status)
-        .bind(message)
-        .bind(message)
-        .bind(duration_ms.cast_signed())
         .fetch_optional(self.pool())
         .await
         .map_err(|e| SwarmError::DatabaseError(format!("Failed to update stage history: {e}")))?
@@ -509,6 +510,61 @@ impl SwarmDb {
         .map(|_| ())?
     }
 
+    async fn get_stage_attempt_number(&self, stage_history_id: i64) -> Result<u32> {
+        let attempt =
+            sqlx::query_scalar::<_, i32>("SELECT attempt_number FROM stage_history WHERE id = $1")
+                .bind(stage_history_id)
+                .fetch_one(self.pool())
+                .await
+                .map_err(|e| {
+                    SwarmError::DatabaseError(format!(
+                        "Failed to load stage attempt number: {e}"
+                    ))
+                })?;
+
+        Ok(to_u32_i32(attempt))
+    }
+
+    async fn store_retry_packet_for_transition(
+        &self,
+        stage_history_id: i64,
+        stage: Stage,
+        message: Option<&str>,
+    ) -> Result<()> {
+        let attempt = self.get_stage_attempt_number(stage_history_id).await?;
+        let artifacts = self.get_stage_artifacts(stage_history_id).await?;
+
+        let artifacts_payload = json!({
+            "failure_details": find_artifact_content(&artifacts, ArtifactType::FailureDetails),
+            "test_output": find_artifact_content(&artifacts, ArtifactType::TestOutput),
+            "test_results": find_artifact_content(&artifacts, ArtifactType::TestResults),
+            "error_message": find_artifact_content(&artifacts, ArtifactType::ErrorMessage),
+            "adversarial_report": find_artifact_content(&artifacts, ArtifactType::AdversarialReport),
+        });
+        let retry_payload = json!({
+            "failed_stage": stage.as_str(),
+            "attempt": attempt,
+            "feedback": message.map(str::to_string),
+            "artifacts": artifacts_payload,
+        });
+
+        let payload_text = serde_json::to_string_pretty(&retry_payload).map_err(|e| {
+            SwarmError::DatabaseError(format!("Failed to serialize retry packet: {e}"))
+        })?;
+
+        self.store_stage_artifact(
+            stage_history_id,
+            ArtifactType::RetryPacket,
+            &payload_text,
+            Some(json!({
+                "stage": stage.as_str(),
+                "attempt": attempt,
+            })),
+        )
+        .await
+        .map(|_| ())
+    }
+
     /// Stores a stage artifact to the database.
     ///
     /// # Errors
@@ -628,6 +684,10 @@ impl SwarmDb {
                 .await
             }
             StageTransition::RetryImplement => {
+                if let Some(history_id) = stage_history_id {
+                    self.store_retry_packet_for_transition(history_id, stage, message)
+                        .await?;
+                }
                 self.apply_failure_transition(agent_id, message).await?;
                 self.record_execution_event(
                     bead_id,
@@ -657,6 +717,121 @@ impl SwarmDb {
                 .await
             }
         }
+    }
+
+    async fn persist_retry_packet(
+        &self,
+        stage_history_id: Option<i64>,
+        stage: Stage,
+        attempt: u32,
+        bead_id: &BeadId,
+        agent_id: &AgentId,
+        message: Option<&str>,
+    ) -> Result<()> {
+        let stage_history_id = match stage_history_id {
+            Some(id) => id,
+            None => return Ok(()),
+        };
+
+        let config = self.get_config(&RepoId::new("local")).await?;
+        let max_attempts = config.max_implementation_attempts;
+        let remaining_attempts = max_attempts.saturating_sub(attempt);
+
+        let FailureDiagnosticsPayload {
+            category: failure_category,
+            retryable,
+            next_command,
+            detail: failure_detail,
+        } = build_failure_diagnostics(message);
+
+        let mut artifact_refs = Vec::new();
+        let mut seen_ids = HashSet::new();
+        let mut seen_types = HashSet::new();
+
+        let stage_artifacts = self.get_stage_artifacts(stage_history_id).await?;
+        for artifact in stage_artifacts {
+            let artifact_type_name = artifact.artifact_type.as_str().to_string();
+            if seen_ids.insert(artifact.id) {
+                seen_types.insert(artifact_type_name.clone());
+                artifact_refs.push(json!({
+                    "artifact_id": artifact.id,
+                    "artifact_type": artifact.artifact_type.as_str(),
+                    "content_hash": artifact.content_hash,
+                    "metadata": artifact.metadata,
+                    "created_at": artifact.created_at.to_rfc3339(),
+                    "stage_history_id": artifact.stage_history_id,
+                    "context": "current_stage",
+                }));
+            }
+        }
+
+        const CONTEXT_ARTIFACT_TYPES: [ArtifactType; 3] = [
+            ArtifactType::ImplementationCode,
+            ArtifactType::TestResults,
+            ArtifactType::TestOutput,
+        ];
+
+        for artifact_type in CONTEXT_ARTIFACT_TYPES {
+            let artifact_type_name = artifact_type.as_str().to_string();
+            if seen_types.contains(&artifact_type_name) {
+                continue;
+            }
+
+            let artifacts = self
+                .get_bead_artifacts_by_type(bead_id, artifact_type)
+                .await?;
+            if let Some(artifact) = artifacts.last() {
+                if seen_ids.insert(artifact.id) {
+                    seen_types.insert(artifact_type_name.clone());
+                    artifact_refs.push(json!({
+                        "artifact_id": artifact.id,
+                        "artifact_type": artifact.artifact_type.as_str(),
+                        "content_hash": artifact.content_hash,
+                        "metadata": artifact.metadata,
+                        "created_at": artifact.created_at.to_rfc3339(),
+                        "stage_history_id": artifact.stage_history_id,
+                        "context": "latest_per_type",
+                    }));
+                    continue;
+                }
+            }
+
+            seen_types.insert(artifact_type_name.clone());
+            artifact_refs.push(json!({
+                "artifact_type": artifact_type.as_str(),
+                "missing": true,
+                "context": "latest_per_type",
+            }));
+        }
+
+        let retry_packet = json!({
+            "bead_id": bead_id.value(),
+            "agent_id": agent_id.number(),
+            "stage": stage.as_str(),
+            "stage_history_id": stage_history_id,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "remaining_attempts": remaining_attempts,
+            "failure_category": failure_category,
+            "failure_detail": failure_detail,
+            "failure_message": message.map(|value| redact_sensitive(value)),
+            "retryable": retryable,
+            "next_command": next_command,
+            "artifact_refs": artifact_refs,
+            "created_at": Utc::now().to_rfc3339(),
+        });
+
+        self.store_stage_artifact(
+            stage_history_id,
+            ArtifactType::RetryPacket,
+            &retry_packet.to_string(),
+            Some(json!({
+                "stage": stage.as_str(),
+                "attempt": attempt,
+                "failure_category": failure_category,
+            })),
+        )
+        .await
     }
 
     /// Sets the swarm status.
@@ -1225,7 +1400,9 @@ struct ExecutionEventWriteInput {
 }
 
 fn build_failure_diagnostics(message: Option<&str>) -> FailureDiagnosticsPayload {
-    let detail = message.map(redact_sensitive);
+    let detail = message
+        .map(redact_sensitive)
+        .filter(|value| !value.trim().is_empty());
     FailureDiagnosticsPayload {
         category: message.map_or_else(
             || "stage_failure".to_string(),
@@ -1367,6 +1544,16 @@ fn seed_idle_agents_recursive<'a>(
             seed_idle_agents_recursive(db, next.saturating_add(1), count).await
         }
     })
+}
+
+fn find_artifact_content(
+    artifacts: &[StageArtifact],
+    artifact_type: ArtifactType,
+) -> Option<String> {
+    artifacts
+        .iter()
+        .find(|artifact| artifact.artifact_type == artifact_type)
+        .map(|artifact| artifact.content.clone())
 }
 
 fn determine_transition(stage: Stage, result: &StageResult) -> StageTransition {

@@ -1191,6 +1191,8 @@ async fn handle_register(
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
     let db: SwarmDb = db_from_request(request).await?;
     let config = db.get_config(&RepoId::new("local")).await.ok();
+    let repo_root = current_repo_root().await?;
+    let repo_root = current_repo_root().await?;
 
     let count = request
         .args
@@ -1359,42 +1361,17 @@ async fn handle_resume(
 async fn handle_resume_context(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
-    let bead_filter = request
-        .args
-        .get("bead_id")
-        .and_then(Value::as_str)
-        .map(std::string::ToString::to_string);
-
     let db: SwarmDb = db_from_request(request).await?;
     let contexts = db
         .get_deep_resume_contexts()
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
 
-    let selected = if let Some(ref bead_id) = bead_filter {
-        let filtered = contexts
-            .into_iter()
-            .filter(|context| context.bead_id == *bead_id)
-            .collect::<Vec<_>>();
-        if filtered.is_empty() {
-            return Err(Box::new(
-                ProtocolEnvelope::error(
-                    request.rid.clone(),
-                    code::NOTFOUND.to_string(),
-                    format!("Bead {bead_id} not found or not resumable"),
-                )
-                .with_fix("swarm resume-context --bead-id <bead-id>".to_string())
-                .with_ctx(json!({"bead_id": bead_id})),
-            ));
-        }
-        filtered
-    } else {
-        contexts
-    };
-
     Ok(CommandSuccess {
-        data: json!({"contexts": selected}),
-        next: "swarm monitor --view failures".to_string(),
+        data: json!({
+            "contexts": contexts,
+        }),
+        next: "swarm resume".to_string(),
         state: minimal_state_for_request(request).await,
     })
 }
@@ -1830,7 +1807,10 @@ async fn handle_spawn_prompts(
     let db: SwarmDb = db_from_request(request).await?;
     let config = db.get_config(&RepoId::new("local")).await.ok();
 
-    let (template_text, template_name) = match request.args.get("template").and_then(Value::as_str)
+    let (template_text, template_name) = match request
+        .args
+        .get("template")
+        .and_then(Value::as_str)
     {
         Some(path) => {
             let text = fs::read_to_string(path).await.map_err(|err| {
@@ -1846,10 +1826,13 @@ async fn handle_spawn_prompts(
             })?;
             (text, path.to_string())
         }
-        None => (
-            swarm::prompts::AGENT_PROMPT_TEMPLATE.to_string(),
-            "embedded_template".to_string(),
-        ),
+        None => {
+            let template_path = swarm::prompts::canonical_agent_prompt_path(&repo_root);
+            let text = swarm::prompts::load_agent_prompt_template(&repo_root)
+                .await
+                .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
+            (text, template_path.to_string_lossy().to_string())
+        }
     };
 
     let out_dir = request
@@ -1944,7 +1927,10 @@ async fn handle_prompt(
         .and_then(Value::as_u64)
         .map_or(1, |value| value) as u32;
 
-    let prompt = swarm::prompts::get_agent_prompt(id);
+    let repo_root = current_repo_root().await?;
+    let prompt = swarm::prompts::get_agent_prompt(&repo_root, id)
+        .await
+        .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
 
     Ok(CommandSuccess {
         data: json!({"agent_id": id, "prompt": prompt}),

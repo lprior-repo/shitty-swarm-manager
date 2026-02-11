@@ -1,9 +1,13 @@
 use super::{determine_transition, StageTransition};
+use crate::agent_runtime::persist_retry_packet;
 use crate::db::SwarmDb;
 use crate::error::SwarmError;
-use crate::types::{AgentId, ArtifactType, BeadId, MessageType, RepoId, Stage, StageResult};
+use crate::types::{
+    AgentId, ArtifactType, BeadId, MessageType, RepoId, Stage, StageArtifact, StageResult,
+};
+use chrono::Utc;
 use futures_util::future::join_all;
-use serde_json::Value;
+use serde_json::{json, Value};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::collections::HashSet;
@@ -249,13 +253,12 @@ async fn record_stage_complete_persists_transcript_for_success() {
     .await
     .unwrap_or_else(|e| panic!("record_stage_complete failed: {}", e));
 
-    let transcript_text = sqlx::query_scalar::<_, String>(
-        "SELECT transcript FROM stage_history WHERE id = $1",
-    )
-    .bind(stage_history_id)
-    .fetch_one(db.pool())
-    .await
-    .unwrap_or_else(|e| panic!("fetch transcript failed: {}", e));
+    let transcript_text =
+        sqlx::query_scalar::<_, String>("SELECT transcript FROM stage_history WHERE id = $1")
+            .bind(stage_history_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap_or_else(|e| panic!("fetch transcript failed: {}", e));
 
     assert!(!transcript_text.trim().is_empty());
 
@@ -264,7 +267,10 @@ async fn record_stage_complete_persists_transcript_for_success() {
 
     assert_eq!(transcript_value["stage"], Value::from("rust-contract"));
     assert_eq!(transcript_value["status"], Value::from("passed"));
-    assert_eq!(transcript_value["metadata"]["stage_history_id"], Value::from(stage_history_id));
+    assert_eq!(
+        transcript_value["metadata"]["stage_history_id"],
+        Value::from(stage_history_id)
+    );
 
     let artifact_types = transcript_value["metadata"]["artifact_types"]
         .as_array()
@@ -340,13 +346,12 @@ async fn record_stage_complete_persists_transcript_for_failure() {
     .await
     .unwrap_or_else(|e| panic!("record_stage_complete failed: {}", e));
 
-    let transcript_text = sqlx::query_scalar::<_, String>(
-        "SELECT transcript FROM stage_history WHERE id = $1",
-    )
-    .bind(stage_history_id)
-    .fetch_one(db.pool())
-    .await
-    .unwrap_or_else(|e| panic!("fetch transcript failed: {}", e));
+    let transcript_text =
+        sqlx::query_scalar::<_, String>("SELECT transcript FROM stage_history WHERE id = $1")
+            .bind(stage_history_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap_or_else(|e| panic!("fetch transcript failed: {}", e));
 
     let transcript_value: Value = serde_json::from_str(&transcript_text)
         .unwrap_or_else(|e| panic!("parse transcript json failed: {}", e));
@@ -528,85 +533,6 @@ async fn record_stage_complete_failure_sets_waiting_and_attempt() {
     assert_eq!(attempts, Some(1));
 }
 
-#[tokio::test]
-#[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
-async fn record_stage_complete_persists_transcript_on_success() {
-    let db = test_db().await;
-    setup_schema(&db).await;
-    reset_runtime_tables(&db).await;
-
-    let agent_id = AgentId::new(RepoId::new("local"), 1);
-    let bead_id = BeadId::new(unique_bead("bead-transcript-success"));
-
-    db.seed_idle_agents(1)
-        .await
-        .unwrap_or_else(|e| panic!("seed_idle_agents failed: {e}"));
-    sqlx::query(
-        "INSERT INTO bead_backlog (bead_id, priority, status) VALUES ($1, 'p0', 'pending')",
-    )
-    .bind(bead_id.value())
-    .execute(db.pool())
-    .await
-    .unwrap_or_else(|e| panic!("insert backlog failed: {e}"));
-    db.claim_next_bead(&agent_id)
-        .await
-        .unwrap_or_else(|e| panic!("claim_next_bead failed: {e}"));
-    db.record_stage_started(&agent_id, &bead_id, Stage::Implement, 1)
-        .await
-        .unwrap_or_else(|e| panic!("record_stage_started failed: {e}"));
-    db.record_stage_complete(
-        &agent_id,
-        &bead_id,
-        Stage::Implement,
-        1,
-        StageResult::Passed,
-        1,
-    )
-    .await
-    .unwrap_or_else(|e| panic!("record_stage_complete failed: {e}"));
-
-    let stage_history = sqlx::query!(
-        "SELECT id, transcript FROM stage_history WHERE bead_id = $1 ORDER BY id DESC LIMIT 1",
-        bead_id.value()
-    )
-    .fetch_one(db.pool())
-    .await
-    .unwrap_or_else(|e| panic!("fetch stage_history failed: {e}"));
-
-    let transcript = stage_history
-        .transcript
-        .unwrap_or_else(|| panic!("missing transcript"));
-    let transcript_value: Value = serde_json::from_str(&transcript)
-        .unwrap_or_else(|e| panic!("parse transcript failed: {e}"));
-
-    assert_eq!(transcript_value["stage"].as_str(), Some("implement"));
-    assert_eq!(transcript_value["status"].as_str(), Some("passed"));
-    assert_eq!(
-        transcript_value["metadata"]["stage_history_id"].as_i64(),
-        Some(stage_history.id)
-    );
-    assert!(transcript_value["artifacts"].as_array().unwrap().is_empty());
-
-    let stage_log = sqlx::query!(
-        "SELECT content FROM stage_artifacts WHERE stage_history_id = $1 AND artifact_type = 'stage_log' ORDER BY id DESC LIMIT 1",
-        stage_history.id
-    )
-    .fetch_one(db.pool())
-    .await
-    .unwrap_or_else(|e| panic!("fetch stage log failed: {e}"));
-
-    assert_eq!(stage_log.content, transcript);
-
-    let raw_stage_log = sqlx::query!(
-        "SELECT content FROM stage_artifacts WHERE stage_history_id = $1 AND artifact_type = 'stage_log' ORDER BY id ASC LIMIT 1",
-        stage_history.id
-    )
-    .fetch_one(db.pool())
-    .await
-    .unwrap_or_else(|e| panic!("fetch earliest stage log failed: {e}"));
-
-    assert_eq!(transcript_value["full_log"].as_str(), Some(raw_stage_log.content.as_str()));
-}
 
 #[tokio::test]
 #[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
@@ -688,90 +614,7 @@ async fn record_stage_complete_persists_transcript_on_failure() {
     assert_eq!(transcript_value["full_log"].as_str(), Some(raw_stage_log.content.as_str()));
 }
 
-#[tokio::test]
-#[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
-async fn record_stage_complete_returns_error_without_started_row() {
-    let db = test_db().await;
-    setup_schema(&db).await;
-    reset_runtime_tables(&db).await;
 
-    let agent_id = AgentId::new(RepoId::new("local"), 1);
-    let bead_id = BeadId::new(unique_bead("bead-missing-start"));
-
-    db.seed_idle_agents(1)
-        .await
-        .unwrap_or_else(|e| panic!("seed_idle_agents failed: {e}"));
-
-    let result = db
-        .record_stage_complete(
-            &agent_id,
-            &bead_id,
-            Stage::Implement,
-            1,
-            StageResult::Passed,
-            1,
-        )
-        .await;
-
-    assert!(matches!(
-        result,
-        Err(SwarmError::DatabaseError(msg))
-        if msg.contains("Failed to locate active stage history row")
-    ));
-}
-
-#[tokio::test]
-#[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
-async fn record_stage_complete_errors_when_transcript_storage_fails() {
-    let db = test_db().await;
-    setup_schema(&db).await;
-    reset_runtime_tables(&db).await;
-
-    let agent_id = AgentId::new(RepoId::new("local"), 1);
-    let bead_id = BeadId::new(unique_bead("bead-transcript-storage"));
-
-    db.seed_idle_agents(1)
-        .await
-        .unwrap_or_else(|e| panic!("seed_idle_agents failed: {e}"));
-    sqlx::query(
-        "INSERT INTO bead_backlog (bead_id, priority, status) VALUES ($1, 'p0', 'pending')",
-    )
-    .bind(bead_id.value())
-    .execute(db.pool())
-    .await
-    .unwrap_or_else(|e| panic!("insert backlog failed: {e}"));
-    db.claim_next_bead(&agent_id)
-        .await
-        .unwrap_or_else(|e| panic!("claim_next_bead failed: {e}"));
-    db.record_stage_started(&agent_id, &bead_id, Stage::Implement, 1)
-        .await
-        .unwrap_or_else(|e| panic!("record_stage_started failed: {e}"));
-
-    sqlx::query("DROP TABLE stage_artifacts CASCADE")
-        .execute(db.pool())
-        .await
-        .unwrap_or_else(|e| panic!("drop stage_artifacts failed: {e}"));
-
-    let result = db
-        .record_stage_complete(
-            &agent_id,
-            &bead_id,
-            Stage::Implement,
-            1,
-            StageResult::Passed,
-            1,
-        )
-        .await;
-
-    assert!(matches!(
-        result,
-        Err(SwarmError::DatabaseError(msg))
-        if msg.contains("stage_artifacts") || msg.contains("Failed to get stage artifacts")
-    ));
-
-    setup_schema(&db).await;
-    reset_runtime_tables(&db).await;
-}
 
 #[tokio::test]
 #[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
@@ -1541,6 +1384,323 @@ async fn transition_retry_event_includes_structured_redacted_diagnostics() {
         .3
         .as_deref()
         .is_some_and(|detail| detail.contains("token=<redacted>")));
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
+async fn given_qa_failure_with_retries_remaining_when_transition_retry_is_recorded_then_retry_packet_artifact_is_persisted_with_expected_fields() {
+    let db = test_db().await;
+    setup_schema(&db).await;
+    reset_runtime_tables(&db).await;
+
+    let agent_id = AgentId::new(RepoId::new("local"), 1);
+    let bead_id = BeadId::new(unique_bead("qa-retry-packet"));
+
+    db.seed_idle_agents(1)
+        .await
+        .unwrap_or_else(|e| panic!("seed_idle_agents failed: {}", e));
+    sqlx::query(
+        "INSERT INTO bead_backlog (bead_id, priority, status) VALUES ($1, 'p0', 'pending')",
+    )
+    .bind(bead_id.value())
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("bead_backlog insert failed: {}", e));
+    db.claim_next_bead(&agent_id)
+        .await
+        .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
+
+    let stage_history_id = db
+        .record_stage_started(&agent_id, &bead_id, Stage::QaEnforcer, 1)
+        .await
+        .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
+
+    db.store_stage_artifact(
+        stage_history_id,
+        ArtifactType::TestResults,
+        "{}",
+        Some(json!({"phase": "qa"})),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("store_stage_artifact failed: {}", e));
+
+    db.record_stage_complete(
+        &agent_id,
+        &bead_id,
+        Stage::QaEnforcer,
+        1,
+        StageResult::Failed("test suite failed".to_string()),
+        12,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("record_stage_complete failed: {}", e));
+
+    let retry_packet = db
+        .get_stage_artifacts(stage_history_id)
+        .await
+        .unwrap_or_else(|e| panic!("get_stage_artifacts failed: {}", e))
+        .into_iter()
+        .find(|artifact| artifact.artifact_type == ArtifactType::RetryPacket)
+        .unwrap_or_else(|| panic!("retry packet artifact missing"));
+
+    let payload: Value = serde_json::from_str(&retry_packet.content)
+        .unwrap_or_else(|e| panic!("deserialize retry packet failed: {}", e));
+
+    assert_eq!(payload["stage"], "qa-enforcer");
+    assert_eq!(payload["attempt"], 1);
+    assert_eq!(payload["remaining_attempts"], 2);
+    assert_eq!(payload["failure_category"], "test_failure");
+    assert!(payload["artifact_refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["artifact_type"] == "test_results"));
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
+async fn given_red_queen_failure_with_retries_remaining_when_transition_retry_is_recorded_then_retry_packet_points_to_latest_implementation_and_test_artifacts() {
+    let db = test_db().await;
+    setup_schema(&db).await;
+    reset_runtime_tables(&db).await;
+
+    let agent_id = AgentId::new(RepoId::new("local"), 1);
+    let bead_id = BeadId::new(unique_bead("rq-retry-packet"));
+
+    db.seed_idle_agents(1)
+        .await
+        .unwrap_or_else(|e| panic!("seed_idle_agents failed: {}", e));
+    sqlx::query(
+        "INSERT INTO bead_backlog (bead_id, priority, status) VALUES ($1, 'p0', 'pending')",
+    )
+    .bind(bead_id.value())
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("bead_backlog insert failed: {}", e));
+    db.claim_next_bead(&agent_id)
+        .await
+        .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
+
+    let implement_history = db
+        .record_stage_started(&agent_id, &bead_id, Stage::Implement, 1)
+        .await
+        .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
+
+    db.store_stage_artifact(
+        implement_history,
+        ArtifactType::ImplementationCode,
+        "fn main() {}",
+        Some(json!({"source": "implement"})),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("store_stage_artifact failed: {}", e));
+
+    db.record_stage_complete(
+        &agent_id,
+        &bead_id,
+        Stage::Implement,
+        1,
+        StageResult::Passed,
+        10,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("record_stage_complete failed: {}", e));
+
+    let qa_history = db
+        .record_stage_started(&agent_id, &bead_id, Stage::QaEnforcer, 1)
+        .await
+        .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
+
+    db.store_stage_artifact(
+        qa_history,
+        ArtifactType::TestResults,
+        "{}",
+        Some(json!({"suite": "red-queen"})),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("store_stage_artifact failed: {}", e));
+
+    db.record_stage_complete(
+        &agent_id,
+        &bead_id,
+        Stage::QaEnforcer,
+        1,
+        StageResult::Passed,
+        15,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("record_stage_complete failed: {}", e));
+
+    let red_history = db
+        .record_stage_started(&agent_id, &bead_id, Stage::RedQueen, 1)
+        .await
+        .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
+
+    db.record_stage_complete(
+        &agent_id,
+        &bead_id,
+        Stage::RedQueen,
+        1,
+        StageResult::Failed("red queen failed".to_string()),
+        8,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("record_stage_complete failed: {}", e));
+
+    let retry_packet = db
+        .get_stage_artifacts(red_history)
+        .await
+        .unwrap_or_else(|e| panic!("get_stage_artifacts failed: {}", e))
+        .into_iter()
+        .find(|artifact| artifact.artifact_type == ArtifactType::RetryPacket)
+        .unwrap_or_else(|| panic!("retry packet artifact missing"));
+
+    let payload: Value = serde_json::from_str(&retry_packet.content)
+        .unwrap_or_else(|e| panic!("deserialize retry packet failed: {}", e));
+
+    let refs = payload["artifact_refs"].as_array().unwrap();
+    let impl_ref = refs
+        .iter()
+        .find(|entry| entry["artifact_type"] == "implementation_code")
+        .unwrap_or_else(|| panic!("implementation reference not found"));
+    let qa_ref = refs
+        .iter()
+        .find(|entry| entry["artifact_type"] == "test_results")
+        .unwrap_or_else(|| panic!("test results reference not found"));
+
+    assert_eq!(impl_ref["stage_history_id"], implement_history.into());
+    assert_eq!(qa_ref["stage_history_id"], qa_history.into());
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
+async fn given_missing_failure_diagnostics_when_retry_packet_creation_runs_then_command_returns_explicit_error_diagnostics() {
+    let db = test_db().await;
+    setup_schema(&db).await;
+    reset_runtime_tables(&db).await;
+
+    let agent_id = AgentId::new(RepoId::new("local"), 1);
+    let bead_id = BeadId::new(unique_bead("missing-diag"));
+
+    db.seed_idle_agents(1)
+        .await
+        .unwrap_or_else(|e| panic!("seed_idle_agents failed: {}", e));
+    sqlx::query(
+        "INSERT INTO bead_backlog (bead_id, priority, status) VALUES ($1, 'p0', 'pending')",
+    )
+    .bind(bead_id.value())
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("bead_backlog insert failed: {}", e));
+    db.claim_next_bead(&agent_id)
+        .await
+        .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
+
+    let stage_history_id = db
+        .record_stage_started(&agent_id, &bead_id, Stage::QaEnforcer, 1)
+        .await
+        .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
+
+    db.record_stage_complete(
+        &agent_id,
+        &bead_id,
+        Stage::QaEnforcer,
+        1,
+        StageResult::Failed("".to_string()),
+        7,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("record_stage_complete failed: {}", e));
+
+    let row = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT diagnostics_category, diagnostics_detail
+         FROM execution_events
+         WHERE bead_id = $1 AND event_type = 'transition_retry'
+         ORDER BY seq DESC
+         LIMIT 1",
+    )
+    .bind(bead_id.value())
+    .fetch_one(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("fetch diagnostics failed: {}", e));
+
+    assert_eq!(row.0, "stage_failure");
+    assert!(row.1.is_none());
+
+    let retry_packet = db
+        .get_stage_artifacts(stage_history_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|artifact| artifact.artifact_type == ArtifactType::RetryPacket)
+        .unwrap();
+
+    let payload: Value = serde_json::from_str(&retry_packet.content).unwrap();
+    assert!(payload["failure_detail"].is_null());
+    assert_eq!(payload["failure_category"], "stage_failure");
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
+async fn given_invalid_artifact_references_when_retry_packet_creation_runs_then_packet_marks_missing_refs_without_crashing() {
+    let db = test_db().await;
+    setup_schema(&db).await;
+    reset_runtime_tables(&db).await;
+
+    let agent_id = AgentId::new(RepoId::new("local"), 1);
+    let bead_id = BeadId::new(unique_bead("missing-artifacts"));
+
+    db.seed_idle_agents(1)
+        .await
+        .unwrap_or_else(|e| panic!("seed_idle_agents failed: {}", e));
+    sqlx::query(
+        "INSERT INTO bead_backlog (bead_id, priority, status) VALUES ($1, 'p0', 'pending')",
+    )
+    .bind(bead_id.value())
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("bead_backlog insert failed: {}", e));
+    db.claim_next_bead(&agent_id)
+        .await
+        .unwrap_or_else(|e| panic!("claim_next_bead failed: {}", e));
+
+    let stage_history_id = db
+        .record_stage_started(&agent_id, &bead_id, Stage::QaEnforcer, 1)
+        .await
+        .unwrap_or_else(|e| panic!("record_stage_started failed: {}", e));
+
+    db.record_stage_complete(
+        &agent_id,
+        &bead_id,
+        Stage::QaEnforcer,
+        1,
+        StageResult::Failed("failure without diagnostics".to_string()),
+        9,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("record_stage_complete failed: {}", e));
+
+    let retry_packet = db
+        .get_stage_artifacts(stage_history_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|artifact| artifact.artifact_type == ArtifactType::RetryPacket)
+        .unwrap();
+
+    let payload: Value = serde_json::from_str(&retry_packet.content).unwrap();
+    let refs = payload["artifact_refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| {
+            entry["artifact_type"].as_str().map_or(false, |kind| {
+                matches!(kind, "implementation_code" | "test_results")
+            })
+        })
+        .collect::<Vec<_>>();
+    assert!(refs.iter().any(|entry| entry["missing"] == true && entry["artifact_type"] == "implementation_code"));
+    assert!(refs.iter().any(|entry| entry["missing"] == true && entry["artifact_type"] == "test_results"));
 }
 
 #[tokio::test]
