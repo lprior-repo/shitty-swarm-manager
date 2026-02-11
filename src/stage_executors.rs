@@ -293,3 +293,129 @@ async fn execute_red_queen_stage(
 
     Ok(output)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::error::SwarmError;
+    use crate::stage_executors::execute_implement_stage;
+    use crate::types::{ArtifactType, BeadId};
+    use crate::{AgentId, SwarmDb};
+    use sqlx::PgPool;
+
+    #[sqlx::test]
+    async fn test_implement_stage_loads_contract_only_for_first_attempt(pool: PgPool) {
+        let db = SwarmDb::new_with_pool(pool);
+        let bead_id = BeadId::new("test-bead-1");
+        let agent_id = AgentId::new("local", 1);
+
+        // Store contract artifact
+        let stage_history_id = 123;
+        db.store_stage_artifact(
+            stage_history_id,
+            ArtifactType::ContractDocument,
+            "contract content",
+            None,
+        )
+        .await
+        .expect("Failed to store contract");
+
+        // Execute implement stage for attempt 1
+        let result = execute_implement_stage(&bead_id, &agent_id, &db, 1)
+            .await
+            .expect("execute_implement_stage should succeed");
+
+        assert!(result.success);
+        assert!(result.implementation_code.is_some());
+
+        // Verify consumed_context metadata includes only contract
+        if let Some(ref metadata) = result.metadata {
+            let consumed = metadata
+                .get("consumed_context")
+                .and_then(|v| v.as_array())
+                .expect("consumed_context should be an array");
+            assert_eq!(consumed.len(), 1);
+            assert_eq!(consumed[0].get("artifact_type").unwrap().as_str(), Some("contract_document"));
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_implement_stage_loads_retry_context_for_attempt_two(pool: PgPool) {
+        let db = SwarmDb::new_with_pool(pool);
+        let bead_id = BeadId::new("test-bead-2");
+        let agent_id = AgentId::new("local", 1);
+
+        // Store contract artifact
+        let stage_history_id = 123;
+        db.store_stage_artifact(
+            stage_history_id,
+            ArtifactType::ContractDocument,
+            "contract content",
+            None,
+        )
+        .await
+        .expect("Failed to store contract");
+
+        // Store retry packet artifact
+        db.store_stage_artifact(
+            stage_history_id,
+            ArtifactType::RetryPacket,
+            r#"{"attempt": 1, "failure_reason": "test failed", "remaining_attempts": 2}"#,
+            None,
+        )
+        .await
+        .expect("Failed to store retry packet");
+
+        // Store test output artifact from previous QA failure
+        db.store_stage_artifact(
+            stage_history_id,
+            ArtifactType::TestOutput,
+            "test failure output",
+            None,
+        )
+        .await
+        .expect("Failed to store test output");
+
+        // Execute implement stage for attempt 2
+        let result = execute_implement_stage(&bead_id, &agent_id, &db, 2)
+            .await
+            .expect("execute_implement_stage should succeed");
+
+        assert!(result.success);
+        assert!(result.implementation_code.is_some());
+
+        // Verify consumed_context metadata includes contract, retry packet, and test output
+        if let Some(ref metadata) = result.metadata {
+            let consumed = metadata
+                .get("consumed_context")
+                .and_then(|v| v.as_array())
+                .expect("consumed_context should be an array");
+            assert_eq!(consumed.len(), 3);
+
+            let artifact_types: Vec<String> = consumed
+                .iter()
+                .filter_map(|v| v.get("artifact_type").and_then(|s| s.as_str()).map(|s| s.to_string()))
+                .collect();
+
+            assert!(artifact_types.contains(&"contract_document".to_string()));
+            assert!(artifact_types.contains(&"retry_packet".to_string()));
+            assert!(artifact_types.contains(&"test_output".to_string()));
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_implement_stage_fails_without_contract(pool: PgPool) {
+        let db = SwarmDb::new_with_pool(pool);
+        let bead_id = BeadId::new("test-bead-3");
+        let agent_id = AgentId::new("local", 1);
+
+        // No contract artifact stored
+
+        // Execute implement stage for attempt 1
+        let result = execute_implement_stage(&bead_id, &agent_id, &db, 1)
+            .await
+            .expect("execute_implement_stage should return error");
+
+        assert!(!result.success);
+        assert!(result.feedback.contains("contract"));
+    }
+}

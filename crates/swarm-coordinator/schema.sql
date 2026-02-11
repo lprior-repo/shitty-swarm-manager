@@ -116,6 +116,7 @@ CREATE TABLE IF NOT EXISTS stage_artifacts (
         'regression_report',
         'quality_gate_report',
         'stage_log',
+        'retry_packet',
         'skill_invocation',
         'error_message',
         'feedback'

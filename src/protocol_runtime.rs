@@ -634,6 +634,7 @@ async fn execute_request_no_batch(
         "agent" => handle_agent(&request).await,
         "status" => handle_status(&request).await,
         "resume" => handle_resume(&request).await,
+        "resume-context" => handle_resume_context(&request).await,
         "artifacts" => handle_artifacts(&request).await,
         "resume-context" => handle_resume_context(&request).await,
         "release" => handle_release(&request).await,
@@ -670,6 +671,7 @@ async fn handle_help(
         ("status", "Show swarm state"),
         ("resume", "Show resumable context projections"),
         ("resume-context", "Show deep resume context payload"),
+        ("artifacts", "Retrieve artifact records"),
         ("agent", "Run single agent"),
         ("monitor", "View agents/progress"),
         ("register", "Register agents"),
@@ -1354,6 +1356,49 @@ async fn handle_resume(
     })
 }
 
+async fn handle_resume_context(
+    request: &ProtocolRequest,
+) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
+    let bead_filter = request
+        .args
+        .get("bead_id")
+        .and_then(Value::as_str)
+        .map(std::string::ToString::to_string);
+
+    let db: SwarmDb = db_from_request(request).await?;
+    let contexts = db
+        .get_deep_resume_contexts()
+        .await
+        .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
+
+    let selected = if let Some(ref bead_id) = bead_filter {
+        let filtered = contexts
+            .into_iter()
+            .filter(|context| context.bead_id == *bead_id)
+            .collect::<Vec<_>>();
+        if filtered.is_empty() {
+            return Err(Box::new(
+                ProtocolEnvelope::error(
+                    request.rid.clone(),
+                    code::NOTFOUND.to_string(),
+                    format!("Bead {bead_id} not found or not resumable"),
+                )
+                .with_fix("swarm resume-context --bead-id <bead-id>".to_string())
+                .with_ctx(json!({"bead_id": bead_id})),
+            ));
+        }
+        filtered
+    } else {
+        contexts
+    };
+
+    Ok(CommandSuccess {
+        data: json!({"contexts": selected}),
+        next: "swarm monitor --view failures".to_string(),
+        state: minimal_state_for_request(request).await,
+    })
+}
+
 async fn handle_artifacts(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
@@ -1410,7 +1455,7 @@ fn parse_artifact_type(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
+        .map(|value| value.to_owned());
 
     if let Some(value) = candidate {
         ArtifactType::try_from(value.as_str())
@@ -1439,11 +1484,83 @@ fn artifact_to_json(artifact: &StageArtifact) -> Value {
         "id": artifact.id,
         "stage_history_id": artifact.stage_history_id,
         "artifact_type": artifact.artifact_type.as_str(),
-        "content": artifact.content,
+        "content": artifact.content.clone(),
         "metadata": artifact.metadata.clone(),
         "created_at": artifact.created_at.to_rfc3339(),
         "content_hash": artifact.content_hash.clone(),
     })
+}
+
+#[cfg(test)]
+mod artifact_tests {
+    use super::*;
+    use serde_json::{map::Map, Value};
+
+    fn request_with_args(entries: &[(&str, &str)]) -> ProtocolRequest {
+        let args = entries
+            .iter()
+            .map(|(key, value)| (key.to_string(), Value::String(value.to_string())))
+            .collect::<Map<_, _>>();
+        ProtocolRequest {
+            cmd: "artifacts".to_string(),
+            rid: None,
+            dry: None,
+            args,
+        }
+    }
+
+    #[test]
+    fn parse_artifact_bead_id_returns_value() {
+        let request = request_with_args(&[("bead_id", "bead-42")]);
+        let bead_id = parse_artifact_bead_id(&request).expect("should parse bead_id");
+        assert_eq!(bead_id.value(), "bead-42");
+    }
+
+    #[test]
+    fn parse_artifact_bead_id_errors_when_missing() {
+        let request = request_with_args(&[]);
+        let err = parse_artifact_bead_id(&request).expect_err("bead_id missing");
+        let envelope: &ProtocolEnvelope = err.as_ref();
+        assert_eq!(envelope.err.as_ref().unwrap().code, "INVALID");
+        assert!(envelope
+            .fix
+            .as_ref()
+            .unwrap()
+            .contains("bead_id"));
+    }
+
+    #[test]
+    fn parse_artifact_type_returns_none_by_default() {
+        let request = request_with_args(&[("bead_id", "bead-42")]);
+        let artifact_type = parse_artifact_type(&request).expect("should parse optional type");
+        assert!(artifact_type.is_none());
+    }
+
+    #[test]
+    fn parse_artifact_type_accepts_known_value() {
+        let request = request_with_args(&[
+            ("bead_id", "bead-42"),
+            ("artifact_type", "test_output"),
+        ]);
+        let artifact_type = parse_artifact_type(&request).expect("valid type");
+        assert_eq!(artifact_type, Some(ArtifactType::TestOutput));
+    }
+
+    #[test]
+    fn parse_artifact_type_rejects_unknown_value() {
+        let request = request_with_args(&[
+            ("bead_id", "bead-42"),
+            ("artifact_type", "unknown-type"),
+        ]);
+        let err = parse_artifact_type(&request).expect_err("unexpected type");
+        let envelope: &ProtocolEnvelope = err.as_ref();
+        assert_eq!(envelope.err.as_ref().unwrap().code, "INVALID");
+        assert!(envelope
+            .fix
+            .as_ref()
+            .unwrap()
+            .contains("artifact_type"));
+    }
 }
 
 async fn handle_resume_context(
@@ -1460,24 +1577,6 @@ async fn handle_resume_context(
             "contexts": contexts,
         }),
         next: "swarm resume".to_string(),
-        state: minimal_state_for_request(request).await,
-    })
-}
-
-async fn handle_resume_context(
-    request: &ProtocolRequest,
-) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
-    let db: SwarmDb = db_from_request(request).await?;
-    let contexts = db
-        .get_deep_resume_contexts()
-        .await
-        .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
-
-    Ok(CommandSuccess {
-        data: json!({
-            "contexts": contexts,
-        }),
-        next: "swarm monitor --view failures".to_string(),
         state: minimal_state_for_request(request).await,
     })
 }

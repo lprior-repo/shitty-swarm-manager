@@ -1,12 +1,13 @@
-use crate::db::SwarmDb;
+use chrono::{DateTime, Utc};
+use crate::db::{mappers::to_u32_i32, SwarmDb};
 use crate::ddd::{
     runtime_determine_transition_decision, validate_completion_implies_push_confirmed,
     RuntimeStage, RuntimeStageResult, RuntimeStageTransition,
 };
 use crate::error::{Result, SwarmError};
 use crate::types::{
-    AgentId, ArtifactType, BeadId, EventSchemaVersion, MessageType, RepoId, Stage, StageResult,
-    SwarmStatus,
+    AgentId, ArtifactType, BeadId, EventSchemaVersion, MessageType, RepoId, Stage, StageArtifact,
+    StageResult, SwarmStatus,
 };
 use crate::BrSyncStatus;
 use serde_json::json;
@@ -316,19 +317,16 @@ impl SwarmDb {
         result: StageResult,
         duration_ms: u64,
     ) -> Result<()> {
-        self.record_stage_complete_without_transition(
-            agent_id,
-            bead_id,
-            stage,
-            attempt,
-            &result,
-            duration_ms,
-        )
-        .await?;
-
         let message = result.message();
         let stage_history_id = self
-            .load_stage_history_id(agent_id, bead_id, stage, attempt)
+            .record_stage_complete_without_transition(
+                agent_id,
+                bead_id,
+                stage,
+                attempt,
+                &result,
+                duration_ms,
+            )
             .await?;
 
         self.apply_stage_transition(
@@ -336,7 +334,8 @@ impl SwarmDb {
             agent_id,
             bead_id,
             stage,
-            stage_history_id,
+            Some(stage_history_id),
+            attempt,
             message,
         )
         .await?;
@@ -361,11 +360,11 @@ impl SwarmDb {
         attempt: u32,
         result: &StageResult,
         duration_ms: u64,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         let status = result.as_str();
         let message = result.message();
 
-        let stage_history_id = sqlx::query_scalar::<_, i64>(
+        let stage_history_row = sqlx::query!(
             "UPDATE stage_history
              SET status = $5, result = $6, feedback = $7, completed_at = NOW(), duration_ms = $8
              WHERE id = (
@@ -373,7 +372,7 @@ impl SwarmDb {
                 WHERE agent_id = $1 AND bead_id = $2 AND stage = $3 AND attempt_number = $4 AND status = 'started'
                 ORDER BY started_at DESC LIMIT 1
              )
-             RETURNING id",
+             RETURNING id, completed_at",
         )
         .bind(agent_id.number().cast_signed())
         .bind(bead_id.value())
@@ -392,6 +391,21 @@ impl SwarmDb {
             )
         })?;
 
+        let completed_at = stage_history_row.completed_at.ok_or_else(|| {
+            SwarmError::DatabaseError("Failed to capture stage completion timestamp".to_string())
+        })?;
+
+        let stage_history_id = stage_history_row.id;
+
+        self.persist_stage_transcript(
+            stage_history_id,
+            stage,
+            attempt,
+            result,
+            completed_at,
+        )
+        .await?;
+
         self.record_execution_event(
             bead_id,
             agent_id,
@@ -409,6 +423,90 @@ impl SwarmDb {
             },
         )
         .await
+        .map(|_| stage_history_id)
+    }
+
+    async fn persist_stage_transcript(
+        &self,
+        stage_history_id: i64,
+        stage: Stage,
+        attempt: u32,
+        result: &StageResult,
+        completed_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let artifacts = self.get_stage_artifacts(stage_history_id).await?;
+        let mut sorted_artifacts = artifacts.clone();
+        sorted_artifacts.sort_by(|a, b| {
+            a.artifact_type
+                .as_str()
+                .cmp(b.artifact_type.as_str())
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        let artifact_types = sorted_artifacts
+            .iter()
+            .map(|artifact| artifact.artifact_type.as_str().to_string())
+            .collect::<Vec<_>>();
+
+        let artifact_refs = sorted_artifacts
+            .iter()
+            .map(|artifact| {
+                json!({
+                    "id": artifact.id,
+                    "artifact_type": artifact.artifact_type.as_str(),
+                    "content_hash": artifact.content_hash,
+                    "created_at": artifact.created_at.to_rfc3339(),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let message = result
+            .message()
+            .map(ToString::to_string)
+            .unwrap_or_else(String::new);
+
+        let metadata = json!({
+            "stage_history_id": stage_history_id,
+            "stage": stage.as_str(),
+            "attempt": attempt,
+            "status": result.as_str(),
+            "artifact_count": sorted_artifacts.len(),
+            "artifact_types": artifact_types,
+            "completed_at": completed_at.to_rfc3339(),
+        });
+
+        let transcript_body = json!({
+            "stage": stage.as_str(),
+            "attempt": attempt,
+            "status": result.as_str(),
+            "message": message,
+            "artifacts": artifact_refs,
+            "metadata": metadata.clone(),
+        });
+
+        let transcript_text = serde_json::to_string(&transcript_body)
+            .map_err(|e| SwarmError::DatabaseError(format!(
+                "Failed to serialize stage transcript: {e}"
+            )))?;
+
+        sqlx::query(
+            "UPDATE stage_history\n             SET transcript = $1\n             WHERE id = $2 AND transcript IS DISTINCT FROM $1",
+        )
+        .bind(&transcript_text)
+        .bind(stage_history_id)
+        .execute(self.pool())
+        .await
+        .map(|_| ())
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to update stage transcript: {e}")))?;
+
+        self.store_stage_artifact(
+            stage_history_id,
+            ArtifactType::StageLog,
+            &transcript_text,
+            Some(metadata),
+        )
+        .await
+        .map(|_| ())?
     }
 
     /// Stores a stage artifact to the database.
@@ -495,6 +593,7 @@ impl SwarmDb {
         bead_id: &BeadId,
         stage: Stage,
         stage_history_id: Option<i64>,
+        attempt: u32,
         message: Option<&str>,
     ) -> Result<()> {
         match transition {
@@ -952,29 +1051,6 @@ impl SwarmDb {
         .await
         .map(|_result| ())
         .map_err(|e| SwarmError::DatabaseError(format!("Failed to advance stage: {e}")))
-    }
-
-    async fn load_stage_history_id(
-        &self,
-        agent_id: &AgentId,
-        bead_id: &BeadId,
-        stage: Stage,
-        attempt: u32,
-    ) -> Result<Option<i64>> {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT id
-             FROM stage_history
-             WHERE agent_id = $1 AND bead_id = $2 AND stage = $3 AND attempt_number = $4
-             ORDER BY id DESC
-             LIMIT 1",
-        )
-        .bind(agent_id.number().cast_signed())
-        .bind(bead_id.value())
-        .bind(stage.as_str())
-        .bind(attempt.cast_signed())
-        .fetch_optional(self.pool())
-        .await
-        .map_err(|e| SwarmError::DatabaseError(format!("Failed to fetch stage history id: {e}")))
     }
 
     async fn lookup_agent_bead(&self, agent_id: &AgentId) -> Result<Option<BeadId>> {

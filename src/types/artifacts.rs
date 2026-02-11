@@ -26,6 +26,7 @@ pub enum ArtifactType {
     RegressionReport,
     QualityGateReport,
     StageLog,
+    RetryPacket,
     SkillInvocation,
     ErrorMessage,
     Feedback,
@@ -58,10 +59,46 @@ impl ArtifactType {
             Self::RegressionReport => "regression_report",
             Self::QualityGateReport => "quality_gate_report",
             Self::StageLog => "stage_log",
+            Self::RetryPacket => "retry_packet",
             Self::SkillInvocation => "skill_invocation",
             Self::ErrorMessage => "error_message",
             Self::Feedback => "feedback",
         }
+    }
+
+    pub const ALL_STRINGS: [&'static str; 27] = [
+        "contract_document",
+        "requirements",
+        "system_context",
+        "invariants",
+        "data_flow",
+        "implementation_plan",
+        "acceptance_criteria",
+        "error_handling",
+        "test_scenarios",
+        "validation_gates",
+        "success_metrics",
+        "implementation_code",
+        "modified_files",
+        "implementation_notes",
+        "test_output",
+        "test_results",
+        "coverage_report",
+        "validation_report",
+        "failure_details",
+        "adversarial_report",
+        "regression_report",
+        "quality_gate_report",
+        "stage_log",
+        "retry_packet",
+        "skill_invocation",
+        "error_message",
+        "feedback",
+    ];
+
+    #[must_use]
+    pub const fn names() -> &'static [&'static str] {
+        &Self::ALL_STRINGS
     }
 }
 
@@ -96,6 +133,7 @@ impl TryFrom<&str> for ArtifactType {
             "skill_invocation" => Ok(Self::SkillInvocation),
             "error_message" => Ok(Self::ErrorMessage),
             "feedback" => Ok(Self::Feedback),
+            "retry_packet" => Ok(Self::RetryPacket),
             _ => Err(format!("Unknown artifact type: {value}")),
         }
     }

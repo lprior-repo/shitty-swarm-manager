@@ -11,21 +11,25 @@ use std::time::Duration;
 use std::time::Instant;
 use tracing::{error, info, warn};
 
+use serde::Serialize;
 use serde_json::json;
 use swarm::{
-    map_terminal_sync_state, runtime_determine_transition, stage_executors::execute_stage_rust,
+    diagnostics::{classify_failure_category, redact_sensitive},
+    map_terminal_sync_state, runtime_determine_transition,
+    stage_executors::execute_stage_rust,
     AgentId, ArtifactStore, ArtifactType, BeadId, BrSyncAction, BrSyncStatus, ClaimRepository,
-    CoordinatorSyncTerminal, EventSink, LandingGateway, LandingOutcome, MessageType,
+    CoordinatorSyncTerminal, Error, EventSink, LandingGateway, LandingOutcome, MessageType,
     OrchestratorEvent, OrchestratorService, OrchestratorTickOutcome, RepoId, Result,
     RuntimeAgentId as AgentKey, RuntimeAgentState as AgentStateKey,
     RuntimeAgentStatus as AgentStatusKey, RuntimeBeadId as BeadKey, RuntimeRepoId as RepoKey,
     RuntimeStage as StageKey, RuntimeStageResult as StageResultKey,
-    RuntimeStageTransition as StageTransitionKey, Stage, StageArtifactRecord,
+    RuntimeStageTransition as StageTransitionKey, Stage, StageArtifact, StageArtifactRecord,
     StageExecutionOutcome, StageExecutionRequest, StageExecutor, StageResult, SwarmDb,
 };
 
 const MIN_POLL_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_POLL_BACKOFF: Duration = Duration::from_secs(5);
+const MAX_IMPLEMENTATION_ATTEMPTS: u32 = 3;
 
 struct StageCompletionInput {
     stage: StageKey,
@@ -243,10 +247,11 @@ async fn process_work_state(
     stage_commands: &StageCommands,
     state: AgentStateKey,
 ) -> Result<bool> {
-    if state.implementation_attempt() >= 3 {
+    if state.implementation_attempt() >= MAX_IMPLEMENTATION_ATTEMPTS {
         return match state.bead_id() {
             Some(bead_id) => {
-                let reason = "Max implementation attempts (3) exceeded";
+                let reason =
+                    format!("Max implementation attempts ({MAX_IMPLEMENTATION_ATTEMPTS}) exceeded");
                 mark_bead_blocked_key(db, agent_id, bead_id, reason).await?;
                 warn!(
                     "Agent {} blocked bead {}: {}",
@@ -375,7 +380,24 @@ async fn process_work_state(
         );
 
         let stage_outcome = to_stage_result_key(&result);
-        let transition = runtime_determine_transition(stage, &stage_outcome, attempt, 3);
+        let transition = runtime_determine_transition(
+            stage,
+            &stage_outcome,
+            attempt,
+            MAX_IMPLEMENTATION_ATTEMPTS,
+        );
+
+        if should_persist_retry_packet(transition, swarm_stage) {
+            persist_retry_packet(
+                db,
+                stage_history_id,
+                swarm_stage,
+                attempt,
+                result.message(),
+                &stage_artifacts,
+            )
+            .await?;
+        }
 
         let apply_transition = !matches!(transition, StageTransitionKey::Complete);
         record_stage_complete_key(
@@ -709,5 +731,177 @@ async fn record_stage_complete_key(
             completion.duration_ms,
         )
         .await
+    }
+}
+
+fn should_persist_retry_packet(transition: StageTransitionKey, stage: Stage) -> bool {
+    matches!(transition, StageTransitionKey::Retry)
+        && matches!(stage, Stage::QaEnforcer | Stage::RedQueen)
+}
+
+async fn persist_retry_packet(
+    db: &SwarmDb,
+    stage_history_id: i64,
+    stage: Stage,
+    attempt: u32,
+    failure_message: Option<&str>,
+    stage_artifacts: &[StageArtifact],
+) -> Result<()> {
+    let packet = RetryPacket::new(stage, attempt, failure_message, stage_artifacts);
+    let payload = serde_json::to_string(&packet).map_err(Error::SerializationError)?;
+
+    db.store_stage_artifact(
+        stage_history_id,
+        ArtifactType::RetryPacket,
+        &payload,
+        Some(json!({
+            "stage": stage.as_str(),
+            "attempt": attempt,
+        })),
+    )
+    .await
+    .map(|_| ())
+}
+
+#[derive(Serialize)]
+struct RetryPacket {
+    stage: String,
+    attempt: u32,
+    remaining_attempts: u32,
+    failure_category: String,
+    failure_message: Option<String>,
+    artifact_references: Vec<RetryArtifactReference>,
+}
+
+impl RetryPacket {
+    fn new(
+        stage: Stage,
+        attempt: u32,
+        failure_message: Option<&str>,
+        stage_artifacts: &[StageArtifact],
+    ) -> Self {
+        let remaining_attempts = MAX_IMPLEMENTATION_ATTEMPTS.saturating_sub(attempt);
+        let failure_category = failure_message
+            .map(|value| classify_failure_category(value).to_string())
+            .unwrap_or_else(|| "stage_failure".to_string());
+        let failure_message = failure_message.map(redact_sensitive);
+        let artifact_references = stage_artifacts
+            .iter()
+            .map(|artifact| RetryArtifactReference {
+                artifact_type: artifact.artifact_type.as_str().to_string(),
+                artifact_id: artifact.id,
+                stage_history_id: artifact.stage_history_id,
+                content_hash: artifact.content_hash.clone(),
+                created_at: artifact.created_at.to_rfc3339(),
+            })
+            .collect();
+
+        Self {
+            stage: stage.as_str().to_string(),
+            attempt,
+            remaining_attempts,
+            failure_category,
+            failure_message,
+            artifact_references,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct RetryArtifactReference {
+    artifact_type: String,
+    artifact_id: i64,
+    stage_history_id: i64,
+    content_hash: Option<String>,
+    created_at: String,
+}
+
+#[cfg(test)]
+mod retry_packet_tests {
+    use super::{should_persist_retry_packet, RetryPacket, MAX_IMPLEMENTATION_ATTEMPTS};
+    use chrono::Utc;
+    use swarm::{ArtifactType, RuntimeStageTransition as StageTransitionKey, Stage, StageArtifact};
+
+    fn sample_stage_artifacts() -> Vec<StageArtifact> {
+        let now = Utc::now();
+        vec![
+            StageArtifact {
+                id: 1,
+                stage_history_id: 10,
+                artifact_type: ArtifactType::FailureDetails,
+                content: "failure".to_string(),
+                metadata: None,
+                created_at: now,
+                content_hash: Some("hash-1".to_string()),
+            },
+            StageArtifact {
+                id: 2,
+                stage_history_id: 10,
+                artifact_type: ArtifactType::TestResults,
+                content: "tests".to_string(),
+                metadata: None,
+                created_at: now,
+                content_hash: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn retry_packet_is_only_persisted_for_retryable_stages() {
+        assert!(should_persist_retry_packet(
+            StageTransitionKey::Retry,
+            Stage::QaEnforcer
+        ));
+        assert!(should_persist_retry_packet(
+            StageTransitionKey::Retry,
+            Stage::RedQueen
+        ));
+        assert!(!should_persist_retry_packet(
+            StageTransitionKey::Retry,
+            Stage::Implement
+        ));
+        assert!(!should_persist_retry_packet(
+            StageTransitionKey::Retry,
+            Stage::Done
+        ));
+    }
+
+    #[test]
+    fn retry_packet_captures_metadata_and_sanitizes_message() {
+        let artifacts = sample_stage_artifacts();
+        let packet = RetryPacket::new(
+            Stage::QaEnforcer,
+            2,
+            Some("syntax failure password=secret"),
+            &artifacts,
+        );
+
+        assert_eq!(packet.remaining_attempts, MAX_IMPLEMENTATION_ATTEMPTS - 2);
+        assert_eq!(packet.failure_category, "compile_error");
+        assert_eq!(
+            packet.failure_message.unwrap(),
+            "syntax failure password=<redacted>"
+        );
+        assert_eq!(packet.artifact_references.len(), artifacts.len());
+        let reference = &packet.artifact_references[0];
+        assert_eq!(
+            reference.artifact_type,
+            ArtifactType::FailureDetails.as_str()
+        );
+        assert_eq!(reference.stage_history_id, artifacts[0].stage_history_id);
+        assert_eq!(reference.artifact_id, artifacts[0].id);
+        assert_eq!(
+            reference.content_hash.as_deref(),
+            artifacts[0].content_hash.as_deref()
+        );
+    }
+
+    #[test]
+    fn retry_packet_defaults_missing_message_to_stage_failure() {
+        let artifacts = sample_stage_artifacts();
+        let packet = RetryPacket::new(Stage::RedQueen, 1, None, &artifacts);
+
+        assert_eq!(packet.failure_category, "stage_failure");
+        assert!(packet.failure_message.is_none());
     }
 }

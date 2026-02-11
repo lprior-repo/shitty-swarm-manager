@@ -894,6 +894,50 @@ impl SwarmDb {
         })
     }
 
+    /// Retrieves the latest artifact of a specific type for a bead.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::DatabaseError` if the database query fails.
+    pub async fn get_latest_bead_artifact_by_type(
+        &self,
+        bead_id: &BeadId,
+        artifact_type: ArtifactType,
+    ) -> Result<Option<StageArtifact>> {
+        sqlx::query_as::<_, StageArtifactRow>(
+            "SELECT sa.id, sa.stage_history_id, sa.artifact_type, sa.content, sa.metadata, sa.created_at, sa.content_hash
+             FROM stage_artifacts sa
+             JOIN stage_history sh ON sa.stage_history_id = sh.id
+             WHERE sh.bead_id = $1 AND sa.artifact_type = $2
+             ORDER BY sa.created_at DESC, sa.id DESC
+             LIMIT 1",
+        )
+        .bind(bead_id.value())
+        .bind(artifact_type.as_str())
+        .fetch_optional(self.pool())
+        .await
+        .map_err(|e| {
+            SwarmError::DatabaseError(format!("Failed to get latest bead artifact by type: {e}"))
+        })
+        .and_then(|maybe_row| {
+            maybe_row
+                .map(|row| {
+                    ArtifactType::try_from(row.artifact_type.as_str())
+                        .map_err(SwarmError::DatabaseError)
+                        .map(|mapped_type| StageArtifact {
+                            id: row.id,
+                            stage_history_id: row.stage_history_id,
+                            artifact_type: mapped_type,
+                            content: row.content,
+                            metadata: row.metadata,
+                            created_at: row.created_at,
+                            content_hash: row.content_hash,
+                        })
+                })
+                .transpose()
+        })
+    }
+
     /// Retrieves the first artifact of a specific type for a bead.
     ///
     /// # Errors

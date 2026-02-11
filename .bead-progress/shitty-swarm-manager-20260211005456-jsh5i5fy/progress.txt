@@ -1,0 +1,7 @@
+# swm-3qw progress
+
+- [x] Document bead metadata, requirements, and AI hints in the contract stage artifacts.
+- [x] Surface the bead issue description and AI hints as persisted artifacts for downstream stages.
+- [x] Add unit coverage proving the contract document references bead-specific context.
+- [ ] Run `moon run :quick`.
+- [ ] Run `moon run :test`.

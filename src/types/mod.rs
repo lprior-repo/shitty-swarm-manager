@@ -11,8 +11,8 @@ pub use messaging::{AgentMessage, MessageType};
 pub use observability::{EventSchemaVersion, ExecutionEvent, FailureDiagnostics};
 pub use stage::{Stage, StageResult};
 pub use state::{
-    AgentState, AgentStatus, AvailableAgent, BeadClaim, ClaimStatus, ProgressSummary,
-    ResumeArtifactSummary, ResumeArtifactSummaryContract, ResumeContextContract,
-    ResumeContextProjection, ResumeStageAttempt, ResumeStageAttemptContract, SwarmConfig,
-    SwarmStatus,
+    AgentState, AgentStatus, AvailableAgent, BeadClaim, ClaimStatus, DeepResumeContextContract,
+    ProgressSummary, ResumeArtifactDetailContract, ResumeArtifactSummary,
+    ResumeArtifactSummaryContract, ResumeContextContract, ResumeContextProjection,
+    ResumeStageAttempt, ResumeStageAttemptContract, SwarmConfig, SwarmStatus,
 };

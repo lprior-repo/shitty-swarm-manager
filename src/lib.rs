@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod beads_sync;
+pub mod canonical_schema;
 pub mod ddd;
 
 pub use beads_sync::{
@@ -25,6 +26,7 @@ pub use error::{code, SwarmError, ERROR_CODES};
 
 pub mod contracts;
 pub mod db;
+pub mod diagnostics;
 mod error;
 pub mod gate_cache;
 pub mod orchestrator_service;
@@ -48,8 +50,9 @@ pub use orchestrator_service::{
 
 pub use types::{
     AgentId, AgentMessage, AgentState, AgentStatus, ArtifactType, BeadId, ClaimStatus,
-    EventSchemaVersion, ExecutionEvent, FailureDiagnostics, MessageType, ProgressSummary, RepoId,
-    ResumeArtifactSummary, ResumeArtifactSummaryContract, ResumeContextContract,
-    ResumeContextProjection, ResumeStageAttempt, ResumeStageAttemptContract, Stage, StageArtifact,
-    StageResult, SwarmConfig, SwarmStatus,
+    DeepResumeContextContract, EventSchemaVersion, ExecutionEvent, FailureDiagnostics, MessageType,
+    ProgressSummary, RepoId, ResumeArtifactDetailContract, ResumeArtifactSummary,
+    ResumeArtifactSummaryContract, ResumeContextContract, ResumeContextProjection,
+    ResumeStageAttempt, ResumeStageAttemptContract, Stage, StageArtifact, StageResult, SwarmConfig,
+    SwarmStatus,
 };

@@ -40,6 +40,8 @@ swarm init-local-db
 swarm init-db --url "postgresql://shitty_swarm_manager@localhost:5437/shitty_swarm_manager_db" --schema "crates/swarm-coordinator/schema.sql" --seed_agents 12
 ```
 
+The CLI defaults to loading the canonical coordinator schema at `crates/swarm-coordinator/schema.sql` for `init-db`, `init-local-db`, and other bootstrap actions. Use `--schema` only when a different SQL file is required.
+
 This creates:
 - `bead_backlog` (pending/in_progress/completed/blocked queue)
 - `bead_claims` (current claim owner + claim status)

@@ -49,6 +49,8 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use serde_json::json;
 
+    const NEXT_COMMAND: &str = "oya stage -s swm-bkg --stage implement";
+
     #[test]
     fn serializes_execution_event_with_versioned_envelope_fields() -> Result<(), String> {
         let timestamp = Utc
@@ -68,7 +70,7 @@ mod tests {
             diagnostics: Some(FailureDiagnostics {
                 category: "test_failure".to_string(),
                 retryable: true,
-                next_command: "swarm stage --stage implement".to_string(),
+                next_command: NEXT_COMMAND.to_string(),
                 detail: Some("assertion mismatch".to_string()),
             }),
             payload: Some(json!({"transition": "retry"})),
@@ -103,7 +105,7 @@ mod tests {
             "diagnostics": {
                 "category": "stage_failure",
                 "retryable": true,
-                "next_command": "swarm stage --stage implement",
+                "next_command": NEXT_COMMAND,
                 "detail": "redacted"
             },
             "payload": {"attempt": 1, "status": "started"},
@@ -124,7 +126,7 @@ mod tests {
         let diagnostics = FailureDiagnostics {
             category: "timeout".to_string(),
             retryable: true,
-            next_command: "swarm stage --stage implement".to_string(),
+            next_command: NEXT_COMMAND.to_string(),
             detail: Some("operation exceeded budget".to_string()),
         };
 
@@ -132,10 +134,7 @@ mod tests {
 
         assert_eq!(encoded["category"], json!("timeout"));
         assert_eq!(encoded["retryable"], json!(true));
-        assert_eq!(
-            encoded["next_command"],
-            json!("swarm stage --stage implement")
-        );
+        assert_eq!(encoded["next_command"], json!(NEXT_COMMAND));
         assert_eq!(encoded["detail"], json!("operation exceeded budget"));
 
         Ok(())
