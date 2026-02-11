@@ -1125,11 +1125,7 @@ fn resume_artifact_type_names() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        parse_resume_artifacts,
-        parse_resume_attempts,
-        resume_artifact_type_names,
-    };
+    use super::{parse_resume_artifacts, parse_resume_attempts, resume_artifact_type_names};
     use crate::types::{ArtifactType, Stage};
     use chrono::Utc;
     use serde_json::json;
