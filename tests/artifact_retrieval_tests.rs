@@ -62,3 +62,55 @@ fn artifacts_command_rejects_unknown_artifact_type() -> Result<(), String> {
 
     Ok(())
 }
+
+#[test]
+fn artifacts_command_rejects_empty_bead_id() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario =
+        harness.run_protocol(r#"{"cmd":"artifacts","rid":"artifacts-empty-bead","bead_id":""}"#)?;
+    let output = scenario.output;
+
+    assert_protocol_envelope(&output)?;
+    if output["ok"] != Value::Bool(false) {
+        return Err(format!(
+            "expected artifacts request with empty bead_id to fail, got: {output}"
+        ));
+    }
+    if output["err"]["code"] != Value::String("INVALID".to_string()) {
+        return Err(format!(
+            "expected INVALID code for empty bead_id, got: {output}"
+        ));
+    }
+    if !output["fix"]
+        .as_str()
+        .is_some_and(|text| text.contains("bead_id"))
+    {
+        return Err(format!(
+            "expected fix guidance mentioning bead_id, got: {output}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn artifacts_command_rejects_whitespace_only_bead_id() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness
+        .run_protocol(r#"{"cmd":"artifacts","rid":"artifacts-whitespace-bead","bead_id":"   "}"#)?;
+    let output = scenario.output;
+
+    assert_protocol_envelope(&output)?;
+    if output["ok"] != Value::Bool(false) {
+        return Err(format!(
+            "expected artifacts request with whitespace-only bead_id to fail, got: {output}"
+        ));
+    }
+    if output["err"]["code"] != Value::String("INVALID".to_string()) {
+        return Err(format!(
+            "expected INVALID code for whitespace-only bead_id, got: {output}"
+        ));
+    }
+
+    Ok(())
+}

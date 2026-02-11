@@ -127,6 +127,13 @@ impl ParseInput for swarm::AgentInput {
             value: format!("{id_as_u64} exceeds max u32"),
         })?;
 
+        if id == 0 {
+            return Err(ParseError::InvalidValue {
+                field: "id".to_string(),
+                value: "must be greater than 0".to_string(),
+            });
+        }
+
         Ok(Self::Input {
             id,
             dry: request.args.get("dry").and_then(|v: &Value| v.as_bool()),
@@ -669,6 +676,8 @@ pub async fn process_protocol_line(line: &str) -> std::result::Result<(), SwarmE
 async fn execute_request(
     request: ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
+    validate_request_null_bytes(&request)?;
+
     match request.cmd.as_str() {
         "batch" => handle_batch(&request).await,
         _ => execute_request_no_batch(request).await,
@@ -800,6 +809,64 @@ fn validate_request_args(
         .with_fix("Remove unknown fields or use documented command arguments".to_string())
         .with_ctx(json!({"cmd": request.cmd, "unknown": unknown, "allowed": allowed})),
     ))
+}
+
+fn validate_request_null_bytes(
+    request: &ProtocolRequest,
+) -> std::result::Result<(), Box<ProtocolEnvelope>> {
+    if request.cmd.contains('\0') {
+        return Err(Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::INVALID.to_string(),
+                "Null byte is not allowed in cmd".to_string(),
+            )
+            .with_fix("Remove null bytes from request fields".to_string())
+            .with_ctx(json!({"field": "cmd"})),
+        ));
+    }
+
+    if let Some(field) = first_null_byte_field_in_map(&request.args, "") {
+        return Err(Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::INVALID.to_string(),
+                format!("Null byte is not allowed in field {field}"),
+            )
+            .with_fix("Remove null bytes from request fields".to_string())
+            .with_ctx(json!({"field": field})),
+        ));
+    }
+
+    Ok(())
+}
+
+fn first_null_byte_field_in_map(map: &Map<String, Value>, prefix: &str) -> Option<String> {
+    map.iter().find_map(|(key, value)| {
+        let field = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        first_null_byte_field_in_value(value, &field)
+    })
+}
+
+fn first_null_byte_field_in_value(value: &Value, field: &str) -> Option<String> {
+    match value {
+        Value::String(text) => {
+            if text.contains('\0') {
+                Some(field.to_string())
+            } else {
+                None
+            }
+        }
+        Value::Array(items) => items.iter().enumerate().find_map(|(index, item)| {
+            first_null_byte_field_in_value(item, &format!("{field}[{index}]"))
+        }),
+        Value::Object(object) => first_null_byte_field_in_map(object, field),
+        Value::Null | Value::Bool(_) | Value::Number(_) => None,
+    }
 }
 
 struct CommandSuccess {
@@ -2464,11 +2531,10 @@ async fn handle_artifacts(
 fn parse_artifact_bead_id(
     request: &ProtocolRequest,
 ) -> std::result::Result<BeadId, Box<ProtocolEnvelope>> {
-    request
+    let bead_id_str = request
         .args
         .get("bead_id")
         .and_then(Value::as_str)
-        .map(BeadId::new)
         .ok_or_else(||
             Box::new(
                 ProtocolEnvelope::error(
@@ -2479,7 +2545,21 @@ fn parse_artifact_bead_id(
                 .with_fix("Include `bead_id` in the request. Example: {\"cmd\":\"artifacts\",\"bead_id\":\"<bead>\"}".to_string())
                 .with_ctx(json!({"bead_id": "required"})),
             ),
-        )
+        )?;
+
+    if bead_id_str.trim().is_empty() {
+        return Err(Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::INVALID.to_string(),
+                "bead_id cannot be empty".to_string(),
+            )
+            .with_fix("Provide a non-empty bead_id. Example: {\"cmd\":\"artifacts\",\"bead_id\":\"swm-abc123\"}".to_string())
+            .with_ctx(json!({"bead_id": bead_id_str})),
+        ));
+    }
+
+    Ok(BeadId::new(bead_id_str))
 }
 
 fn parse_artifact_type(
@@ -2565,6 +2645,27 @@ mod artifact_tests {
         let envelope: &ProtocolEnvelope = err.as_ref();
         assert_eq!(envelope.err.as_ref().unwrap().code, "INVALID");
         assert!(envelope.fix.as_ref().unwrap().contains("bead_id"));
+    }
+
+    #[test]
+    fn parse_artifact_bead_id_errors_when_empty_string() {
+        let request = request_with_args(&[("bead_id", "")]);
+        let err = parse_artifact_bead_id(&request).expect_err("empty bead_id should be rejected");
+        let envelope: &ProtocolEnvelope = err.as_ref();
+        assert_eq!(envelope.err.as_ref().unwrap().code, "INVALID");
+        assert!(
+            envelope.fix.as_ref().unwrap().contains("bead_id"),
+            "error should provide guidance about bead_id"
+        );
+    }
+
+    #[test]
+    fn parse_artifact_bead_id_errors_when_whitespace_only() {
+        let request = request_with_args(&[("bead_id", "   ")]);
+        let err = parse_artifact_bead_id(&request)
+            .expect_err("whitespace-only bead_id should be rejected");
+        let envelope: &ProtocolEnvelope = err.as_ref();
+        assert_eq!(envelope.err.as_ref().unwrap().code, "INVALID");
     }
 
     #[test]

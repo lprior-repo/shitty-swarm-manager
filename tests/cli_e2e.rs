@@ -393,6 +393,54 @@ fn run_once_rejects_unknown_fields_in_protocol_payload() -> Result<(), String> {
 }
 
 #[test]
+fn lock_command_rejects_null_byte_in_resource_field() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(
+        r#"{"cmd":"lock","resource":"repo\u0000tmp","agent":"agent-1","ttl_ms":1000,"dry":true}"#,
+    )?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["err"]["code"], "INVALID");
+
+    let msg = json["err"]["msg"]
+        .as_str()
+        .ok_or_else(|| format!("expected null-byte validation message, got: {json}"))?;
+    if !msg.contains("Null byte is not allowed") || !msg.contains("resource") {
+        return Err(format!(
+            "expected explicit null-byte validation on resource field, got: {json}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn batch_command_rejects_null_byte_in_nested_operation_payload() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(
+        r#"{"cmd":"batch","ops":[{"cmd":"lock","resource":"repo\u0000tmp","agent":"agent-1","ttl_ms":1000,"dry":true}]}"#,
+    )?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["err"]["code"], "INVALID");
+
+    let msg = json["err"]["msg"]
+        .as_str()
+        .ok_or_else(|| format!("expected nested null-byte validation message, got: {json}"))?;
+    if !msg.contains("Null byte is not allowed") || !msg.contains("ops[0].resource") {
+        return Err(format!(
+            "expected nested null-byte validation path ops[0].resource, got: {json}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
 fn agent_command_rejects_non_numeric_id_with_type_error() -> Result<(), String> {
     let harness = ProtocolScenarioHarness::new();
     let scenario = harness.run_protocol(r#"{"cmd":"agent","id":"abc","dry":true}"#)?;
@@ -415,6 +463,28 @@ fn agent_command_rejects_non_numeric_id_with_type_error() -> Result<(), String> 
 }
 
 #[test]
+fn agent_command_rejects_zero_id_with_validation_error() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"agent","id":0,"dry":true}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["err"]["code"], "INVALID");
+
+    let msg = json["err"]["msg"]
+        .as_str()
+        .ok_or_else(|| format!("expected id validation message, got: {json}"))?;
+    if !msg.contains("Invalid value for field id") || !msg.contains("greater than 0") {
+        return Err(format!(
+            "expected explicit positive-id validation message, got: {json}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
 fn agent_cli_rejects_non_numeric_id_with_type_error() {
     let binary_path = assert_cmd::cargo::cargo_bin!("swarm");
     Command::new(binary_path)
@@ -422,6 +492,18 @@ fn agent_cli_rejects_non_numeric_id_with_type_error() {
         .assert()
         .failure()
         .stderr(contains("Invalid type for id"));
+}
+
+#[test]
+fn agent_cli_rejects_zero_id_with_validation_error() {
+    let binary_path = assert_cmd::cargo::cargo_bin!("swarm");
+    Command::new(binary_path)
+        .args(["agent", "--id", "0", "--dry"])
+        .assert()
+        .failure()
+        .stdout(contains(
+            "Invalid value for field id: must be greater than 0",
+        ));
 }
 
 #[test]
