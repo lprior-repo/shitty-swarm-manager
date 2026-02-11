@@ -558,7 +558,7 @@ impl RuntimeAgentState {
 ```rust
 // Claim idempotency: Same bead cannot be claimed twice
 // Implemented at database level via:
-//   SELECT claim_next_p0_bead(agent_id)
+//   SELECT claim_next_bead(agent_id)
 // Which atomically:
 //   1. SELECTs next pending P0 bead
 //   2. UPDATEs bead_id = agent_id

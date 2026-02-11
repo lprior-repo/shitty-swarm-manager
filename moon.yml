@@ -17,8 +17,7 @@ tasks:
     command: "cargo test"
 
   db-test:
-    command: >-
-      bash -lc 'DB_URL="${SWARM_TEST_DATABASE_URL:-${DATABASE_URL:-}}"; if [ -z "$DB_URL" ]; then printf "Skipping db-test: SWARM_TEST_DATABASE_URL or DATABASE_URL not set\n"; exit 0; fi; PGCONNECT_TIMEOUT=3 psql "$DB_URL" -c "SELECT 1" >/dev/null 2>&1 || { printf "db-test preflight failed: cannot reach database from configured URL\n"; exit 3; }; cargo test db::write_ops::tests:: -- --ignored --nocapture --test-threads=1'
+    command: "bash scripts/run_db_test_from_env.sh"
 
   db-test-full:
     command: "bash scripts/run_db_test_suite.sh"

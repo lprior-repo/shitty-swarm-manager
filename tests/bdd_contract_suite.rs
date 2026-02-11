@@ -276,3 +276,101 @@ fn given_contract_suite_when_reviewed_then_assertions_remain_decoupled_from_inte
         .iter()
         .try_for_each(|relative_path| assert_contract_test_is_decoupled(relative_path))
 }
+
+#[test]
+fn given_ai_runs_init_db_outside_repo_root_when_schema_not_provided_then_embedded_schema_is_used(
+) -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"init-db","dry":true}"#)?;
+
+    assert_protocol_envelope(&scenario.output)?;
+    if scenario.output["ok"] != Value::Bool(true) {
+        return Err(format!(
+            "expected dry init-db success envelope, got: {}",
+            scenario.output
+        ));
+    }
+
+    let steps = scenario.output["d"]["would_do"]
+        .as_array()
+        .ok_or_else(|| "expected would_do array in init-db dry response".to_string())?;
+    let apply_schema = steps
+        .iter()
+        .find(|step| step["action"] == "apply_schema")
+        .ok_or_else(|| "expected apply_schema step in init-db dry response".to_string())?;
+    let target = apply_schema["target"]
+        .as_str()
+        .ok_or_else(|| "expected apply_schema target to be a string".to_string())?;
+
+    if !target.starts_with("embedded:") {
+        return Err(format!(
+            "expected embedded schema target for AI-safe init-db, got: {target}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn given_run_once_payload_with_unknown_field_when_processed_then_command_rejects_it_with_actionable_contract(
+) -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"run-once","agent_id":7,"dry":true}"#)?;
+
+    assert_protocol_envelope(&scenario.output)?;
+    if scenario.output["ok"] != Value::Bool(false) {
+        return Err(format!(
+            "expected unknown field to fail validation, got: {}",
+            scenario.output
+        ));
+    }
+    if scenario.output["err"]["code"] != Value::String("INVALID".to_string()) {
+        return Err(format!(
+            "expected INVALID code for unknown field, got: {}",
+            scenario.output
+        ));
+    }
+    let message = scenario.output["err"]["msg"]
+        .as_str()
+        .ok_or_else(|| format!("expected error message string, got: {}", scenario.output))?;
+    if !message.contains("Unknown field(s) for run-once") {
+        return Err(format!(
+            "expected unknown field message for run-once, got: {}",
+            scenario.output
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn given_agent_request_with_string_id_when_processed_then_response_reports_explicit_type_mismatch(
+) -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"agent","id":"abc","dry":true}"#)?;
+
+    assert_protocol_envelope(&scenario.output)?;
+    if scenario.output["ok"] != Value::Bool(false) {
+        return Err(format!(
+            "expected agent request with string id to fail, got: {}",
+            scenario.output
+        ));
+    }
+    if scenario.output["err"]["code"] != Value::String("INVALID".to_string()) {
+        return Err(format!(
+            "expected INVALID code for id type mismatch, got: {}",
+            scenario.output
+        ));
+    }
+    let message = scenario.output["err"]["msg"]
+        .as_str()
+        .ok_or_else(|| format!("expected error message string, got: {}", scenario.output))?;
+    if !message.contains("Invalid type for field id") {
+        return Err(format!(
+            "expected explicit id type mismatch message, got: {}",
+            scenario.output
+        ));
+    }
+
+    Ok(())
+}

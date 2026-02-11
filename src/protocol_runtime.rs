@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 use swarm::protocol_envelope::ProtocolEnvelope;
 use swarm::{
@@ -24,7 +25,7 @@ use swarm::{
     SwarmError, CANONICAL_COORDINATOR_SCHEMA_PATH,
 };
 use tokio::fs;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 const EMBEDDED_COORDINATOR_SCHEMA_SQL: &str =
@@ -33,6 +34,8 @@ const EMBEDDED_COORDINATOR_SCHEMA_REF: &str = "embedded:crates/swarm-coordinator
 const DEFAULT_DB_CONNECT_TIMEOUT_MS: u64 = 3_000;
 const MIN_DB_CONNECT_TIMEOUT_MS: u64 = 100;
 const MAX_DB_CONNECT_TIMEOUT_MS: u64 = 30_000;
+const MAX_EXTERNAL_OUTPUT_CAPTURE_BYTES: usize = 1_048_576;
+const GLOBAL_ALLOWED_REQUEST_ARGS: &[&str] = &["repo_id", "database_url", "connect_timeout_ms"];
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct ProtocolRequest {
@@ -106,14 +109,23 @@ impl ParseInput for swarm::AgentInput {
     type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
-        let id = request
+        let id_raw = request
             .args
             .get("id")
-            .and_then(|v: &Value| v.as_u64())
-            .and_then(|v| u32::try_from(v).ok())
             .ok_or_else(|| ParseError::MissingField {
                 field: "id".to_string(),
             })?;
+
+        let id_as_u64 = id_raw.as_u64().ok_or_else(|| ParseError::InvalidType {
+            field: "id".to_string(),
+            expected: "u32".to_string(),
+            got: json_value_type_name(id_raw).to_string(),
+        })?;
+
+        let id = u32::try_from(id_as_u64).map_err(|_| ParseError::InvalidValue {
+            field: "id".to_string(),
+            value: format!("{id_as_u64} exceeds max u32"),
+        })?;
 
         Ok(Self::Input {
             id,
@@ -658,6 +670,8 @@ async fn execute_request(
 async fn execute_request_no_batch(
     request: ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
+    validate_request_args(&request)?;
+
     match request.cmd.as_str() {
         "?" | "help" => handle_help(&request).await,
         "state" => handle_state(&request).await,
@@ -695,6 +709,89 @@ async fn execute_request_no_batch(
             ).with_fix("Use a valid command: init, doctor, status, next, claim-next, assign, run-once, qa, resume, artifacts, resume-context, agent, smoke, prompt, register, release, monitor, init-db, init-local-db, spawn-prompts, batch, bootstrap, state, or ?/help for help".to_string())
             .with_ctx(json!({"cmd": other})))),
     }
+}
+
+fn allowed_command_args(cmd: &str) -> Option<&'static [&'static str]> {
+    match cmd {
+        "?" | "help" => Some(&["short", "s"]),
+        "state" | "history" => Some(&["limit"]),
+        "doctor" | "status" | "resume" | "agents" => Some(&[]),
+        "lock" => Some(&["resource", "agent", "ttl_ms", "dry"]),
+        "unlock" => Some(&["resource", "agent", "dry"]),
+        "broadcast" => Some(&["msg", "from", "dry"]),
+        "monitor" => Some(&["view", "watch_ms"]),
+        "register" => Some(&["count", "dry"]),
+        "agent" | "run-once" | "smoke" => Some(&["id", "dry"]),
+        "next" | "claim-next" | "bootstrap" => Some(&["dry"]),
+        "assign" => Some(&["bead_id", "agent_id", "dry"]),
+        "qa" => Some(&["target", "id", "dry"]),
+        "resume-context" => Some(&["bead_id"]),
+        "artifacts" => Some(&["bead_id", "artifact_type"]),
+        "release" => Some(&["agent_id", "dry"]),
+        "init-db" => Some(&["url", "schema", "seed_agents", "dry"]),
+        "init-local-db" => Some(&[
+            "container_name",
+            "port",
+            "user",
+            "database",
+            "schema",
+            "seed_agents",
+            "dry",
+        ]),
+        "spawn-prompts" => Some(&["template", "out_dir", "count", "dry"]),
+        "prompt" => Some(&["id", "skill"]),
+        "load-profile" => Some(&["agents", "rounds", "timeout_ms", "dry"]),
+        "init" => Some(&["dry", "database_url", "schema", "seed_agents"]),
+        "batch" => Some(&["ops", "cmds", "dry"]),
+        _ => None,
+    }
+}
+
+fn validate_request_args(
+    request: &ProtocolRequest,
+) -> std::result::Result<(), Box<ProtocolEnvelope>> {
+    let Some(allowed_command_specific) = allowed_command_args(request.cmd.as_str()) else {
+        return Ok(());
+    };
+    let unknown = request
+        .args
+        .keys()
+        .filter(|key| {
+            !allowed_command_specific.contains(&key.as_str())
+                && !GLOBAL_ALLOWED_REQUEST_ARGS.contains(&key.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if unknown.is_empty() {
+        return Ok(());
+    }
+
+    let mut allowed = allowed_command_specific
+        .iter()
+        .map(|key| (*key).to_string())
+        .collect::<Vec<_>>();
+    allowed.extend(
+        GLOBAL_ALLOWED_REQUEST_ARGS
+            .iter()
+            .map(|key| (*key).to_string()),
+    );
+    allowed.sort();
+    allowed.dedup();
+
+    Err(Box::new(
+        ProtocolEnvelope::error(
+            request.rid.clone(),
+            code::INVALID.to_string(),
+            format!(
+                "Unknown field(s) for {}: {}",
+                request.cmd,
+                unknown.join(", ")
+            ),
+        )
+        .with_fix("Remove unknown fields or use documented command arguments".to_string())
+        .with_ctx(json!({"cmd": request.cmd, "unknown": unknown, "allowed": allowed})),
+    ))
 }
 
 struct CommandSuccess {
@@ -786,13 +883,67 @@ async fn run_external_json_command(
     fix: &str,
 ) -> std::result::Result<Value, Box<ProtocolEnvelope>> {
     let timeout_ms = 15_000_u64;
-    let output = tokio::time::timeout(
-        tokio::time::Duration::from_millis(timeout_ms),
-        Command::new(program).args(args).output(),
-    )
-    .await
-    .map_err(|_| {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| {
+            Box::new(
+                ProtocolEnvelope::error(
+                    rid.clone(),
+                    code::INTERNAL.to_string(),
+                    format!("Failed to execute {program}: {err}"),
+                )
+                .with_fix(fix.to_string()),
+            )
+        })?;
+
+    let stdout = child.stdout.take().ok_or_else(|| {
         Box::new(
+            ProtocolEnvelope::error(
+                rid.clone(),
+                code::INTERNAL.to_string(),
+                format!("Failed to capture {program} stdout"),
+            )
+            .with_fix(fix.to_string()),
+        )
+    })?;
+
+    let stderr = child.stderr.take().ok_or_else(|| {
+        Box::new(
+            ProtocolEnvelope::error(
+                rid.clone(),
+                code::INTERNAL.to_string(),
+                format!("Failed to capture {program} stderr"),
+            )
+            .with_fix(fix.to_string()),
+        )
+    })?;
+
+    let stdout_task = tokio::spawn(async move {
+        capture_stream_limited(stdout, MAX_EXTERNAL_OUTPUT_CAPTURE_BYTES).await
+    });
+    let stderr_task = tokio::spawn(async move {
+        capture_stream_limited(stderr, MAX_EXTERNAL_OUTPUT_CAPTURE_BYTES).await
+    });
+
+    let status = if let Ok(wait_result) =
+        tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait()).await
+    {
+        wait_result.map_err(SwarmError::IoError).map_err(|err| {
+            Box::new(
+                ProtocolEnvelope::error(
+                    rid.clone(),
+                    code::INTERNAL.to_string(),
+                    format!("Failed to wait for {program}: {err}"),
+                )
+                .with_fix(fix.to_string()),
+            )
+        })?
+    } else {
+        let _ = child.kill().await;
+        return Err(Box::new(
             ProtocolEnvelope::error(
                 rid.clone(),
                 code::INTERNAL.to_string(),
@@ -800,22 +951,58 @@ async fn run_external_json_command(
             )
             .with_fix(fix.to_string())
             .with_ctx(json!({"program": program, "args": args, "timeout_ms": timeout_ms})),
-        )
-    })?
-    .map_err(|err| {
+        ));
+    };
+
+    let stdout_capture = stdout_task.await.map_err(|err| {
         Box::new(
             ProtocolEnvelope::error(
                 rid.clone(),
                 code::INTERNAL.to_string(),
-                format!("Failed to execute {program}: {err}"),
+                format!("Failed to read {program} stdout: {err}"),
             )
             .with_fix(fix.to_string()),
         )
     })?;
 
-    if !output.status.success() {
-        let exit_code = output.status.code().unwrap_or(1);
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stderr_capture = stderr_task.await.map_err(|err| {
+        Box::new(
+            ProtocolEnvelope::error(
+                rid.clone(),
+                code::INTERNAL.to_string(),
+                format!("Failed to read {program} stderr: {err}"),
+            )
+            .with_fix(fix.to_string()),
+        )
+    })?;
+
+    let stdout_capture = stdout_capture.map_err(|err| {
+        Box::new(
+            ProtocolEnvelope::error(
+                rid.clone(),
+                code::INTERNAL.to_string(),
+                format!("Failed to read {program} stdout: {err}"),
+            )
+            .with_fix(fix.to_string()),
+        )
+    })?;
+
+    let stderr_capture = stderr_capture.map_err(|err| {
+        Box::new(
+            ProtocolEnvelope::error(
+                rid.clone(),
+                code::INTERNAL.to_string(),
+                format!("Failed to read {program} stderr: {err}"),
+            )
+            .with_fix(fix.to_string()),
+        )
+    })?;
+
+    if !status.success() {
+        let exit_code = status.code().map_or(1, |code| code);
+        let stderr = String::from_utf8_lossy(&stderr_capture.bytes)
+            .trim()
+            .to_string();
         return Err(Box::new(
             ProtocolEnvelope::error(
                 rid,
@@ -831,11 +1018,14 @@ async fn run_external_json_command(
                 "program": program,
                 "exit_code": exit_code,
                 "stderr": stderr,
+                "stderr_truncated": stderr_capture.truncated,
             })),
         ));
     }
 
-    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let raw = String::from_utf8_lossy(&stdout_capture.bytes)
+        .trim()
+        .to_string();
     serde_json::from_str::<Value>(&raw).map_err(|err| {
         Box::new(
             ProtocolEnvelope::error(
@@ -844,9 +1034,48 @@ async fn run_external_json_command(
                 format!("{program} returned non-JSON output: {err}"),
             )
             .with_fix(fix.to_string())
-            .with_ctx(json!({"raw": raw})),
+            .with_ctx(json!({"raw": raw, "stdout_truncated": stdout_capture.truncated})),
         )
     })
+}
+
+#[derive(Debug, Clone)]
+struct StreamCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+async fn capture_stream_limited<R>(
+    mut stream: R,
+    max_bytes: usize,
+) -> std::result::Result<StreamCapture, SwarmError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    let mut truncated = false;
+    let mut chunk = [0_u8; 8_192];
+
+    loop {
+        let read = stream.read(&mut chunk).await.map_err(SwarmError::IoError)?;
+        if read == 0 {
+            break;
+        }
+
+        let remaining = max_bytes.saturating_sub(bytes.len());
+        if remaining == 0 {
+            truncated = true;
+            continue;
+        }
+
+        let to_copy = remaining.min(read);
+        bytes.extend_from_slice(&chunk[..to_copy]);
+        if to_copy < read {
+            truncated = true;
+        }
+    }
+
+    Ok(StreamCapture { bytes, truncated })
 }
 
 async fn run_external_json_command_with_ms(
@@ -3184,7 +3413,8 @@ async fn db_from_request(
         .filter(|value| !value.is_empty());
     let candidates =
         compose_database_url_candidates(explicit_database_url, database_url_candidates_for_cli());
-    connect_using_candidates(candidates, request.rid.clone()).await
+    let timeout_ms = request_connect_timeout_ms(request)?;
+    connect_using_candidates(candidates, timeout_ms, request.rid.clone()).await
 }
 
 async fn resolve_database_url_for_init(
@@ -3209,7 +3439,8 @@ async fn resolve_database_url_for_init(
     }
 
     let candidates = database_url_candidates_for_cli();
-    let (connected, failures) = try_connect_candidates(&candidates).await;
+    let timeout_ms = request_connect_timeout_ms(request)?;
+    let (connected, failures) = try_connect_candidates(&candidates, timeout_ms).await;
     if let Some((_db, connected_url)) = connected {
         return Ok(connected_url);
     }
@@ -3232,9 +3463,10 @@ async fn resolve_database_url_for_init(
 
 async fn connect_using_candidates(
     candidates: Vec<String>,
+    timeout_ms: u64,
     rid: Option<String>,
 ) -> std::result::Result<SwarmDb, Box<ProtocolEnvelope>> {
-    let (connected, failures) = try_connect_candidates(&candidates).await;
+    let (connected, failures) = try_connect_candidates(&candidates, timeout_ms).await;
     if let Some((db, _connected_url)) = connected {
         return Ok(db);
     }
@@ -3258,20 +3490,16 @@ async fn connect_using_candidates(
     ))
 }
 
-async fn try_connect_candidates(candidates: &[String]) -> (Option<(SwarmDb, String)>, Vec<String>) {
+async fn try_connect_candidates(
+    candidates: &[String],
+    timeout_ms: u64,
+) -> (Option<(SwarmDb, String)>, Vec<String>) {
     let mut failures = Vec::new();
-    let timeout_ms = database_connect_timeout_ms();
-    let timeout = Duration::from_millis(timeout_ms);
 
     for candidate in candidates {
-        match tokio::time::timeout(timeout, SwarmDb::new(candidate)).await {
-            Ok(Ok(db)) => return (Some((db, candidate.clone())), failures),
-            Ok(Err(err)) => failures.push(format!("{}: {}", mask_database_url(candidate), err)),
-            Err(_) => failures.push(format!(
-                "{}: connection attempt timed out after {}ms",
-                mask_database_url(candidate),
-                timeout_ms
-            )),
+        match SwarmDb::new_with_timeout(candidate, Some(timeout_ms)).await {
+            Ok(db) => return (Some((db, candidate.clone())), failures),
+            Err(err) => failures.push(format!("{}: {}", mask_database_url(candidate), err)),
         }
     }
 
@@ -3289,6 +3517,51 @@ fn parse_database_connect_timeout_ms(raw: Option<&str>) -> u64 {
         .map_or(DEFAULT_DB_CONNECT_TIMEOUT_MS, |value| {
             value.clamp(MIN_DB_CONNECT_TIMEOUT_MS, MAX_DB_CONNECT_TIMEOUT_MS)
         })
+}
+
+fn parse_connect_timeout_value(raw: &Value) -> std::result::Result<u64, ParseError> {
+    let Some(value) = raw.as_u64() else {
+        return Err(ParseError::InvalidType {
+            field: "connect_timeout_ms".to_string(),
+            expected: "u64".to_string(),
+            got: json_value_type_name(raw).to_string(),
+        });
+    };
+
+    Ok(value.clamp(MIN_DB_CONNECT_TIMEOUT_MS, MAX_DB_CONNECT_TIMEOUT_MS))
+}
+
+fn request_connect_timeout_ms(
+    request: &ProtocolRequest,
+) -> std::result::Result<u64, Box<ProtocolEnvelope>> {
+    request
+        .args
+        .get("connect_timeout_ms")
+        .map(parse_connect_timeout_value)
+        .transpose()
+        .map(|maybe| maybe.unwrap_or_else(database_connect_timeout_ms))
+        .map_err(|error| {
+            Box::new(
+                ProtocolEnvelope::error(
+                    request.rid.clone(),
+                    code::INVALID.to_string(),
+                    error.to_string(),
+                )
+                .with_fix("Use connect_timeout_ms as an integer between 100 and 30000".to_string())
+                .with_ctx(json!({"error": error.to_string()})),
+            )
+        })
+}
+
+const fn json_value_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 async fn minimal_state_for_request(request: &ProtocolRequest) -> Value {
@@ -3340,7 +3613,9 @@ async fn check_database_connectivity(request: &ProtocolRequest) -> Value {
         .filter(|value| !value.is_empty());
     let candidates =
         compose_database_url_candidates(explicit_database_url, database_url_candidates_for_cli());
-    let (connected, failures) = try_connect_candidates(&candidates).await;
+    let timeout_ms =
+        request_connect_timeout_ms(request).unwrap_or_else(|_| database_connect_timeout_ms());
+    let (connected, failures) = try_connect_candidates(&candidates, timeout_ms).await;
 
     match connected {
         Some((_db, connected_url)) => {
@@ -3481,6 +3756,47 @@ mod database_candidate_tests {
     }
 }
 
+#[cfg(test)]
+mod stream_capture_tests {
+    use super::capture_stream_limited;
+    use tokio::io::{AsyncWriteExt, DuplexStream};
+
+    async fn write_all(mut writer: DuplexStream, bytes: Vec<u8>) -> std::io::Result<()> {
+        writer.write_all(&bytes).await?;
+        writer.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn capture_stream_limited_preserves_full_output_under_limit(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (writer, reader) = tokio::io::duplex(64);
+        let payload = b"hello-stream".to_vec();
+        let writer_task = tokio::spawn(write_all(writer, payload.clone()));
+
+        let captured = capture_stream_limited(reader, 1024).await?;
+        writer_task.await.map_err(std::io::Error::other)??;
+
+        assert_eq!(captured.bytes, payload);
+        assert!(!captured.truncated);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn capture_stream_limited_truncates_when_output_exceeds_limit(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (writer, reader) = tokio::io::duplex(32);
+        let payload = b"abcdefghijklmnopqrstuvwxyz".to_vec();
+        let writer_task = tokio::spawn(write_all(writer, payload));
+
+        let captured = capture_stream_limited(reader, 10).await?;
+        writer_task.await.map_err(std::io::Error::other)??;
+
+        assert_eq!(captured.bytes, b"abcdefghij".to_vec());
+        assert!(captured.truncated);
+        Ok(())
+    }
+}
+
 fn mask_database_url(url: &str) -> String {
     match url::Url::parse(url) {
         Ok(mut parsed) => {
@@ -3527,7 +3843,8 @@ async fn audit_request(
     error_code: Option<&str>,
     candidates: &[String],
 ) -> std::result::Result<(), SwarmError> {
-    let (connected, _failures) = try_connect_candidates(candidates).await;
+    let (connected, _failures) =
+        try_connect_candidates(candidates, database_connect_timeout_ms()).await;
     match connected {
         Some((db, _used_url)) => {
             db.record_command_audit(cmd, rid, args, ok, ms, error_code)

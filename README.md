@@ -412,7 +412,7 @@ Key tables:
 - `swarm_config`: max_agents=N, max_implementation_attempts=3, claim_label=p0
 
 Core DB functions:
-- `claim_next_p0_bead(agent_id)`
+- `claim_next_bead(agent_id)`
 - `store_stage_artifact(stage_history_id, artifact_type, content, metadata)`
 - `send_agent_message(from_repo_id, from_agent_id, to_repo_id, to_agent_id, bead_id, message_type, subject, body, metadata)`
 - `get_unread_messages(repo_id, agent_id, bead_id)`

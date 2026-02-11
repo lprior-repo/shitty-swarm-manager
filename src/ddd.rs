@@ -697,7 +697,7 @@ impl RuntimePgBeadRepository {
     /// # Errors
     /// Returns [`RuntimeError::RepositoryError`] when persistence fails.
     pub async fn claim_next(&self, agent_id: &RuntimeAgentId) -> Result<Option<RuntimeBeadId>> {
-        sqlx::query_scalar::<_, Option<String>>("SELECT claim_next_p0_bead($1)")
+        sqlx::query_scalar::<_, Option<String>>("SELECT claim_next_bead($1)")
             .bind(agent_id.number().cast_signed())
             .fetch_one(&self.pool)
             .await

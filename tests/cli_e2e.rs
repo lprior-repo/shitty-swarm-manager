@@ -1,5 +1,6 @@
 mod support;
 use assert_cmd::Command;
+use predicates::str::contains;
 use std::fs;
 use std::path::Path;
 
@@ -13,19 +14,62 @@ fn e2e_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn local_database_url() -> String {
+    std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://shitty_swarm_manager:shitty_swarm_manager@localhost:5437/shitty_swarm_manager_db"
+            .to_string()
+    })
+}
+
 #[test]
 fn help_command_returns_protocol_envelope() -> Result<(), String> {
     let harness = ProtocolScenarioHarness::new();
     let scenario = harness.run_protocol(r#"{"cmd":"?","rid":"r-1"}"#)?;
     let json = scenario.output;
 
-    assert_protocol_envelope(&json)?;
     assert_eq!(json["ok"], true);
     assert_eq!(json["rid"], "r-1");
     assert!(json["t"].is_i64());
     assert!(json["ms"].is_i64());
     assert!(json["d"]["commands"].is_object());
     assert!(json["state"]["total"].is_number());
+
+    Ok(())
+}
+
+#[test]
+fn help_command_documents_batch_ops_contract() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"?","rid":"batch-help"}"#)?;
+    let json = scenario.output;
+
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["d"]["batch_input"]["required"], "ops");
+    assert_eq!(json["d"]["batch_input"]["not"], "cmds");
+    assert!(json["d"]["batch_input"]["example"].is_string());
+
+    Ok(())
+}
+
+#[test]
+fn batch_with_cmds_field_returns_actionable_ops_hint() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario =
+        harness.run_protocol(r#"{"cmd":"batch","cmds":[{"cmd":"doctor"}],"dry":false}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["err"]["code"], "INVALID");
+
+    let fix = json["fix"]
+        .as_str()
+        .ok_or_else(|| format!("expected fix hint string, got: {json}"))?;
+    if !(fix.contains("ops") && fix.contains("cmds")) {
+        return Err(format!(
+            "expected fix hint to explain ops-vs-cmds contract, got: {json}"
+        ));
+    }
 
     Ok(())
 }
@@ -288,6 +332,195 @@ fn status_command_includes_bead_terminology_timestamp_and_breakdown() -> Result<
     assert!(json["d"]["beads_by_status"]["open"].is_number());
     assert!(json["d"]["beads_by_status"]["in_progress"].is_number());
     assert!(json["d"]["beads_by_status"]["closed"].is_number());
+
+    Ok(())
+}
+
+#[test]
+fn status_cli_help_flag_returns_help_envelope_instead_of_executing_status() -> Result<(), String> {
+    let binary_path = assert_cmd::cargo::cargo_bin!("swarm");
+    let assert = Command::new(binary_path)
+        .args(["status", "--help"])
+        .assert()
+        .success();
+
+    let raw = String::from_utf8_lossy(&assert.get_output().stdout)
+        .trim()
+        .to_string();
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|err| format!("expected JSON response envelope, got '{raw}': {err}"))?;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], true);
+    if !json["d"]["commands"].is_object() {
+        return Err(format!(
+            "expected help payload with commands map, got: {json}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn status_cli_unknown_flag_fails_fast() {
+    let binary_path = assert_cmd::cargo::cargo_bin!("swarm");
+    Command::new(binary_path)
+        .args(["status", "--definitely-invalid-flag"])
+        .assert()
+        .failure()
+        .stderr(contains("Unknown command: --definitely-invalid-flag"));
+}
+
+#[test]
+fn run_once_rejects_unknown_fields_in_protocol_payload() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"run-once","agent_id":9999,"dry":true}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["err"]["code"], "INVALID");
+
+    let msg = json["err"]["msg"]
+        .as_str()
+        .ok_or_else(|| format!("expected error message for unknown field, got: {json}"))?;
+    if !msg.contains("Unknown field(s) for run-once") || !msg.contains("agent_id") {
+        return Err(format!(
+            "expected unknown-field validation message, got: {json}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn agent_command_rejects_non_numeric_id_with_type_error() -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"agent","id":"abc","dry":true}"#)?;
+    let json = scenario.output;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["err"]["code"], "INVALID");
+
+    let msg = json["err"]["msg"]
+        .as_str()
+        .ok_or_else(|| format!("expected type validation message, got: {json}"))?;
+    if !msg.contains("Invalid type for field id") {
+        return Err(format!(
+            "expected explicit id type validation message, got: {json}"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn agent_cli_rejects_non_numeric_id_with_type_error() {
+    let binary_path = assert_cmd::cargo::cargo_bin!("swarm");
+    Command::new(binary_path)
+        .args(["agent", "--id", "not-a-number", "--dry"])
+        .assert()
+        .failure()
+        .stderr(contains("Invalid type for id"));
+}
+
+#[test]
+fn status_command_fallbacks_from_unreachable_explicit_url_with_bounded_latency(
+) -> Result<(), String> {
+    let binary_path = assert_cmd::cargo::cargo_bin!("swarm");
+    let assert = Command::new(binary_path)
+        .env("DATABASE_URL", local_database_url())
+        .env("SWARM_DB_CONNECT_TIMEOUT_MS", "250")
+        .write_stdin(
+            "{\"cmd\":\"status\",\"database_url\":\"postgres://invalid:invalid@127.0.0.1:1/does_not_exist\"}\n",
+        )
+        .assert()
+        .success();
+
+    let raw = String::from_utf8_lossy(&assert.get_output().stdout)
+        .trim()
+        .to_string();
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|err| format!("expected JSON response envelope, got '{raw}': {err}"))?;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], true);
+
+    let connect_ms = json["d"]["timing"]["db"]["connect_ms"]
+        .as_i64()
+        .ok_or_else(|| format!("missing status timing.db.connect_ms in response: {json}"))?;
+    if connect_ms > 2_000 {
+        return Err(format!(
+            "expected bounded fallback connect latency <= 2000ms, got {connect_ms}ms ({json})"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn doctor_command_fallbacks_from_unreachable_explicit_url_with_bounded_latency(
+) -> Result<(), String> {
+    let binary_path = assert_cmd::cargo::cargo_bin!("swarm");
+    let assert = Command::new(binary_path)
+        .env("DATABASE_URL", local_database_url())
+        .env("SWARM_DB_CONNECT_TIMEOUT_MS", "250")
+        .write_stdin(
+            "{\"cmd\":\"doctor\",\"database_url\":\"postgres://invalid:invalid@127.0.0.1:1/does_not_exist\"}\n",
+        )
+        .assert()
+        .success();
+
+    let raw = String::from_utf8_lossy(&assert.get_output().stdout)
+        .trim()
+        .to_string();
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|err| format!("expected JSON response envelope, got '{raw}': {err}"))?;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], true);
+
+    let db_check_ms = json["d"]["timing"]["checks_ms"]["database"]
+        .as_i64()
+        .ok_or_else(|| format!("missing doctor timing.checks_ms.database in response: {json}"))?;
+    if db_check_ms > 2_000 {
+        return Err(format!(
+            "expected bounded doctor database check latency <= 2000ms, got {db_check_ms}ms ({json})"
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn status_command_honors_request_connect_timeout_override() -> Result<(), String> {
+    let binary_path = assert_cmd::cargo::cargo_bin!("swarm");
+    let assert = Command::new(binary_path)
+        .env("DATABASE_URL", local_database_url())
+        .write_stdin(
+            "{\"cmd\":\"status\",\"database_url\":\"postgres://invalid:invalid@127.0.0.1:1/does_not_exist\",\"connect_timeout_ms\":100}\n",
+        )
+        .assert()
+        .success();
+
+    let raw = String::from_utf8_lossy(&assert.get_output().stdout)
+        .trim()
+        .to_string();
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|err| format!("expected JSON response envelope, got '{raw}': {err}"))?;
+
+    assert_protocol_envelope(&json)?;
+    assert_eq!(json["ok"], true);
+
+    let connect_ms = json["d"]["timing"]["db"]["connect_ms"]
+        .as_i64()
+        .ok_or_else(|| format!("missing status timing.db.connect_ms in response: {json}"))?;
+    if connect_ms > 2_000 {
+        return Err(format!(
+            "expected request connect_timeout_ms override to keep latency <= 2000ms, got {connect_ms}ms ({json})"
+        ));
+    }
 
     Ok(())
 }
@@ -565,12 +798,21 @@ fn empty_stdin_returns_structured_invalid_envelope() -> Result<(), String> {
 }
 
 #[test]
-fn doctor_with_explicit_unreachable_database_url_marks_database_check_failed() -> Result<(), String>
-{
-    let harness = ProtocolScenarioHarness::new();
-    let scenario = harness
-        .run_protocol(r#"{"cmd":"doctor","database_url":"postgresql://nope@127.0.0.1:1/no_db"}"#)?;
-    let json = scenario.output;
+fn doctor_with_explicit_unreachable_database_url_falls_back_to_candidates() -> Result<(), String> {
+    let binary_path = assert_cmd::cargo::cargo_bin!("swarm");
+    let assert = Command::new(binary_path)
+        .env("DATABASE_URL", local_database_url())
+        .write_stdin(
+            "{\"cmd\":\"doctor\",\"database_url\":\"postgresql://nope@127.0.0.1:1/no_db\"}\n",
+        )
+        .assert()
+        .success();
+
+    let raw = String::from_utf8_lossy(&assert.get_output().stdout)
+        .trim()
+        .to_string();
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|err| format!("expected JSON response envelope, got '{raw}': {err}"))?;
 
     assert_protocol_envelope(&json)?;
     assert_eq!(json["ok"], true);
@@ -583,9 +825,9 @@ fn doctor_with_explicit_unreachable_database_url_marks_database_check_failed() -
         .find(|check| check["n"] == "database")
         .ok_or_else(|| "doctor response missing database check".to_string())?;
 
-    if database_check["ok"] != serde_json::Value::Bool(false) {
+    if database_check["ok"] != serde_json::Value::Bool(true) {
         return Err(format!(
-            "expected explicit unreachable database_url to fail database check, got {database_check}"
+            "expected unreachable explicit database_url to recover via fallback, got {database_check}"
         ));
     }
 

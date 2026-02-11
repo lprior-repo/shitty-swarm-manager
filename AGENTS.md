@@ -223,9 +223,13 @@ bv is a graph-aware triage engine for Beads projects (.beads/beads.jsonl). Inste
 
 **CRITICAL: Use ONLY `--robot-*` flags. Bare `bv` launches an interactive TUI that blocks your session.**
 
+For AI logs: keep outputs minimal and machine-readable; do not emit chain-of-thought narration.
+
 ### The Workflow: Start With Triage
 
-**`bv --robot-triage` is your single entry point.** It returns everything you need in one call:
+**For autonomous agents, `bv --robot-next` is the default entry point.** Use `bv --robot-triage` only when you explicitly need full ranking/context.
+
+`bv --robot-triage` returns everything in one call:
 - `quick_ref`: at-a-glance counts + top 3 picks
 - `recommendations`: ranked actionable items with scores, reasons, unblock info
 - `quick_wins`: low-effort high-impact items

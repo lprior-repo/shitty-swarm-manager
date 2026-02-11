@@ -48,8 +48,11 @@ async fn setup_schema(db: &SwarmDb) {
          DROP FUNCTION IF EXISTS store_stage_artifact(BIGINT, TEXT, TEXT, JSONB) CASCADE;
          DROP FUNCTION IF EXISTS heartbeat_bead_claim(INTEGER, TEXT, INTEGER) CASCADE;
          DROP FUNCTION IF EXISTS recover_expired_bead_claims() CASCADE;
+         DROP FUNCTION IF EXISTS claim_next_bead(TEXT, INTEGER) CASCADE;
+         DROP FUNCTION IF EXISTS claim_next_bead(INTEGER) CASCADE;
          DROP FUNCTION IF EXISTS claim_next_p0_bead(INTEGER) CASCADE;
          DROP FUNCTION IF EXISTS claim_next_p0_bead(SMALLINT) CASCADE;
+         DROP FUNCTION IF EXISTS claim_next_p0_bead(TEXT, INTEGER) CASCADE;
          DROP FUNCTION IF EXISTS set_agent_last_update() CASCADE;
          DROP TABLE IF EXISTS agent_messages CASCADE;
          DROP TABLE IF EXISTS stage_artifacts CASCADE;
@@ -741,6 +744,86 @@ async fn claim_next_bead_recovers_expired_claim_for_another_agent() {
             .await
             .unwrap_or_else(|e| panic!("fetch original status failed: {}", e));
     assert_eq!(original_status, "idle");
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
+async fn claim_next_bead_falls_back_to_lower_priorities_when_p0_missing() {
+    let db = test_db().await;
+    setup_schema(&db).await;
+    reset_runtime_tables(&db).await;
+
+    let agent_id = AgentId::new(RepoId::new("local"), 1);
+    let bead_id = BeadId::new(unique_bead("bead-priority-fallback"));
+
+    db.seed_idle_agents(1)
+        .await
+        .unwrap_or_else(|e| panic!("seed_idle_agents failed: {e}"));
+    sqlx::query(
+        "INSERT INTO bead_backlog (bead_id, priority, status) VALUES ($1, 'p2', 'pending')",
+    )
+    .bind(bead_id.value())
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("insert backlog failed: {e}"));
+
+    let claimed = db
+        .claim_next_bead(&agent_id)
+        .await
+        .unwrap_or_else(|e| panic!("claim_next_bead failed: {e}"));
+
+    assert_eq!(claimed.as_ref().map(BeadId::value), Some(bead_id.value()));
+}
+
+#[tokio::test]
+#[ignore = "requires DATABASE_URL or SWARM_TEST_DATABASE_URL"]
+async fn claim_next_bead_assigns_distinct_work_across_priorities_in_parallel() {
+    let db = test_db().await;
+    setup_schema(&db).await;
+    reset_runtime_tables(&db).await;
+
+    let agent_a = AgentId::new(RepoId::new("local"), 1);
+    let agent_b = AgentId::new(RepoId::new("local"), 2);
+    let p0_bead = BeadId::new(unique_bead("bead-priority-p0"));
+    let p1_bead = BeadId::new(unique_bead("bead-priority-p1"));
+
+    db.seed_idle_agents(2)
+        .await
+        .unwrap_or_else(|e| panic!("seed_idle_agents failed: {e}"));
+    sqlx::query(
+        "INSERT INTO bead_backlog (bead_id, priority, status) VALUES ($1, 'p1', 'pending')",
+    )
+    .bind(p1_bead.value())
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("insert p1 backlog failed: {e}"));
+    sqlx::query(
+        "INSERT INTO bead_backlog (bead_id, priority, status) VALUES ($1, 'p0', 'pending')",
+    )
+    .bind(p0_bead.value())
+    .execute(db.pool())
+    .await
+    .unwrap_or_else(|e| panic!("insert p0 backlog failed: {e}"));
+
+    let claims = join_all([db.claim_next_bead(&agent_a), db.claim_next_bead(&agent_b)]).await;
+
+    let claimed_beads: Vec<String> = claims
+        .into_iter()
+        .map(|result| {
+            result
+                .unwrap_or_else(|e| panic!("parallel claim_next_bead failed: {e}"))
+                .unwrap_or_else(|| panic!("parallel claim_next_bead returned no bead"))
+                .value()
+                .to_string()
+        })
+        .collect();
+
+    let claim_set: HashSet<String> = claimed_beads.into_iter().collect();
+    let expected_set: HashSet<String> = [p0_bead.value().to_string(), p1_bead.value().to_string()]
+        .into_iter()
+        .collect();
+
+    assert_eq!(claim_set, expected_set);
 }
 
 #[tokio::test]

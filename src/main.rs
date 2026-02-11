@@ -53,8 +53,14 @@ const HELP_DATA: &str = r#"{
     {"desc": "Quick start", "cmd": "echo '{\"cmd\":\"init\"}' | swarm"},
     {"desc": "Health check", "cmd": "echo '{\"cmd\":\"doctor\"}' | swarm"},
     {"desc": "Assign bead", "cmd": "echo '{\"cmd\":\"assign\",\"bead_id\":\"bd-abc123\",\"agent_id\":1}' | swarm"},
-    {"desc": "Dry run", "cmd": "echo '{\"cmd\":\"agent\",\"id\":1,\"dry\":true}' | swarm"}
+    {"desc": "Dry run", "cmd": "echo '{\"cmd\":\"agent\",\"id\":1,\"dry\":true}' | swarm"},
+    {"desc": "Batch (use ops, not cmds)", "cmd": "echo '{\"cmd\":\"batch\",\"ops\":[{\"cmd\":\"doctor\"},{\"cmd\":\"status\"}]}' | swarm"}
   ],
+  "batch_input": {
+    "required": "ops",
+    "not": "cmds",
+    "example": "echo '{\"cmd\":\"batch\",\"ops\":[{\"cmd\":\"doctor\"},{\"cmd\":\"status\"}]}' | swarm"
+  },
   "resp": {
     "ok": "bool - success",
     "d": "object - data",
@@ -194,6 +200,13 @@ enum CliAction {
 
 #[allow(clippy::too_many_lines)]
 fn parse_cli_args(args: &[String]) -> Result<CliAction, CliError> {
+    if args
+        .get(1)
+        .is_some_and(|arg| matches!(arg.as_str(), "-h" | "--help"))
+    {
+        return Ok(CliAction::ShowHelp);
+    }
+
     match args.first().map(String::as_str) {
         None | Some("--") => Ok(CliAction::RunProtocol),
         Some("-h" | "--help") => Ok(CliAction::ShowHelp),
@@ -210,8 +223,14 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction, CliError> {
         }
 
         // Commands with no args
-        Some("doctor") => Ok(CliAction::Command(CliCommand::Doctor)),
-        Some("status") => Ok(CliAction::Command(CliCommand::Status)),
+        Some("doctor") => {
+            ensure_no_unknown_flags(args, &[])?;
+            Ok(CliAction::Command(CliCommand::Doctor))
+        }
+        Some("status") => {
+            ensure_no_unknown_flags(args, &[])?;
+            Ok(CliAction::Command(CliCommand::Status))
+        }
         Some("next") => {
             let dry = parse_optional_arg(args, "dry")?;
             Ok(CliAction::Command(CliCommand::Next { dry }))
@@ -734,13 +753,33 @@ where
     T::Err: std::fmt::Display,
 {
     let flag = format!("--{}", name.replace('_', "-"));
-    args.iter()
-        .position(|a| a.as_str() == flag)
-        .and_then(|i| args.get(i + 1))
-        .and_then(|v| v.parse::<T>().ok())
-        .ok_or_else(|| CliError::MissingRequiredArg {
+    let Some(position) = args.iter().position(|a| a.as_str() == flag) else {
+        return Err(CliError::MissingRequiredArg {
             arg_name: name.to_string(),
             usage: format!("--{} <value>", name.replace('_', "-")),
+        });
+    };
+
+    let Some(raw_value) = args.get(position + 1) else {
+        return Err(CliError::MissingRequiredArg {
+            arg_name: name.to_string(),
+            usage: format!("--{} <value>", name.replace('_', "-")),
+        });
+    };
+
+    if raw_value.starts_with("--") {
+        return Err(CliError::MissingRequiredArg {
+            arg_name: name.to_string(),
+            usage: format!("--{} <value>", name.replace('_', "-")),
+        });
+    }
+
+    raw_value
+        .parse::<T>()
+        .map_err(|_e| CliError::InvalidArgType {
+            arg_name: name.to_string(),
+            got: raw_value.clone(),
+            expected: std::any::type_name::<T>().to_string(),
         })
 }
 
@@ -773,6 +812,13 @@ where
 
             maybe_value
                 .map(|v| {
+                    if v.starts_with("--") {
+                        return Err(CliError::MissingRequiredArg {
+                            arg_name: name.to_string(),
+                            usage: format!("--{} <value>", name.replace('_', "-")),
+                        });
+                    }
+
                     v.parse::<T>().map_err(|e| CliError::InvalidArgValue {
                         arg_name: name.to_string(),
                         value: format!("{e}"),
@@ -782,6 +828,25 @@ where
                 .transpose()
         }
     }
+}
+
+fn ensure_no_unknown_flags(args: &[String], allowed_flags: &[&str]) -> Result<(), CliError> {
+    let invalid = args
+        .iter()
+        .skip(1)
+        .find(|arg| {
+            arg.starts_with("--")
+                && !matches!(arg.as_str(), "--help" | "-h")
+                && !allowed_flags.iter().any(|allowed| allowed == &arg.as_str())
+        })
+        .cloned();
+
+    invalid.map_or(Ok(()), |flag| {
+        Err(CliError::UnknownCommand {
+            command: flag,
+            suggestions: Vec::new(),
+        })
+    })
 }
 
 fn suggest_commands(typo: &str) -> Vec<String> {

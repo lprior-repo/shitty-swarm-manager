@@ -81,6 +81,15 @@ Treat this as your first-invocation handshake in every fresh session.
 Do not skip it.
 Do not run mutating commands before it succeeds.
 
+For bead selection, use the smallest possible command first:
+
+```bash
+bv --robot-next
+```
+
+Use `bv --robot-triage` only when explicitly asked for full ranking details.
+Default to `--robot-next` to minimize output volume and context usage.
+
 For agent execution:
 
 ```bash
@@ -217,6 +226,9 @@ NEXT: return to implement with feedback id=qa-err-07
 ```
 
 Keep logs concise and parseable.
+
+Hard rule: do not emit chain-of-thought or "Thinking:" logs.
+Only emit command results, state transitions, and next action.
 
 ---
 

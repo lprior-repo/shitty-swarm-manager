@@ -427,7 +427,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION claim_next_p0_bead(
+CREATE OR REPLACE FUNCTION claim_next_bead(
     p_repo_id TEXT,
     p_agent_id INTEGER
 )
@@ -463,8 +463,9 @@ BEGIN
     FROM bead_backlog
     WHERE repo_id = p_repo_id
       AND status = 'pending'
-      AND priority = 'p0'
-    ORDER BY created_at ASC
+    ORDER BY
+        COALESCE(array_position(ARRAY['p0', 'p1', 'p2', 'p3']::TEXT[], lower(priority)), 999),
+        created_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1;
 
@@ -496,7 +497,24 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION claim_next_p0_bead(p_agent_id INTEGER)
 RETURNS TEXT AS $$
 BEGIN
-    RETURN claim_next_p0_bead('local', p_agent_id);
+    RETURN claim_next_bead('local', p_agent_id);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION claim_next_p0_bead(
+    p_repo_id TEXT,
+    p_agent_id INTEGER
+)
+RETURNS TEXT AS $$
+BEGIN
+    RETURN claim_next_bead(p_repo_id, p_agent_id);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION claim_next_bead(p_agent_id INTEGER)
+RETURNS TEXT AS $$
+BEGIN
+    RETURN claim_next_bead('local', p_agent_id);
 END;
 $$ LANGUAGE plpgsql;
 

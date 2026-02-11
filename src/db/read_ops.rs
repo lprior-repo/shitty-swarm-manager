@@ -392,6 +392,39 @@ impl SwarmDb {
         Ok(vec![(repo_id.clone(), repo_id.value().to_string())])
     }
 
+    /// Gets active agents for a repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::DatabaseError` if the database query fails.
+    pub async fn get_active_agents(
+        &self,
+        repo_id: &RepoId,
+    ) -> Result<Vec<(RepoId, u32, Option<String>, String)>> {
+        sqlx::query_as::<_, ActiveAgentRow>(
+            "SELECT repo_id, agent_id, bead_id, status
+             FROM v_active_agents
+             WHERE repo_id = $1
+             ORDER BY last_update DESC",
+        )
+        .bind(repo_id.value())
+        .fetch_all(self.pool())
+        .await
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to get active agents: {e}")))
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| {
+                    (
+                        RepoId::new(row.repo_id),
+                        to_u32_i32(row.agent_id),
+                        row.bead_id,
+                        row.status,
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+    }
+
     /// Gets all active agents across all repositories.
     ///
     /// # Errors
@@ -427,7 +460,7 @@ impl SwarmDb {
     /// Returns `SwarmError::DatabaseError` if the database query fails.
     pub async fn claim_next_bead(&self, agent_id: &AgentId) -> Result<Option<BeadId>> {
         let claim_agent_id = agent_id.number();
-        sqlx::query_scalar::<_, Option<String>>("SELECT claim_next_p0_bead($1, $2)")
+        sqlx::query_scalar::<_, Option<String>>("SELECT claim_next_bead($1, $2)")
             .bind(agent_id.repo_id().value())
             .bind(claim_agent_id.cast_signed())
             .fetch_one(self.pool())

@@ -1,0 +1,330 @@
+{
+  "project": "shitty-swarm-manager",
+  "research_date": "2026-02-11",
+  
+  "1_websocket_implementation": {
+    "status": "NOT_IMPLEMENTED",
+    "findings": [
+      "No WebSocket dependencies in Cargo.toml (no tungstenite, tokio-tungstenite, ws crate)",
+      "No WebSocket imports found in codebase",
+      "No real-time streaming protocol currently exists",
+      "Project uses JSON-based request/response over stdio protocol"
+    ],
+    "current_protocol": "STDIN/STDOUT JSON protocol",
+    "protocol_location": "src/protocol_runtime.rs",
+    "protocol_envelope": "src/protocol_envelope.rs",
+    "note": "This is an opportunity to add WebSocket support for real-time streaming"
+  },
+
+  "2_async_runtime": {
+    "runtime": "Tokio",
+    "version": "1.35 with full features",
+    "cargo_location": "Cargo.toml:11",
+    "usage_patterns": [
+      {
+        "pattern": "tokio::time::timeout",
+        "location": "src/protocol_runtime.rs:789-790",
+        "description": "Timeout handling for external JSON commands",
+        "ms_param": "DEFAULT_DB_CONNECT_TIMEOUT_MS=3000"
+      },
+      {
+        "pattern": "async fn + .await",
+        "location": "src/protocol_runtime.rs (throughout)",
+        "count": "40+ async functions",
+        "key_functions": [
+          "run_protocol_loop() - main event loop",
+          "execute_request() - command dispatcher",
+          "handle_* functions - individual command handlers"
+        ]
+      },
+      {
+        "pattern": "tokio::fs - async file I/O",
+        "location": "src/protocol_runtime.rs:26",
+        "description": "Async filesystem operations"
+      },
+      {
+        "pattern": "tokio::io::{AsyncBufReadExt, AsyncWriteExt}",
+        "location": "src/protocol_runtime.rs:27",
+        "description": "Async I/O traits for stdin/stdout"
+      },
+      {
+        "pattern": "tokio::process::Command",
+        "location": "src/protocol_runtime.rs:28",
+        "description": "Async subprocess execution"
+      }
+    ],
+    "database_async": "sqlx with runtime-tokio-rustls",
+    "database_version": "0.8"
+  },
+
+  "3_event_handling_infrastructure": {
+    "status": "DATABASE_DRIVEN, NOT_PUBSUB",
+    "architecture": "SQL-based event sourcing",
+    "tables": {
+      "execution_events": {
+        "location": "crates/swarm-coordinator/schema.sql:261",
+        "columns": [
+          "seq (BIGSERIAL PRIMARY KEY)",
+          "schema_version (INTEGER, DEFAULT 1)",
+          "event_type (TEXT)",
+          "entity_id (TEXT)",
+          "bead_id (TEXT)",
+          "agent_id (INTEGER)",
+          "stage (TEXT)",
+          "causation_id (TEXT)",
+          "diagnostics_category (TEXT)",
+          "diagnostics_retryable (BOOLEAN)",
+          "diagnostics_next_command (TEXT)",
+          "diagnostics_detail (TEXT)",
+          "payload (JSONB)",
+          "created_at (TIMESTAMPTZ)"
+        ],
+        "purpose": "Deterministic execution event log"
+      },
+      "agent_messages": {
+        "location": "crates/swarm-coordinator/schema.sql:198",
+        "columns": [
+          "id (BIGSERIAL PRIMARY KEY)",
+          "from_repo_id (TEXT)",
+          "from_agent_id (INTEGER)",
+          "to_repo_id (TEXT)",
+          "to_agent_id (INTEGER)",
+          "bead_id (TEXT)",
+          "message_type (ENUM: contract_ready, implementation_ready, qa_complete, qa_failed, red_queen_failed, implementation_retry, artifact_available, stage_complete, stage_failed, blocking_issue, coordination)",
+          "subject (TEXT)",
+          "body (TEXT)",
+          "metadata (JSONB)",
+          "created_at (TIMESTAMPTZ)",
+          "read_at (TIMESTAMPTZ)",
+          "read (BOOLEAN)"
+        ],
+        "purpose": "Agent-to-agent messaging"
+      },
+      "broadcast_log": {
+        "location": "crates/swarm-coordinator/schema.sql:285",
+        "columns": [
+          "id (BIGSERIAL PRIMARY KEY)",
+          "from_agent (TEXT)",
+          "msg (TEXT)",
+          "created_at (TIMESTAMPTZ)"
+        ],
+        "purpose": "Broadcast messaging"
+      }
+    },
+    "event_operations": {
+      "get_execution_events": {
+        "location": "src/db/read_ops.rs:520",
+        "signature": "async fn get_execution_events(&self, repo_id: &RepoId, bead_filter: Option<&str>, limit: i64) -> Result<Vec<ExecutionEvent>>",
+        "description": "Retrieves deterministic execution events optionally filtered by bead",
+        "database_call": "sqlx::query_as with fetch_all()",
+        "error_handling": "Returns SwarmError::DatabaseError"
+      },
+      "record_execution_event": {
+        "location": "src/db/write_ops.rs:1605",
+        "signature": "async fn record_execution_event()",
+        "event_types": [
+          "stage_completed",
+          "transition_finalize",
+          "transition_advance",
+          "transition_retry",
+          "transition_noop",
+          "transition_blocked"
+        ],
+        "error_handling": "Returns SwarmError::DatabaseError"
+      },
+      "write_broadcast": {
+        "location": "src/db/write_ops.rs:140",
+        "signature": "async fn write_broadcast(&self, from_agent: &str, msg: &str) -> Result<i64>",
+        "description": "Writes broadcast message from agent"
+      }
+    },
+    "protocol_handlers": {
+      "broadcast": {
+        "location": "src/protocol_runtime.rs:668",
+        "handler": "handle_broadcast()",
+        "operation": "Persists broadcast to database"
+      },
+      "events": {
+        "location": "src/protocol_runtime.rs:1853",
+        "handler": "handle query with get_execution_events()",
+        "operation": "Retrieves execution events from database"
+      }
+    },
+    "no_pubsub_note": "No tokio::sync::broadcast, no event subscription pattern. All event access is poll-based via database queries."
+  },
+
+  "4_data_streaming_patterns": {
+    "status": "PULL_BASED, NOT_PUSH_BASED",
+    "patterns": [
+      {
+        "name": "Database polling",
+        "description": "Events are stored in PostgreSQL and retrieved via pull queries",
+        "implementation": "LIMIT-based pagination in read_ops.rs",
+        "used_in": "get_execution_events() - queries last N events"
+      },
+      {
+        "name": "Request/Response over stdio",
+        "description": "CLI sends JSON request, waits for JSON response",
+        "implementation": "src/protocol_runtime.rs:run_protocol_loop()",
+        "flow": "stdin -> parse -> execute -> stdout"
+      },
+      {
+        "name": "No streaming response",
+        "description": "All responses are complete JSON objects, not streamed",
+        "protocol_envelope": "src/protocol_envelope.rs",
+        "fields": "ok, rid, t, ms, d (data), err, fix, next, state"
+      },
+      {
+        "name": "Async subprocess execution",
+        "description": "External commands run via tokio::process::Command with timeout",
+        "location": "src/protocol_runtime.rs:run_external_json_command()",
+        "timeout": "3000ms default, configurable 100-30000ms"
+      }
+    ],
+    "no_streaming": "No streaming iterators, no futures::Stream, no channel-based data flow",
+    "buffer_location": "BufReader in stdin processing (src/protocol_runtime.rs:27)"
+  },
+
+  "5_json_schema_validation": {
+    "status": "SERDE_BASED, NOT_JSON_SCHEMA_CRATE",
+    "approach": "Type-safe Rust structs with serde deserialization",
+    "validation_patterns": [
+      {
+        "name": "deny_unknown_fields",
+        "example": "FailureDiagnostics and ExecutionEvent structs",
+        "location": "src/types/observability.rs:19,28",
+        "effect": "Rejects unknown JSON fields during deserialization"
+      },
+      {
+        "name": "Field aliases for versioning",
+        "example": "ExecutionEvent with seq/sequence, schema_version/payload_version",
+        "location": "src/types/observability.rs:30-32,42",
+        "purpose": "Backward compatibility with different field names"
+      },
+      {
+        "name": "TryFrom trait for enum parsing",
+        "example": "MessageType::try_from(&str)",
+        "location": "src/types/messaging.rs:39",
+        "validation": "Returns Err if unknown message type string"
+      },
+      {
+        "name": "ParseInput trait",
+        "location": "src/protocol_runtime.rs:50",
+        "implementations": "40+ types with contract-based parsing",
+        "pattern": "Custom parse_input() for each input type"
+      },
+      {
+        "name": "Manual field extraction",
+        "pattern": ".get(field).and_then(|v| v.as_type())",
+        "location": "src/protocol_runtime.rs:81-124 (ParseInput impls)",
+        "validation": "Returns ParseError::MissingField or InvalidType"
+      }
+    ],
+    "no_json_schema_crate": "No dependency on json-schema, jsonschema, or similar",
+    "validation_errors": "ParseError enum at src/protocol_runtime.rs:57",
+    "database_validation": "CHECK constraints in schema.sql enforce enum values and ranges"
+  },
+
+  "6_error_handling_patterns": {
+    "framework": "thiserror crate (v1.0)",
+    "location": "src/error.rs",
+    "error_type": "SwarmError enum with thiserror derive",
+    "variants": [
+      {
+        "name": "DatabaseError(String)",
+        "protocol_code": "INTERNAL",
+        "exit_code": 3
+      },
+      {
+        "name": "SqlxError (auto From impl)",
+        "protocol_code": "INTERNAL",
+        "exit_code": 3
+      },
+      {
+        "name": "ConfigError(String)",
+        "protocol_code": "INVALID",
+        "exit_code": 2
+      },
+      {
+        "name": "AgentError(String)",
+        "protocol_code": "CONFLICT",
+        "exit_code": 4
+      },
+      {
+        "name": "BeadError(String)",
+        "protocol_code": "NOTFOUND",
+        "exit_code": 5
+      },
+      {
+        "name": "StageError(String)",
+        "protocol_code": "CONFLICT",
+        "exit_code": 6
+      },
+      {
+        "name": "IoError (auto From impl)",
+        "protocol_code": "DEPENDENCY",
+        "exit_code": 7
+      },
+      {
+        "name": "SerializationError (auto From impl)",
+        "protocol_code": "INVALID",
+        "exit_code": 8
+      },
+      {
+        "name": "Internal(String)",
+        "protocol_code": "INTERNAL",
+        "exit_code": 9
+      }
+    ],
+    "network_error_handling": {
+      "timeout_errors": "tokio::time::timeout wrapping external commands",
+      "location": "src/protocol_runtime.rs:789",
+      "pattern": "Caught as timeout, returned in ProtocolEnvelope with error code TIMEOUT"
+    },
+    "database_error_handling": {
+      "location": "Throughout src/db/read_ops.rs and write_ops.rs",
+      "pattern": ".map_err(|e| SwarmError::DatabaseError(format!(...)))",
+      "context": ".with_ctx(json!({...}))"
+    },
+    "protocol_error_response": {
+      "structure": "ProtocolEnvelope with ok=false, err field populated",
+      "location": "src/protocol_envelope.rs:57",
+      "fields": "code (string), msg (string), ctx (Option<Value>)"
+    },
+    "no_panic_policy": {
+      "enforcement": "Lint denials in error.rs:1-6",
+      "rules": [
+        "#![deny(clippy::unwrap_used)]",
+        "#![deny(clippy::expect_used)]",
+        "#![deny(clippy::panic)]"
+      ]
+    }
+  },
+
+  "summary": {
+    "protocol_type": "Synchronous JSON request/response over STDIO",
+    "real_time_capability": "None - all operations are poll-based via database",
+    "async_foundation": "Tokio 1.35 with full features, used for I/O and subprocess execution",
+    "event_sourcing": "PostgreSQL-based with 4 event/message tables",
+    "type_safety": "Serde + custom ParseInput trait, no JSON Schema validation library",
+    "error_handling": "thiserror with structured error codes and exit codes",
+    
+    "opportunities_for_websocket": [
+      "Real-time execution event streaming to multiple clients",
+      "Live agent status updates without polling",
+      "Broadcast messages with subscription model",
+      "Multi-agent coordination with push notifications"
+    ]
+  },
+
+  "key_file_locations": {
+    "protocol_entry": "src/protocol_runtime.rs (main event loop at line 515)",
+    "protocol_envelope": "src/protocol_envelope.rs (response structure)",
+    "error_handling": "src/error.rs (SwarmError and error codes)",
+    "database_schema": "crates/swarm-coordinator/schema.sql (event tables at lines 261, 198, 285)",
+    "event_types": "src/types/observability.rs (ExecutionEvent, EventSchemaVersion)",
+    "message_types": "src/types/messaging.rs (MessageType enum, AgentMessage)",
+    "database_operations": "src/db/read_ops.rs (get_execution_events at line 520)",
+    "event_recording": "src/db/write_ops.rs (record_execution_event at line 1605)"
+  }
+}

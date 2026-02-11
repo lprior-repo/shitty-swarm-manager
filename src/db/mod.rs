@@ -2,6 +2,8 @@ mod mappers;
 mod read_ops;
 mod write_ops;
 
+use std::time::Duration;
+
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use tracing::info;
@@ -22,12 +24,28 @@ impl SwarmDb {
     ///
     /// Returns `SwarmError::DatabaseError` if the database connection fails.
     pub async fn new(database_url: &str) -> Result<Self> {
+        Self::new_with_timeout(database_url, None).await
+    }
+
+    /// Creates a new `SwarmDb` instance with explicit connection timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SwarmError::DatabaseError` if the database connection fails
+    /// or times out.
+    pub async fn new_with_timeout(
+        database_url: &str,
+        connect_timeout_ms: Option<u64>,
+    ) -> Result<Self> {
         let max_connections = resolve_pool_max_connections();
 
-        let pool = PgPoolOptions::new()
-            .max_connections(max_connections)
-            .connect(database_url)
-            .await?;
+        let mut options = PgPoolOptions::new().max_connections(max_connections);
+
+        if let Some(timeout_ms) = connect_timeout_ms {
+            options = options.acquire_timeout(Duration::from_millis(timeout_ms));
+        }
+
+        let pool = options.connect(database_url).await?;
 
         info!("Connected to PostgreSQL swarm database");
         Ok(Self { pool })
