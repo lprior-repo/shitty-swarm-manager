@@ -1,0 +1,89 @@
+{
+  "id": "task-001",
+  "title": "domain: Define bounded contexts and ubiquitous language",
+  "type": "feature",
+  "priority": 1,
+  "effort": "2hr",
+  "description": "Define DDD bounded contexts (Coordination, Execution, Skill Invocation, Landing, Read Models) and establish ubiquitous language and anti-corruption boundaries.",
+  "ears": {
+    "ubiquitous": [
+      "THE SYSTEM SHALL model swarm coordination using explicit bounded contexts",
+      "THE SYSTEM SHALL name domain concepts consistently across prompts, schema, and runtime"
+    ],
+    "event_driven": [
+      {
+        "trigger": "WHEN a stage transition occurs",
+        "shall": "THE SYSTEM SHALL record the transition as a domain event with causation metadata"
+      }
+    ],
+    "unwanted": [
+      {
+        "condition": "IF infrastructure concerns leak into domain contracts",
+        "shall_not": "THE SYSTEM SHALL NOT couple domain invariants to SQL shape",
+        "because": "Coupling prevents safe evolution and deterministic behavior"
+      }
+    ]
+  },
+  "contracts": {
+    "preconditions": [
+      "Existing schema and runtime are accessible",
+      "Domain terms used by agent prompts are available"
+    ],
+    "postconditions": [
+      "Bounded contexts and ownership boundaries are documented",
+      "Ubiquitous language glossary is versioned in repository"
+    ],
+    "invariants": [
+      "One concept has one canonical name",
+      "Cross-context interaction uses explicit interfaces"
+    ]
+  },
+  "tests": {
+    "happy": [
+      "Given domain glossary, when reviewing runtime modules, then each module maps to one bounded context",
+      "Given context map, when adding a new use case, then ownership is assigned to exactly one context"
+    ],
+    "error": [
+      "Given ambiguous term usage, when validating glossary, then planning fails with explicit conflict",
+      "Given duplicate term definitions, when validating glossary, then the conflict is reported with remediation guidance"
+    ],
+    "edge": [
+      "Given legacy naming from prior schema, when mapping terms, then deprecation aliases are defined"
+    ]
+  },
+  "research": {
+    "files": [
+      "src/agent_runtime.rs",
+      "src/db/write_ops.rs",
+      "src/ddd.rs",
+      "crates/swarm-coordinator/schema.sql"
+    ],
+    "patterns": [
+      "Martin Fowler Service Layer",
+      "DDD bounded context mapping"
+    ],
+    "questions": [
+      "Which transitions are currently duplicated across layers?"
+    ]
+  },
+  "implementation": {
+    "phase_0": [
+      "Inventory domain nouns and lifecycle states from runtime + schema"
+    ],
+    "phase_1": [
+      "Write BDD scenarios for context boundary correctness"
+    ],
+    "phase_2": [
+      "Produce context map and glossary artifacts"
+    ]
+  },
+  "context": {
+    "related_files": [
+      "README.md",
+      "src/prompts.rs"
+    ],
+    "similar": [
+      "Existing RuntimeStageTransition model in src/ddd.rs"
+    ]
+  }
+}

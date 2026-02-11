@@ -1,0 +1,86 @@
+{
+  "id": "task-007",
+  "title": "quality: Build BDD contract suite decoupled from internals",
+  "type": "feature",
+  "priority": 0,
+  "effort": "4hr",
+  "description": "Add behavior-driven contract tests that assert protocol and domain outcomes without coupling to SQL statements or private functions.",
+  "ears": {
+    "ubiquitous": [
+      "THE SYSTEM SHALL expose behavior contracts as executable scenarios"
+    ],
+    "event_driven": [
+      {
+        "trigger": "WHEN agent runs stage pipeline",
+        "shall": "THE SYSTEM SHALL produce observable state transitions matching scenario expectations"
+      }
+    ],
+    "unwanted": [
+      {
+        "condition": "IF refactoring internal module layout",
+        "shall_not": "THE SYSTEM SHALL NOT break BDD tests that target external behavior",
+        "because": "Behavior contracts should survive refactors"
+      }
+    ]
+  },
+  "contracts": {
+    "preconditions": [
+      "Scenario fixtures can initialize and reset test database state"
+    ],
+    "postconditions": [
+      "Scenarios cover happy, failure-loop, and blocked terminal flows",
+      "Assertions rely on protocol responses and read models"
+    ],
+    "invariants": [
+      "No BDD assertion inspects private function behavior",
+      "Scenario setup is deterministic and isolated"
+    ]
+  },
+  "tests": {
+    "happy": [
+      "Given pending bead, when agent pipeline passes all stages, then progress shows completed bead and done agent",
+      "Given completed bead, when querying monitor progress, then aggregate counts reflect completion"
+    ],
+    "error": [
+      "Given repeated QA failures, when retries exceed max, then bead becomes blocked and agent leaves working state",
+      "Given invalid command payload, when protocol executes, then structured INVALID error envelope is returned"
+    ],
+    "edge": [
+      "Given process restart mid-run, when agent resumes, then it continues from persisted stage context"
+    ]
+  },
+  "research": {
+    "files": [
+      "tests/cli_e2e.rs",
+      "src/db/write_ops_tests.rs",
+      "tests/cue_contract.rs"
+    ],
+    "patterns": [
+      "Martin Fowler Acceptance Test",
+      "Outside-in BDD"
+    ],
+    "questions": [
+      "How to model skill execution deterministically in test doubles?"
+    ]
+  },
+  "implementation": {
+    "phase_0": [
+      "Define scenario vocabulary and fixture strategy"
+    ],
+    "phase_1": [
+      "Author Given-When-Then scenarios over protocol commands"
+    ],
+    "phase_2": [
+      "Implement reusable scenario runner utilities"
+    ]
+  },
+  "context": {
+    "related_files": [
+      "moon.yml",
+      "README.md"
+    ],
+    "similar": [
+      "Current end-to-end JSON envelope assertions"
+    ]
+  }
+}

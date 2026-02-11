@@ -1,0 +1,86 @@
+{
+  "id": "task-009",
+  "title": "integration: Define beads_rust synchronization anti-corruption layer",
+  "type": "feature",
+  "priority": 2,
+  "effort": "2hr",
+  "description": "Design explicit synchronization rules between swarm coordinator state and beads_rust (`br`) so ownership and status updates remain consistent without split-brain.",
+  "ears": {
+    "ubiquitous": [
+      "THE SYSTEM SHALL maintain explicit sync state between coordinator and beads_rust"
+    ],
+    "event_driven": [
+      {
+        "trigger": "WHEN bead terminal state changes in coordinator",
+        "shall": "THE SYSTEM SHALL issue and record corresponding br synchronization action"
+      }
+    ],
+    "unwanted": [
+      {
+        "condition": "IF coordinator and br diverge",
+        "shall_not": "THE SYSTEM SHALL NOT silently proceed without divergence marker",
+        "because": "Silent divergence breaks operator trust"
+      }
+    ]
+  },
+  "contracts": {
+    "preconditions": [
+      "Coordinator transition has stable bead identifier"
+    ],
+    "postconditions": [
+      "Sync outcome is persisted with success/failure status",
+      "Retry-safe command plan is available"
+    ],
+    "invariants": [
+      "Terminal transitions are never dropped",
+      "Sync retries do not duplicate terminal side effects"
+    ]
+  },
+  "tests": {
+    "happy": [
+      "Given completion in coordinator, when sync succeeds, then br status reflects completed",
+      "Given blocked bead in coordinator, when sync succeeds, then br reflects blocked status"
+    ],
+    "error": [
+      "Given sync failure, when transition recorded, then bead remains in pending-sync terminal state and remediation command is emitted",
+      "Given stale sync retry command, when replayed, then no duplicate status mutation occurs"
+    ],
+    "edge": [
+      "Given duplicate sync retries, when command replays, then resulting br state remains correct"
+    ]
+  },
+  "research": {
+    "files": [
+      "docs/08_BEADS.md",
+      "src/agent_runtime_support.rs",
+      "src/protocol_runtime.rs"
+    ],
+    "patterns": [
+      "Anti-Corruption Layer",
+      "Outbox-style integration events"
+    ],
+    "questions": [
+      "Should sync status be embedded in bead_claims or separate table?"
+    ]
+  },
+  "implementation": {
+    "phase_0": [
+      "Define sync lifecycle model and divergence states"
+    ],
+    "phase_1": [
+      "Write BDD scenarios for sync success/failure/retry"
+    ],
+    "phase_2": [
+      "Implement anti-corruption adapter and state persistence"
+    ]
+  },
+  "context": {
+    "related_files": [
+      "README.md",
+      "AGENTS.md"
+    ],
+    "similar": [
+      "Current br update + br sync workflow in prompts"
+    ]
+  }
+}

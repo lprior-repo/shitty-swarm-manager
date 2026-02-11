@@ -1,0 +1,86 @@
+{
+  "id": "task-002",
+  "title": "domain: Model execution aggregate and deterministic stage DAG",
+  "type": "feature",
+  "priority": 1,
+  "effort": "4hr",
+  "description": "Create a pure domain aggregate for BeadExecution that owns stage transitions, retry policy, and terminal states independent of persistence details.",
+  "ears": {
+    "ubiquitous": [
+      "THE SYSTEM SHALL determine next stage through domain policy only"
+    ],
+    "event_driven": [
+      {
+        "trigger": "WHEN stage result is recorded",
+        "shall": "THE SYSTEM SHALL emit exactly one next transition decision"
+      }
+    ],
+    "unwanted": [
+      {
+        "condition": "IF transition logic exists in multiple modules",
+        "shall_not": "THE SYSTEM SHALL NOT allow conflicting transition outcomes",
+        "because": "Conflicts break determinism and resumability"
+      }
+    ]
+  },
+  "contracts": {
+    "preconditions": [
+      "Current stage and attempt counters are known"
+    ],
+    "postconditions": [
+      "Transition decision is explicit: advance, retry, block, or complete",
+      "Decision carries reason code for observability"
+    ],
+    "invariants": [
+      "No skipping stages in forward flow",
+      "Complete is only reachable from red-queen pass"
+    ]
+  },
+  "tests": {
+    "happy": [
+      "Given implement passed, when transition is computed, then next stage is qa-enforcer",
+      "Given qa-enforcer passed, when transition is computed, then next stage is red-queen"
+    ],
+    "error": [
+      "Given red-queen failed at attempt 3, when transition is computed, then state becomes blocked",
+      "Given invalid stage result input, when transition is computed, then invalid-transition error is returned"
+    ],
+    "edge": [
+      "Given unknown stage result, when transition is computed, then domain returns invalid-transition error"
+    ]
+  },
+  "research": {
+    "files": [
+      "src/ddd.rs",
+      "src/db/write_ops.rs",
+      "src/agent_runtime.rs"
+    ],
+    "patterns": [
+      "Fowler Domain Model",
+      "State machine aggregate"
+    ],
+    "questions": [
+      "How to preserve backward compatibility for existing runtime transition calls?"
+    ]
+  },
+  "implementation": {
+    "phase_0": [
+      "Specify BeadExecution aggregate and transition function signatures"
+    ],
+    "phase_1": [
+      "Write BDD scenarios against domain API only"
+    ],
+    "phase_2": [
+      "Implement pure transition policy and map existing runtime to it"
+    ]
+  },
+  "context": {
+    "related_files": [
+      "src/types/stage.rs",
+      "src/types/state.rs"
+    ],
+    "similar": [
+      "runtime_determine_transition in src/ddd.rs"
+    ]
+  }
+}

@@ -1,0 +1,86 @@
+{
+  "id": "task-008",
+  "title": "observability: Add deterministic event stream and failure diagnostics",
+  "type": "feature",
+  "priority": 1,
+  "effort": "2hr",
+  "description": "Create a versioned execution event stream and diagnostics payloads so operators and AI agents can reason about progress and failures without scraping logs.",
+  "ears": {
+    "ubiquitous": [
+      "THE SYSTEM SHALL emit versioned lifecycle events for every transition"
+    ],
+    "event_driven": [
+      {
+        "trigger": "WHEN transition fails",
+        "shall": "THE SYSTEM SHALL emit diagnostics with category, retryability, and recommended next command"
+      }
+    ],
+    "unwanted": [
+      {
+        "condition": "IF only plain text logs exist",
+        "shall_not": "THE SYSTEM SHALL NOT require log parsing for orchestration decisions",
+        "because": "Log parsing is brittle and nondeterministic"
+      }
+    ]
+  },
+  "contracts": {
+    "preconditions": [
+      "Transition executor surfaces structured outcomes"
+    ],
+    "postconditions": [
+      "Event schema includes event_type, entity_id, causation_id, timestamp",
+      "Error payload includes retryable and category fields"
+    ],
+    "invariants": [
+      "Event ordering is monotonic per bead",
+      "Sensitive fields are redacted in diagnostics"
+    ]
+  },
+  "tests": {
+    "happy": [
+      "Given successful stage advance, when event emitted, then payload matches schema v1",
+      "Given monitor request, when events are queried, then ordering is deterministic by sequence"
+    ],
+    "error": [
+      "Given stage failure, when diagnostics emitted, then retryable and fix command are present",
+      "Given malformed event payload write, when persistence is attempted, then failure is surfaced without partial event row"
+    ],
+    "edge": [
+      "Given large failure detail, when event stored, then summary remains bounded while full detail stays retrievable"
+    ]
+  },
+  "research": {
+    "files": [
+      "src/protocol_envelope.rs",
+      "src/protocol_runtime.rs",
+      "src/error.rs"
+    ],
+    "patterns": [
+      "Fowler Event Narratives",
+      "API error taxonomy design"
+    ],
+    "questions": [
+      "Should events be separate table or part of stage_history extensions?"
+    ]
+  },
+  "implementation": {
+    "phase_0": [
+      "Define event and diagnostics schema"
+    ],
+    "phase_1": [
+      "Write BDD scenarios for event and error contracts"
+    ],
+    "phase_2": [
+      "Implement event persistence + protocol exposure"
+    ]
+  },
+  "context": {
+    "related_files": [
+      "src/types/messaging.rs",
+      "README.md"
+    ],
+    "similar": [
+      "Existing command_audit and monitor views"
+    ]
+  }
+}

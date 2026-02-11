@@ -1,0 +1,86 @@
+{
+  "id": "task-004",
+  "title": "application: Build orchestrator service layer and ports",
+  "type": "feature",
+  "priority": 1,
+  "effort": "4hr",
+  "description": "Introduce a Fowler-style Service Layer to coordinate domain aggregate transitions through explicit ports for repository, skill runner, and landing gateway.",
+  "ears": {
+    "ubiquitous": [
+      "THE SYSTEM SHALL execute orchestration through a single service boundary"
+    ],
+    "event_driven": [
+      {
+        "trigger": "WHEN agent tick is requested",
+        "shall": "THE SYSTEM SHALL execute exactly one deterministic state advancement"
+      }
+    ],
+    "unwanted": [
+      {
+        "condition": "IF infra adapter fails",
+        "shall_not": "THE SYSTEM SHALL NOT corrupt domain state transitions",
+        "because": "Failure isolation is required for safe retries"
+      }
+    ]
+  },
+  "contracts": {
+    "preconditions": [
+      "Ports expose deterministic request/response contracts"
+    ],
+    "postconditions": [
+      "Orchestrator can run fully with mocked ports in tests",
+      "Infrastructure side effects are isolated in adapters"
+    ],
+    "invariants": [
+      "Domain entities do not import SQLx or process APIs",
+      "Service layer never bypasses aggregate policy"
+    ]
+  },
+  "tests": {
+    "happy": [
+      "Given stage pass event, when service handles tick, then next stage is persisted and event emitted",
+      "Given ready idle agent, when service handles claim tick, then one bead is claimed and state updates are emitted"
+    ],
+    "error": [
+      "Given repository write failure, when service handles tick, then transition is not partially persisted",
+      "Given skill runner timeout, when service handles stage execution, then failure transition is persisted with retry guidance"
+    ],
+    "edge": [
+      "Given duplicate tick request, when same execution id is processed, then result is idempotent"
+    ]
+  },
+  "research": {
+    "files": [
+      "src/agent_runtime.rs",
+      "src/stage_executors.rs",
+      "src/db/mod.rs"
+    ],
+    "patterns": [
+      "Fowler Service Layer",
+      "Hexagonal architecture ports/adapters"
+    ],
+    "questions": [
+      "Which current module best hosts orchestrator entrypoint?"
+    ]
+  },
+  "implementation": {
+    "phase_0": [
+      "Define orchestrator command model and port traits"
+    ],
+    "phase_1": [
+      "Write BDD scenarios against service API with fake ports"
+    ],
+    "phase_2": [
+      "Implement adapters and wire protocol_runtime to service"
+    ]
+  },
+  "context": {
+    "related_files": [
+      "src/protocol_runtime.rs",
+      "src/main.rs"
+    ],
+    "similar": [
+      "Current handle_agent + run_agent flow"
+    ]
+  }
+}

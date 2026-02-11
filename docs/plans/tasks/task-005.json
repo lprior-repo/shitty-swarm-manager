@@ -1,0 +1,85 @@
+{
+  "id": "task-005",
+  "title": "persistence: Create resumable context projection API",
+  "type": "feature",
+  "priority": 1,
+  "effort": "2hr",
+  "description": "Add a dedicated read model that returns minimal, sufficient context for next-stage execution, independent of internal table shape.",
+  "ears": {
+    "ubiquitous": [
+      "THE SYSTEM SHALL provide one-call resume context for each active bead"
+    ],
+    "event_driven": [
+      {
+        "trigger": "WHEN a stage fails",
+        "shall": "THE SYSTEM SHALL expose failure feedback and latest relevant artifacts in projection"
+      }
+    ],
+    "unwanted": [
+      {
+        "condition": "IF resume requires multiple ad-hoc SQL queries",
+        "shall_not": "THE SYSTEM SHALL NOT require clients to reconstruct context manually",
+        "because": "Manual reconstruction increases nondeterminism"
+      }
+    ]
+  },
+  "contracts": {
+    "preconditions": [
+      "Stage artifacts are persisted with stable artifact types"
+    ],
+    "postconditions": [
+      "Projection includes stage, attempt, feedback, and minimal artifacts",
+      "Projection omits sensitive data by default"
+    ],
+    "invariants": [
+      "Projection contract remains stable across schema refactors",
+      "Ordering of stage attempts is deterministic"
+    ]
+  },
+  "tests": {
+    "happy": [
+      "Given one failed qa stage, when resume context is requested, then response includes latest implement and qa failure feedback",
+      "Given passing prior stages, when resume context is requested, then response includes next actionable stage and attempt count"
+    ],
+    "error": [
+      "Given unknown bead id, when resume context is requested, then not-found error is returned",
+      "Given malformed bead id input, when resume context is requested, then validation error is returned"
+    ],
+    "edge": [
+      "Given large artifact payloads, when projection is requested with summary mode, then payload size remains bounded"
+    ]
+  },
+  "research": {
+    "files": [
+      "src/db/read_ops.rs",
+      "src/types/artifacts.rs",
+      "crates/swarm-coordinator/schema.sql"
+    ],
+    "patterns": [
+      "Fowler Query Model/CQRS read model"
+    ],
+    "questions": [
+      "Which artifact classes are mandatory for each stage retry?"
+    ]
+  },
+  "implementation": {
+    "phase_0": [
+      "Define projection DTO and stable API contract"
+    ],
+    "phase_1": [
+      "Write BDD contract tests against public protocol response"
+    ],
+    "phase_2": [
+      "Implement query and map to protocol command"
+    ]
+  },
+  "context": {
+    "related_files": [
+      "src/protocol_runtime.rs",
+      "src/db/mappers.rs"
+    ],
+    "similar": [
+      "v_resume_context view in schema"
+    ]
+  }
+}

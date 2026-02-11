@@ -1,0 +1,86 @@
+{
+  "id": "task-006",
+  "title": "integration: Add landing saga with push-confirmed completion",
+  "type": "feature",
+  "priority": 0,
+  "effort": "4hr",
+  "description": "Implement an explicit landing saga that tracks commit/sync/fetch/push outcomes and only transitions bead to completed after push confirmation.",
+  "ears": {
+    "ubiquitous": [
+      "THE SYSTEM SHALL never mark completed before remote push confirmation"
+    ],
+    "event_driven": [
+      {
+        "trigger": "WHEN red-queen passes",
+        "shall": "THE SYSTEM SHALL enter landing workflow and emit landing status events"
+      }
+    ],
+    "unwanted": [
+      {
+        "condition": "IF push fails after local commit",
+        "shall_not": "THE SYSTEM SHALL NOT transition bead to completed",
+        "because": "Local-only completion strands work"
+      }
+    ]
+  },
+  "contracts": {
+    "preconditions": [
+      "All pipeline stages passed",
+      "Landing command adapter can execute jj/br operations"
+    ],
+    "postconditions": [
+      "Landing result is persisted with each step outcome",
+      "Completed status requires push=true"
+    ],
+    "invariants": [
+      "completion_implies_push_confirmed",
+      "failed_landing_preserves_retryable_state"
+    ]
+  },
+  "tests": {
+    "happy": [
+      "Given all landing steps succeed, when saga completes, then bead and agent move to done/completed",
+      "Given transient fetch delay, when saga retries and succeeds, then terminal completion is emitted once"
+    ],
+    "error": [
+      "Given push fails, when saga runs, then bead remains non-completed and landing error is persisted",
+      "Given commit fails, when saga runs, then error state is recorded and no completion transition is applied"
+    ],
+    "edge": [
+      "Given duplicate landing trigger, when saga replays, then second run is idempotent"
+    ]
+  },
+  "research": {
+    "files": [
+      "src/agent_runtime_support.rs",
+      "src/agent_runtime.rs",
+      "src/db/write_ops.rs"
+    ],
+    "patterns": [
+      "Fowler Transaction Script vs Saga tradeoffs"
+    ],
+    "questions": [
+      "Need a separate table for landing audit steps?"
+    ]
+  },
+  "implementation": {
+    "phase_0": [
+      "Define landing saga state model and persistence shape"
+    ],
+    "phase_1": [
+      "Write BDD scenarios for success/failure/idempotency"
+    ],
+    "phase_2": [
+      "Implement landing adapter and orchestrator integration"
+    ]
+  },
+  "context": {
+    "related_files": [
+      "README.md",
+      "AGENTS.md"
+    ],
+    "similar": [
+      "Current finalize_workspace step in agent_runtime"
+    ]
+  }
+}

@@ -1,0 +1,87 @@
+{
+  "id": "task-003",
+  "title": "coordination: Implement lease-based claiming and heartbeat recovery",
+  "type": "feature",
+  "priority": 1,
+  "effort": "4hr",
+  "description": "Strengthen claim safety with agent leases, heartbeat updates, and deterministic recovery of stale claims.",
+  "ears": {
+    "ubiquitous": [
+      "THE SYSTEM SHALL reclaim stale work without manual intervention"
+    ],
+    "event_driven": [
+      {
+        "trigger": "WHEN lease expires without heartbeat",
+        "shall": "THE SYSTEM SHALL transition ownership to recoverable state"
+      }
+    ],
+    "unwanted": [
+      {
+        "condition": "IF an agent process crashes",
+        "shall_not": "THE SYSTEM SHALL NOT leave bead permanently stuck in progress",
+        "because": "Stuck claims destroy throughput"
+      }
+    ]
+  },
+  "contracts": {
+    "preconditions": [
+      "Claim selection runs in transaction",
+      "Lease fields are populated on claim"
+    ],
+    "postconditions": [
+      "Claim owner has active lease",
+      "Expired leases are detectable by read model"
+    ],
+    "invariants": [
+      "At most one active lease per bead",
+      "Heartbeat updates are monotonic"
+    ]
+  },
+  "tests": {
+    "happy": [
+      "Given two agents claim concurrently, when claims execute, then each gets distinct bead",
+      "Given active lease owner heartbeat, when claim checks run, then ownership remains unchanged"
+    ],
+    "error": [
+      "Given stale lease, when reaper runs, then bead becomes reclaimable and audit event is emitted",
+      "Given heartbeat write failure, when lease update is attempted, then agent transitions to recoverable error state"
+    ],
+    "edge": [
+      "Given heartbeat arrives near expiry boundary, when evaluated, then lease remains valid"
+    ]
+  },
+  "research": {
+    "files": [
+      "crates/swarm-coordinator/schema.sql",
+      "src/db/read_ops.rs",
+      "src/db/write_ops.rs"
+    ],
+    "patterns": [
+      "Fowler Unit of Work",
+      "SKIP LOCKED queue processing"
+    ],
+    "questions": [
+      "Should recovery create explicit stage_history entry?"
+    ]
+  },
+  "implementation": {
+    "phase_0": [
+      "Define lease lifecycle states and timeout policy"
+    ],
+    "phase_1": [
+      "Write BDD scenarios for claim, heartbeat, and recovery"
+    ],
+    "phase_2": [
+      "Add schema + repository changes for lease semantics"
+    ]
+  },
+  "context": {
+    "related_files": [
+      "src/protocol_runtime.rs",
+      "src/agent_runtime.rs"
+    ],
+    "similar": [
+      "claim_next_p0_bead database function"
+    ]
+  }
+}

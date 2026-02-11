@@ -496,6 +496,16 @@ CROSS JOIN swarm_config c
 WHERE a.status = 'idle'
    OR (a.status = 'waiting' AND a.implementation_attempt < c.max_implementation_attempts);
 
+-- Compatibility view for agent prompts that reference `beads` directly.
+CREATE OR REPLACE VIEW beads AS
+SELECT
+    b.bead_id,
+    b.bead_id AS id,
+    b.priority,
+    b.status,
+    b.created_at
+FROM bead_backlog b;
+
 CREATE OR REPLACE VIEW v_resume_context AS
 SELECT
     a.agent_id,

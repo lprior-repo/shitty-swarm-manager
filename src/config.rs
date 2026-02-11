@@ -145,35 +145,65 @@ impl StageCommands {
 }
 
 fn default_database_url() -> String {
-    std::env::var("DATABASE_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| {
-            let user = std::env::var("SWARM_DB_USER")
-                .unwrap_or_else(|_| "shitty_swarm_manager".to_string());
-            let pass = std::env::var("SWARM_DB_PASSWORD")
-                .unwrap_or_else(|_| "shitty_swarm_manager".to_string());
-            let host = std::env::var("SWARM_DB_HOST").unwrap_or_else(|_| "localhost".to_string());
-            let port = std::env::var("SWARM_DB_PORT").unwrap_or_else(|_| "5437".to_string());
-            let db = std::env::var("SWARM_DB_NAME")
-                .unwrap_or_else(|_| "shitty_swarm_manager_db".to_string());
-            format!("postgres://{user}:{pass}@{host}:{port}/{db}")
-        })
+    non_empty_env_var("DATABASE_URL").unwrap_or_else(computed_default_database_url)
 }
 
 pub fn default_database_url_for_cli() -> String {
-    // 1. Try .swarm/config.toml (without credentials for security)
+    database_url_candidates_for_cli()
+        .into_iter()
+        .next()
+        .unwrap_or_else(computed_default_database_url)
+}
+
+pub fn database_url_candidates_for_cli() -> Vec<String> {
+    let mut candidates = Vec::new();
+
+    // 1. Environment variable wins so local shell config works immediately.
+    push_unique(&mut candidates, non_empty_env_var("DATABASE_URL"));
+
+    // 2. Project config comes next.
     if let Ok(content) = std::fs::read_to_string(".swarm/config.toml") {
         let (database_url, _) = parse_config_content(&content);
-        if let Some(url) = database_url {
-            if !url.is_empty() {
-                return url;
-            }
-        }
+        push_unique(
+            &mut candidates,
+            database_url.and_then(|url| {
+                let trimmed = url.trim().to_string();
+                (!trimmed.is_empty()).then_some(trimmed)
+            }),
+        );
     }
 
-    // 2. Fallback to env or computed default
-    default_database_url()
+    // 3. Finally, computed defaults from SWARM_DB_* values.
+    push_unique(&mut candidates, Some(computed_default_database_url()));
+
+    candidates
+}
+
+fn push_unique(target: &mut Vec<String>, value: Option<String>) {
+    if let Some(candidate) = value {
+        if !target.iter().any(|existing| existing == &candidate) {
+            target.push(candidate);
+        }
+    }
+}
+
+fn non_empty_env_var(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn computed_default_database_url() -> String {
+    let user =
+        std::env::var("SWARM_DB_USER").unwrap_or_else(|_| "shitty_swarm_manager".to_string());
+    let pass =
+        std::env::var("SWARM_DB_PASSWORD").unwrap_or_else(|_| "shitty_swarm_manager".to_string());
+    let host = std::env::var("SWARM_DB_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let port = std::env::var("SWARM_DB_PORT").unwrap_or_else(|_| "5437".to_string());
+    let db =
+        std::env::var("SWARM_DB_NAME").unwrap_or_else(|_| "shitty_swarm_manager_db".to_string());
+    format!("postgres://{user}:{pass}@{host}:{port}/{db}")
 }
 
 #[cfg(test)]

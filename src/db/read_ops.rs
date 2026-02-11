@@ -269,20 +269,26 @@ impl SwarmDb {
     /// Returns `SwarmError::DatabaseError` if the database query fails.
     pub async fn get_progress(&self, _repo_id: &RepoId) -> Result<ProgressSummary> {
         sqlx::query_as::<_, ProgressRow>(
-            "SELECT done_agents, working_agents, waiting_agents, error_agents, idle_agents, total_agents
+            "SELECT
+                done_agents AS done,
+                working_agents AS working,
+                waiting_agents AS waiting,
+                error_agents AS error,
+                idle_agents AS idle,
+                total_agents AS total
              FROM v_swarm_progress",
         )
-            .fetch_one(self.pool())
-            .await
-            .map_err(|e| SwarmError::DatabaseError(format!("Failed to get progress: {e}")))
-            .map(|row| ProgressSummary {
-                completed: row.done.cast_unsigned(),
-                working: row.working.cast_unsigned(),
-                waiting: row.waiting.cast_unsigned(),
-                errors: row.error.cast_unsigned(),
-                idle: row.idle.cast_unsigned(),
-                total_agents: row.total.cast_unsigned(),
-            })
+        .fetch_one(self.pool())
+        .await
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to get progress: {e}")))
+        .map(|row| ProgressSummary {
+            completed: row.done.cast_unsigned(),
+            working: row.working.cast_unsigned(),
+            waiting: row.waiting.cast_unsigned(),
+            errors: row.error.cast_unsigned(),
+            idle: row.idle.cast_unsigned(),
+            total_agents: row.total.cast_unsigned(),
+        })
     }
 
     /// Retrieves the swarm configuration for a repository.

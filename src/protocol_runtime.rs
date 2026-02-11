@@ -10,7 +10,7 @@
 #![allow(clippy::too_many_lines)]
 
 use crate::agent_runtime::{run_agent, run_smoke_once};
-use crate::config::{default_database_url_for_cli, load_config};
+use crate::config::{database_url_candidates_for_cli, default_database_url_for_cli, load_config};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -1701,13 +1701,14 @@ async fn handle_smoke(
 async fn handle_doctor(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
-    let checks = [
+    let mut checks = vec![
         check_command("moon").await,
         check_command("br").await,
         check_command("jj").await,
         check_command("zjj").await,
         check_command("psql").await,
     ];
+    checks.push(check_database_connectivity().await);
     let failed = checks
         .iter()
         .filter(|check| !check["ok"].as_bool().is_some_and(|value| value))
@@ -2079,18 +2080,60 @@ fn required_string_arg(
 async fn db_from_request(
     request: &ProtocolRequest,
 ) -> std::result::Result<SwarmDb, Box<ProtocolEnvelope>> {
-    let database_url = match request
+    let Some(database_url) = request
         .args
         .get("database_url")
         .and_then(Value::as_str)
         .map(std::string::ToString::to_string)
-    {
-        Some(value) => value,
-        None => default_database_url_for_cli(),
+    else {
+        let candidates = database_url_candidates_for_cli();
+        return connect_using_candidates(candidates, request.rid.clone()).await;
     };
+
     SwarmDb::new(&database_url)
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))
+}
+
+async fn connect_using_candidates(
+    candidates: Vec<String>,
+    rid: Option<String>,
+) -> std::result::Result<SwarmDb, Box<ProtocolEnvelope>> {
+    let (connected, failures) = try_connect_candidates(&candidates).await;
+    if let Some((db, _connected_url)) = connected {
+        return Ok(db);
+    }
+
+    let masked: Vec<String> = candidates
+        .iter()
+        .map(|candidate| mask_database_url(candidate))
+        .collect();
+
+    Err(Box::new(
+        ProtocolEnvelope::error(
+            rid,
+            code::INTERNAL.to_string(),
+            "Unable to connect to any configured database URL".to_string(),
+        )
+        .with_fix(
+            "Set DATABASE_URL, verify postgres is reachable, or run 'swarm init-local-db'"
+                .to_string(),
+        )
+        .with_ctx(json!({"tried": masked, "errors": failures})),
+    ))
+}
+
+async fn try_connect_candidates(candidates: &[String]) -> (Option<(SwarmDb, String)>, Vec<String>) {
+    let mut failures = Vec::new();
+
+    for candidate in candidates {
+        match SwarmDb::new(candidate).await {
+            Ok(db) => return (Some((db, candidate.clone())), failures),
+            Err(err) => failures.push(format!("{}: {}", mask_database_url(candidate), err)),
+        }
+    }
+
+    (None, failures)
 }
 
 async fn minimal_state_for_request(request: &ProtocolRequest) -> Value {
@@ -2129,6 +2172,35 @@ async fn check_command(command: &str) -> Value {
             "ok": false,
             "fix": format!("Install '{}' and ensure it is on PATH.", command),
         }),
+    }
+}
+
+async fn check_database_connectivity() -> Value {
+    let candidates = database_url_candidates_for_cli();
+    let (connected, failures) = try_connect_candidates(&candidates).await;
+
+    match connected {
+        Some((_db, connected_url)) => {
+            json!({"name": "database", "ok": true, "url": mask_database_url(&connected_url)})
+        }
+        None => json!({
+            "name": "database",
+            "ok": false,
+            "fix": "Set DATABASE_URL, verify postgres is reachable, or run 'swarm init-local-db'",
+            "errors": failures,
+        }),
+    }
+}
+
+fn mask_database_url(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut parsed) => {
+            if parsed.password().is_some() {
+                let _ = parsed.set_password(Some("********"));
+            }
+            parsed.to_string()
+        }
+        Err(_) => "<invalid-database-url>".to_string(),
     }
 }
 
