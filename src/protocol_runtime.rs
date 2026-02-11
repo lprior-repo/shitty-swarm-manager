@@ -11,6 +11,7 @@
 
 use crate::agent_runtime::{run_agent, run_smoke_once};
 use crate::config::{database_url_candidates_for_cli, default_database_url_for_cli, load_config};
+use itertools::Itertools;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -20,13 +21,8 @@ use std::pin::Pin;
 use std::time::Instant;
 use swarm::protocol_envelope::ProtocolEnvelope;
 use swarm::{
-    code,
-    AgentId,
-    CANONICAL_COORDINATOR_SCHEMA_PATH,
-    RepoId,
-    ResumeContextContract,
-    SwarmDb,
-    SwarmError,
+    code, AgentId, ArtifactType, BeadId, RepoId, ResumeContextContract, StageArtifact, SwarmDb,
+    SwarmError, CANONICAL_COORDINATOR_SCHEMA_PATH,
 };
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -638,6 +634,7 @@ async fn execute_request_no_batch(
         "agent" => handle_agent(&request).await,
         "status" => handle_status(&request).await,
         "resume" => handle_resume(&request).await,
+        "artifacts" => handle_artifacts(&request).await,
         "resume-context" => handle_resume_context(&request).await,
         "release" => handle_release(&request).await,
         "init-db" => handle_init_db(&request).await,
@@ -653,7 +650,7 @@ async fn execute_request_no_batch(
                 request.rid.clone(),
                 code::INVALID.to_string(),
                 format!("Unknown command: {other}"),
-            ).with_fix("Use a valid command: init, doctor, status, resume, resume-context, agent, smoke, prompt, register, release, monitor, init-db, init-local-db, spawn-prompts, batch, bootstrap, state, or ?/help for help".to_string())
+            ).with_fix("Use a valid command: init, doctor, status, resume, artifacts, resume-context, agent, smoke, prompt, register, release, monitor, init-db, init-local-db, spawn-prompts, batch, bootstrap, state, or ?/help for help".to_string())
             .with_ctx(json!({"cmd": other})))),
     }
 }
@@ -1353,6 +1350,116 @@ async fn handle_resume(
             "contexts": contracts,
         }),
         next: "swarm monitor --view failures".to_string(),
+        state: minimal_state_for_request(request).await,
+    })
+}
+
+async fn handle_artifacts(
+    request: &ProtocolRequest,
+) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
+    let bead_id = parse_artifact_bead_id(request)?;
+    let artifact_type = parse_artifact_type(request)?;
+    let db: SwarmDb = db_from_request(request).await?;
+    let artifacts = db
+        .get_bead_artifacts(&bead_id, artifact_type)
+        .await
+        .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
+    let artifact_payload = artifacts
+        .iter()
+        .map(artifact_to_json)
+        .collect::<Vec<_>>();
+
+    Ok(CommandSuccess {
+        data: json!({
+            "bead_id": bead_id.value(),
+            "artifact_count": artifact_payload.len(),
+            "artifacts": artifact_payload,
+        }),
+        next: "swarm monitor --view progress".to_string(),
+        state: minimal_state_for_request(request).await,
+    })
+}
+
+fn parse_artifact_bead_id(
+    request: &ProtocolRequest,
+) -> std::result::Result<BeadId, Box<ProtocolEnvelope>> {
+    request
+        .args
+        .get("bead_id")
+        .and_then(Value::as_str)
+        .map(BeadId::new)
+        .ok_or_else(||
+            Box::new(
+                ProtocolEnvelope::error(
+                    request.rid.clone(),
+                    code::INVALID.to_string(),
+                    "Missing required field: bead_id".to_string(),
+                )
+                .with_fix("Include `bead_id` in the request. Example: {\"cmd\":\"artifacts\",\"bead_id\":\"<bead>\"}".to_string())
+                .with_ctx(json!({"bead_id": "required"})),
+            ),
+        )
+}
+
+fn parse_artifact_type(
+    request: &ProtocolRequest,
+) -> std::result::Result<Option<ArtifactType>, Box<ProtocolEnvelope>> {
+    let candidate = request
+        .args
+        .get("artifact_type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+
+    if let Some(value) = candidate {
+        ArtifactType::try_from(value.as_str())
+            .map(Some)
+            .map_err(|err| {
+                Box::new(
+                    ProtocolEnvelope::error(
+                        request.rid.clone(),
+                        code::INVALID.to_string(),
+                        err,
+                    )
+                    .with_fix(format!(
+                        "Use artifact_type from: {}",
+                        ArtifactType::names().join(", ")
+                    ))
+                    .with_ctx(json!({"artifact_type": value})),
+                )
+            })
+    } else {
+        Ok(None)
+    }
+}
+
+fn artifact_to_json(artifact: &StageArtifact) -> Value {
+    json!({
+        "id": artifact.id,
+        "stage_history_id": artifact.stage_history_id,
+        "artifact_type": artifact.artifact_type.as_str(),
+        "content": artifact.content,
+        "metadata": artifact.metadata.clone(),
+        "created_at": artifact.created_at.to_rfc3339(),
+        "content_hash": artifact.content_hash.clone(),
+    })
+}
+
+async fn handle_resume_context(
+    request: &ProtocolRequest,
+) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
+    let db: SwarmDb = db_from_request(request).await?;
+    let contexts = db
+        .get_deep_resume_contexts()
+        .await
+        .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
+
+    Ok(CommandSuccess {
+        data: json!({
+            "contexts": contexts,
+        }),
+        next: "swarm resume".to_string(),
         state: minimal_state_for_request(request).await,
     })
 }

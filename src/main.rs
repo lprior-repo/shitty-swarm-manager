@@ -31,7 +31,6 @@ const HELP_DATA: &str = r#"{
     ["status", "Show swarm state"],
     ["resume", "Show resumable context projections"],
     ["resume-context", "Show deep resume context payload"],
-    ["resume-context", "Show deep resume context payload"],
     ["artifacts", "Retrieve bead artifacts"],
     ["agent", "Run single agent"],
     ["monitor", "View agents/progress"],
@@ -65,8 +64,9 @@ pub enum CliCommand {
     Help,
     Status,
     Resume,
-    ResumeContext,
-    ResumeContext,
+    ResumeContext {
+        bead_id: Option<String>,
+    },
     Artifacts {
         bead_id: String,
         artifact_type: Option<String>,
@@ -187,13 +187,18 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction, CliError> {
         Some("doctor") => Ok(CliAction::Command(CliCommand::Doctor)),
         Some("status") => Ok(CliAction::Command(CliCommand::Status)),
         Some("resume") => Ok(CliAction::Command(CliCommand::Resume)),
-        Some("resume-context") => Ok(CliAction::Command(CliCommand::ResumeContext)),
+        Some("resume-context") => {
+            let bead_id = parse_optional_arg(args, "bead_id")?;
+            Ok(CliAction::Command(CliCommand::ResumeContext { bead_id }))
+        }
         Some("artifacts") => {
             let bead_id = parse_required_arg::<String>(args, "bead_id")?;
             let artifact_type = parse_optional_arg::<String>(args, "artifact_type")?;
-            Ok(CliAction::Command(CliCommand::Artifacts { bead_id, artifact_type }))
+            Ok(CliAction::Command(CliCommand::Artifacts {
+                bead_id,
+                artifact_type,
+            }))
         }
-        Some("resume-context") => Ok(CliAction::Command(CliCommand::ResumeContext)),
         Some("?" | "help") => Ok(CliAction::Command(CliCommand::Help)),
         Some("state") => Ok(CliAction::Command(CliCommand::State)),
         Some("agents") => Ok(CliAction::Command(CliCommand::Agents)),
@@ -379,7 +384,13 @@ fn cli_command_to_request(cmd: CliCommand) -> String {
             }
             ("artifacts".to_string(), None, args)
         }
-        CliCommand::ResumeContext => ("resume-context".to_string(), None, serde_json::Map::new()),
+        CliCommand::ResumeContext { bead_id } => {
+            let mut args = serde_json::Map::new();
+            if let Some(id) = bead_id {
+                args.insert("bead_id".to_string(), json!(id));
+            }
+            ("resume-context".to_string(), None, args)
+        }
 
         CliCommand::Agent { id, dry } => {
             let mut args = serde_json::Map::new();
@@ -669,7 +680,6 @@ fn suggest_commands(typo: &str) -> Vec<String> {
         "help",
         "status",
         "resume",
-        "resume-context",
         "resume-context",
         "artifacts",
         "agent",
