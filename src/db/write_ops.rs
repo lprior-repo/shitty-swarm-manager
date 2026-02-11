@@ -1087,7 +1087,7 @@ impl SwarmDb {
             sqlx::query(
                 "INSERT INTO agent_state (repo_id, agent_id, status)
                  VALUES ($1, $2, 'idle')
-                 ON CONFLICT (agent_id) DO NOTHING",
+                 ON CONFLICT (repo_id, agent_id) DO NOTHING",
             )
             .bind(default_repo.value())
             .bind(agent_number.cast_signed())
@@ -1498,22 +1498,24 @@ impl SwarmDb {
         let repo_scoped = self.table_has_column("agent_state", "repo_id").await?;
 
         if repo_scoped {
-            sqlx::query_scalar::<_, String>(
+            sqlx::query_scalar::<_, Option<String>>(
                 "SELECT bead_id FROM agent_state WHERE repo_id = $1 AND agent_id = $2",
             )
             .bind(agent_id.repo_id().value())
             .bind(agent_id.number().cast_signed())
             .fetch_optional(self.pool())
             .await
-            .map(|bead| bead.map(BeadId::new))
+            .map(|bead| bead.flatten().map(BeadId::new))
             .map_err(|e| SwarmError::DatabaseError(format!("Failed to lookup agent bead: {e}")))
         } else {
-            sqlx::query_scalar::<_, String>("SELECT bead_id FROM agent_state WHERE agent_id = $1")
-                .bind(agent_id.number().cast_signed())
-                .fetch_optional(self.pool())
-                .await
-                .map(|bead| bead.map(BeadId::new))
-                .map_err(|e| SwarmError::DatabaseError(format!("Failed to lookup agent bead: {e}")))
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT bead_id FROM agent_state WHERE agent_id = $1",
+            )
+            .bind(agent_id.number().cast_signed())
+            .fetch_optional(self.pool())
+            .await
+            .map(|bead| bead.flatten().map(BeadId::new))
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to lookup agent bead: {e}")))
         }
     }
 

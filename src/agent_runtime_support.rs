@@ -256,12 +256,23 @@ pub async fn run_shell_command(command: &str) -> Result<CommandOutput> {
 }
 
 pub async fn create_workspace(agent_id: u32, bead_id: &str) -> Result<()> {
-    let cmd = format!("zjj add agent-{agent_id}-{bead_id}");
-    let out = run_shell_command(&cmd).await?;
-    if !out.status_success {
+    let session_name = format!("agent-{agent_id}-{bead_id}");
+    let output = Command::new("zjj")
+        .args(["add", session_name.as_str()])
+        .output()
+        .await
+        .map_err(SwarmError::IoError)?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let message = match (stdout.is_empty(), stderr.is_empty()) {
+        (true, _) => stderr,
+        (_, true) => stdout,
+        _ => format!("{stdout}\n{stderr}"),
+    };
+    if !output.status.success() {
         tracing::warn!(
             "Workspace creation might have failed or already exists: {}",
-            out.message
+            message
         );
     }
     Ok(())

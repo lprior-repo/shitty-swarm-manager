@@ -1473,30 +1473,40 @@ fn parse_artifact_bead_id(
 fn parse_artifact_type(
     request: &ProtocolRequest,
 ) -> std::result::Result<Option<ArtifactType>, Box<ProtocolEnvelope>> {
-    let candidate = request
-        .args
-        .get("artifact_type")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
+    let Some(raw_artifact_type) = request.args.get("artifact_type") else {
+        return Ok(None);
+    };
 
-    if let Some(value) = candidate {
-        ArtifactType::try_from(value.as_str())
-            .map(Some)
-            .map_err(|err| {
-                Box::new(
-                    ProtocolEnvelope::error(request.rid.clone(), code::INVALID.to_string(), err)
-                        .with_fix(format!(
-                            "Use artifact_type from: {}",
-                            ArtifactType::names().join(", ")
-                        ))
-                        .with_ctx(json!({"artifact_type": value})),
-                )
-            })
-    } else {
-        Ok(None)
+    let Some(raw_artifact_type) = raw_artifact_type.as_str() else {
+        return Err(Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::INVALID.to_string(),
+                "artifact_type must be a string".to_string(),
+            )
+            .with_fix(format!(
+                "Use artifact_type from: {}",
+                ArtifactType::names().join(", ")
+            ))
+            .with_ctx(json!({"artifact_type": request.args.get("artifact_type")})),
+        ));
+    };
+
+    let candidate = raw_artifact_type.trim();
+    if candidate.is_empty() {
+        return Ok(None);
     }
+
+    ArtifactType::try_from(candidate).map(Some).map_err(|err| {
+        Box::new(
+            ProtocolEnvelope::error(request.rid.clone(), code::INVALID.to_string(), err)
+                .with_fix(format!(
+                    "Use artifact_type from: {}",
+                    ArtifactType::names().join(", ")
+                ))
+                .with_ctx(json!({"artifact_type": candidate})),
+        )
+    })
 }
 
 fn artifact_to_json(artifact: &StageArtifact) -> Value {
@@ -1568,6 +1578,21 @@ mod artifact_tests {
         let envelope: &ProtocolEnvelope = err.as_ref();
         assert_eq!(envelope.err.as_ref().unwrap().code, "INVALID");
         assert!(envelope.fix.as_ref().unwrap().contains("artifact_type"));
+    }
+
+    #[test]
+    fn parse_artifact_type_rejects_non_string_value() {
+        let mut request = request_with_args(&[("bead_id", "bead-42")]);
+        request
+            .args
+            .insert("artifact_type".to_string(), Value::Bool(true));
+        let err = parse_artifact_type(&request).expect_err("non-string artifact_type");
+        let envelope: &ProtocolEnvelope = err.as_ref();
+        assert_eq!(envelope.err.as_ref().unwrap().code, "INVALID");
+        assert_eq!(
+            envelope.err.as_ref().map(|e| e.msg.as_str()),
+            Some("artifact_type must be a string")
+        );
     }
 }
 
