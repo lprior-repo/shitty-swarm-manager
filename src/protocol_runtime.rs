@@ -618,7 +618,7 @@ async fn execute_request_no_batch(
     request: ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
     match request.cmd.as_str() {
-        "?" => handle_help(&request).await,
+        "?" | "help" => handle_help(&request).await,
         "state" => handle_state(&request).await,
         "history" => handle_history(&request).await,
         "lock" => handle_lock(&request).await,
@@ -643,7 +643,7 @@ async fn execute_request_no_batch(
                 request.rid.clone(),
                 code::INVALID.to_string(),
                 format!("Unknown command: {other}"),
-            ).with_fix("Use a valid command: init, doctor, status, agent, smoke, prompt, register, release, monitor, init-db, init-local-db, spawn-prompts, batch, bootstrap, or ? for help".to_string())
+            ).with_fix("Use a valid command: init, doctor, status, agent, smoke, prompt, register, release, monitor, init-db, init-local-db, spawn-prompts, batch, bootstrap, state, or ?/help for help".to_string())
             .with_ctx(json!({"cmd": other})))),
     }
 }
@@ -674,10 +674,16 @@ async fn handle_help(
         ("?", "This help"),
     ];
 
+    let command_map = commands
+        .iter()
+        .map(|(cmd, description)| (cmd.to_string(), Value::String(description.to_string())))
+        .collect::<serde_json::Map<String, Value>>();
+
     Ok(CommandSuccess {
         data: json!({
             "n": "swarm",
             "v": env!("CARGO_PKG_VERSION"),
+            "commands": command_map,
             "cmds": commands,
         }),
         next: "swarm state".to_string(),

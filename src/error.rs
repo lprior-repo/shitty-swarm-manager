@@ -134,13 +134,4 @@ pub const ERROR_CODES: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// Get error code details (description and fix) for a given error code
-#[must_use]
-pub fn get_error_info(error_code: &str) -> Option<(&'static str, &'static str)> {
-    ERROR_CODES
-        .iter()
-        .find(|(code, _, _)| *code == error_code)
-        .map(|(_, desc, fix)| (*desc, *fix))
-}
-
 pub type Result<T> = std::result::Result<T, SwarmError>;
