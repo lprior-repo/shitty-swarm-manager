@@ -51,56 +51,41 @@ pub fn contract_document_and_artifacts(bead_id: &BeadId) -> (String, HashMap<Str
         .and_then(|issue| parse_ai_hints(&issue.description));
 
     let mut contract_document = format!(
-            r"# Contract for {bead_reference}
-
-## Goal
-Deliver the bead with explicit behavior boundaries and failure semantics.
-
-## Bead Metadata
-{metadata_section}
-
-## Requirements
-{requirements}
-
-## Given-When-Then Scenarios
-- Given valid bead context, when implementation runs, then behavior is deterministic and side effects are explicit.
-- Given dependency failure, when stage logic runs, then errors propagate via Result with no panic path.
-- Given stage artifacts, when downstream stages execute, then required artifacts are discoverable and typed.
-
-## Implementation Plan
-1. Load required artifacts from persistence layer.
-2. Transform data through pure functions where possible.
-3. Isolate shell/process boundaries into thin async adapters.
-4. Persist typed artifacts for downstream stages.
-
-## Acceptance Criteria
-- No unwrap, expect, panic, todo, or unimplemented paths.
-- Stage status reflects command outcome with actionable feedback.
-- Artifacts are persisted for each stage before completion.
-
-## System Context
-{system_context}
-
-## Invariants
-{invariants}
-
-## Data Flow
-{data_flow}
-
-## Error Handling
-{error_handling}
-
-## Test Scenarios
-{test_scenarios}
-
-## Validation Gates
-{validation_gates}
-
-## Success Metrics
-{success_metrics}
-
-"#
-        );
+        "# Contract for {bead_reference}\n\n\
+         ## Goal\n\
+         Deliver the bead with explicit behavior boundaries and failure semantics.\n\n\
+         ## Bead Metadata\n\
+         {metadata_section}\n\n\
+         ## Requirements\n\
+         {requirements}\n\n\
+         ## Given-When-Then Scenarios\n\
+         - Given valid bead context, when implementation runs, then behavior is deterministic and side effects are explicit.\n\
+         - Given dependency failure, when stage logic runs, then errors propagate via Result with no panic path.\n\
+         - Given stage artifacts, when downstream stages execute, then required artifacts are discoverable and typed.\n\n\
+         ## Implementation Plan\n\
+         1. Load required artifacts from persistence layer.\n\
+         2. Transform data through pure functions where possible.\n\
+         3. Isolate shell/process boundaries into thin async adapters.\n\
+         4. Persist typed artifacts for downstream stages.\n\n\
+         ## Acceptance Criteria\n\
+         - No unwrap, expect, panic, todo, or unimplemented paths.\n\
+         - Stage status reflects command outcome with actionable feedback.\n\
+         - Artifacts are persisted for each stage before completion.\n\n\
+         ## System Context\n\
+         {system_context}\n\n\
+         ## Invariants\n\
+         {invariants}\n\n\
+         ## Data Flow\n\
+         {data_flow}\n\n\
+         ## Error Handling\n\
+         {error_handling}\n\n\
+         ## Test Scenarios\n\
+         {test_scenarios}\n\n\
+         ## Validation Gates\n\
+         {validation_gates}\n\n\
+         ## Success Metrics\n\
+         {success_metrics}\n\n"
+    );
 
     if let Some(description) = &issue_description_block {
         contract_document.push_str("## Backlog Description\n```cue\n");
@@ -380,5 +365,28 @@ ai_hints: {
         assert!(metadata.contains("- Issue Type: feature"));
         assert!(metadata.contains("- Effort Estimate: 2hr"));
         assert!(metadata.contains("- Labels: planner-generated"));
+    }
+
+    #[test]
+    fn contract_document_includes_bead_metadata_and_contextual_artifacts() {
+        let bead_id = BeadId::new("swm-3qw");
+        let (contract_document, artifacts) = contract_document_and_artifacts(&bead_id);
+
+        assert!(contract_document.contains("## Bead Metadata"));
+        assert!(contract_document.contains("- ID: swm-3qw"));
+        assert!(contract_document
+            .contains("- Issue goal: contract-stage: generate bead-aware contract artifacts"));
+        assert!(contract_document.contains("## Backlog Description"));
+        assert!(contract_document.contains("## AI Hints"));
+
+        let metadata = artifacts
+            .get("issue_metadata")
+            .expect("issue metadata artifact should exist");
+        assert!(metadata.contains("contract-stage: generate bead-aware contract artifacts"));
+        assert!(artifacts.contains_key("issue_description"));
+        assert!(artifacts.contains_key("ai_hints"));
+
+        let ai_hints = artifacts.get("ai_hints").unwrap();
+        assert!(ai_hints.contains("Zero unwrap law"));
     }
 }
