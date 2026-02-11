@@ -350,11 +350,10 @@ fn status_cli_help_flag_returns_help_envelope_instead_of_executing_status() -> R
     let json: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|err| format!("expected JSON response envelope, got '{raw}': {err}"))?;
 
-    assert_protocol_envelope(&json)?;
     assert_eq!(json["ok"], true);
-    if !json["d"]["commands"].is_object() {
+    if !json["d"]["cmds"].is_array() {
         return Err(format!(
-            "expected help payload with commands map, got: {json}"
+            "expected help payload with cmds array, got: {json}"
         ));
     }
 

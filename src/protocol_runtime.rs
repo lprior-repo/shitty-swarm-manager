@@ -638,7 +638,7 @@ pub async fn process_protocol_line(line: &str) -> std::result::Result<(), SwarmE
     }
 
     let candidates = database_url_candidates_for_cli();
-    match audit_request(
+    let audit_result = audit_request(
         &audit_cmd,
         maybe_rid.as_deref(),
         audit_args,
@@ -647,15 +647,23 @@ pub async fn process_protocol_line(line: &str) -> std::result::Result<(), SwarmE
         envelope.err.as_ref().map(|e| e.code.as_str()),
         &candidates,
     )
-    .await
-    {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            // Log audit failure but don't fail the request
-            eprintln!("WARN: Audit trail recording failed: {e}");
-            Ok(())
-        }
+    .await;
+
+    if let Err(e) = audit_result {
+        // Log audit failure but don't fail the request
+        eprintln!("WARN: Audit trail recording failed: {e}");
     }
+
+    // CRITICAL FIX: Return error if the protocol request itself failed
+    // This ensures proper exit codes are propagated to the caller
+    if !envelope.ok {
+        return Err(SwarmError::Internal(envelope.err.as_ref().map_or_else(
+            || "Unknown protocol error".to_string(),
+            |e| e.msg.clone(),
+        )));
+    }
+
+    Ok(())
 }
 
 async fn execute_request(

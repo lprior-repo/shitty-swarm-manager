@@ -21,15 +21,16 @@ impl ProtocolScenarioHarness {
     }
 
     pub fn run_protocol(&self, input: &str) -> Result<ScenarioResult, String> {
-        let assert = Command::new(&self.binary_path)
+        let output = Command::new(&self.binary_path)
             .write_stdin(format!("{input}\n"))
-            .assert()
-            .success();
+            .output()
+            .map_err(|err| format!("failed to run command: {err}"))?;
 
-        let raw = String::from_utf8_lossy(&assert.get_output().stdout)
-            .trim()
-            .to_string();
-        serde_json::from_str::<Value>(&raw)
+        let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        // Parse the first JSON line (there may be a second error envelope)
+        let first_line = raw.lines().next().unwrap_or(&raw);
+        serde_json::from_str::<Value>(first_line)
             .map(|output| ScenarioResult { output })
             .map_err(|err| format!("expected JSON response envelope, got '{raw}': {err}"))
     }
