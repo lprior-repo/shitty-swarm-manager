@@ -1434,7 +1434,7 @@ async fn handle_init_db(
         .map(PathBuf::from)
     {
         Some(value) => value,
-        None => PathBuf::from("crates/swarm-coordinator/schema.sql"),
+        None => PathBuf::from(CANONICAL_COORDINATOR_SCHEMA_PATH),
     };
     let seed_agents = request
         .args
@@ -1461,7 +1461,9 @@ async fn handle_init_db(
                 code::INVALID.to_string(),
                 format!("Failed to read schema: {err}"),
             )
-            .with_fix("swarm init-db --schema crates/swarm-coordinator/schema.sql".to_string())
+            .with_fix(format!(
+                "swarm init-db --schema {CANONICAL_COORDINATOR_SCHEMA_PATH}"
+            ))
             .with_ctx(json!({"schema": schema.display().to_string()})),
         )
     })?;
@@ -1519,7 +1521,7 @@ async fn handle_init_local_db(
         .map(PathBuf::from)
     {
         Some(value) => value,
-        None => PathBuf::from("crates/swarm-coordinator/schema.sql"),
+        None => PathBuf::from(CANONICAL_COORDINATOR_SCHEMA_PATH),
     };
     let seed_agents = request
         .args
@@ -2040,7 +2042,7 @@ async fn handle_init(
         .map(PathBuf::from)
     {
         Some(value) => value,
-        None => PathBuf::from("crates/swarm-coordinator/schema.sql"),
+        None => PathBuf::from(CANONICAL_COORDINATOR_SCHEMA_PATH),
     };
 
     if dry_flag(request) {
