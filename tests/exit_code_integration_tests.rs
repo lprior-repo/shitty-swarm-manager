@@ -128,7 +128,7 @@ fn test_exit_code_range_validation() {
     for error in errors {
         let code = error.exit_code();
         assert!(
-            code >= 1 && code <= 9,
+            (1..=9).contains(&code),
             "Exit code {} is outside valid range 1-9 for error: {:?}",
             code,
             error

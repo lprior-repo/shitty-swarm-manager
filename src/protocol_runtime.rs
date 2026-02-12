@@ -11,6 +11,11 @@
 
 use crate::agent_runtime::{run_agent, run_smoke_once};
 use crate::config::{database_url_candidates_for_cli, load_config};
+use crate::protocol_envelope::ProtocolEnvelope;
+use crate::{
+    code, AgentId, ArtifactType, BeadId, RepoId, ResumeContextContract, StageArtifact, SwarmDb,
+    SwarmError, CANONICAL_COORDINATOR_SCHEMA_PATH,
+};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -19,17 +24,11 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
-use swarm::protocol_envelope::ProtocolEnvelope;
-use swarm::{
-    code, AgentId, ArtifactType, BeadId, RepoId, ResumeContextContract, StageArtifact, SwarmDb,
-    SwarmError, CANONICAL_COORDINATOR_SCHEMA_PATH,
-};
 use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
-const EMBEDDED_COORDINATOR_SCHEMA_SQL: &str =
-    include_str!("../crates/swarm-coordinator/schema.sql");
+const EMBEDDED_COORDINATOR_SCHEMA_SQL: &str = include_str!("canonical_schema/schema.sql");
 const EMBEDDED_COORDINATOR_SCHEMA_REF: &str = "embedded:crates/swarm-coordinator/schema.sql";
 const DEFAULT_DB_CONNECT_TIMEOUT_MS: u64 = 3_000;
 const MIN_DB_CONNECT_TIMEOUT_MS: u64 = 100;
@@ -53,13 +52,21 @@ pub struct ProtocolRequest {
 // PARSE INPUT TRAIT
 // ============================================================================
 
+/// Trait for parsing protocol request inputs
 pub trait ParseInput {
     type Input;
+
+    /// Parses a protocol request into the input type
+    ///
+    /// # Errors
+    /// Returns `ParseError` if:
+    /// - Required fields are missing
+    /// - Field validation fails
+    /// - Parsing errors occur
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError>;
 }
 
 #[derive(Debug, thiserror::Error)]
-#[expect(dead_code)]
 pub enum ParseError {
     #[error("Missing required field: {field}")]
     MissingField { field: String },
@@ -79,7 +86,7 @@ pub enum ParseError {
 }
 
 // Implement ParseInput for all contract types
-impl ParseInput for swarm::DoctorInput {
+impl ParseInput for crate::DoctorInput {
     type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
@@ -89,7 +96,7 @@ impl ParseInput for swarm::DoctorInput {
     }
 }
 
-impl ParseInput for swarm::HelpInput {
+impl ParseInput for crate::HelpInput {
     type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
@@ -100,7 +107,7 @@ impl ParseInput for swarm::HelpInput {
     }
 }
 
-impl ParseInput for swarm::StatusInput {
+impl ParseInput for crate::StatusInput {
     type Input = Self;
 
     fn parse_input(_request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
@@ -108,7 +115,7 @@ impl ParseInput for swarm::StatusInput {
     }
 }
 
-impl ParseInput for swarm::AgentInput {
+impl ParseInput for crate::AgentInput {
     type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
@@ -144,7 +151,7 @@ impl ParseInput for swarm::AgentInput {
     }
 }
 
-impl ParseInput for swarm::InitInput {
+impl ParseInput for crate::InitInput {
     type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
@@ -169,7 +176,7 @@ impl ParseInput for swarm::InitInput {
     }
 }
 
-impl ParseInput for swarm::RegisterInput {
+impl ParseInput for crate::RegisterInput {
     type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
@@ -219,7 +226,7 @@ impl ParseInput for swarm::RegisterInput {
     }
 }
 
-impl ParseInput for swarm::ReleaseInput {
+impl ParseInput for crate::ReleaseInput {
     type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
@@ -239,7 +246,7 @@ impl ParseInput for swarm::ReleaseInput {
     }
 }
 
-impl ParseInput for swarm::MonitorInput {
+impl ParseInput for crate::MonitorInput {
     type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
@@ -341,7 +348,7 @@ fn bounded_history_limit(limit: Option<i64>) -> i64 {
     requested.min(MAX_HISTORY_LIMIT)
 }
 
-impl ParseInput for swarm::InitDbInput {
+impl ParseInput for crate::InitDbInput {
     type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
@@ -364,7 +371,7 @@ impl ParseInput for swarm::InitDbInput {
     }
 }
 
-impl ParseInput for swarm::InitLocalDbInput {
+impl ParseInput for crate::InitLocalDbInput {
     type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
@@ -404,7 +411,7 @@ impl ParseInput for swarm::InitLocalDbInput {
     }
 }
 
-impl ParseInput for swarm::BootstrapInput {
+impl ParseInput for crate::BootstrapInput {
     type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
@@ -414,7 +421,7 @@ impl ParseInput for swarm::BootstrapInput {
     }
 }
 
-impl ParseInput for swarm::SpawnPromptsInput {
+impl ParseInput for crate::SpawnPromptsInput {
     type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
@@ -439,7 +446,7 @@ impl ParseInput for swarm::SpawnPromptsInput {
     }
 }
 
-impl ParseInput for swarm::PromptInput {
+impl ParseInput for crate::PromptInput {
     type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
@@ -486,7 +493,7 @@ impl ParseInput for swarm::PromptInput {
     }
 }
 
-impl ParseInput for swarm::SmokeInput {
+impl ParseInput for crate::SmokeInput {
     type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
@@ -502,7 +509,7 @@ impl ParseInput for swarm::SmokeInput {
     }
 }
 
-impl ParseInput for swarm::BatchInput {
+impl ParseInput for crate::BatchInput {
     type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
@@ -522,7 +529,7 @@ impl ParseInput for swarm::BatchInput {
     }
 }
 
-impl ParseInput for swarm::StateInput {
+impl ParseInput for crate::StateInput {
     type Input = Self;
 
     fn parse_input(_request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
@@ -530,7 +537,7 @@ impl ParseInput for swarm::StateInput {
     }
 }
 
-impl ParseInput for swarm::HistoryInput {
+impl ParseInput for crate::HistoryInput {
     type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
@@ -539,7 +546,7 @@ impl ParseInput for swarm::HistoryInput {
     }
 }
 
-impl ParseInput for swarm::LockInput {
+impl ParseInput for crate::LockInput {
     type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
@@ -578,7 +585,7 @@ impl ParseInput for swarm::LockInput {
     }
 }
 
-impl ParseInput for swarm::UnlockInput {
+impl ParseInput for crate::UnlockInput {
     type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
@@ -608,7 +615,7 @@ impl ParseInput for swarm::UnlockInput {
     }
 }
 
-impl ParseInput for swarm::AgentsInput {
+impl ParseInput for crate::AgentsInput {
     type Input = Self;
 
     fn parse_input(_request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
@@ -616,7 +623,7 @@ impl ParseInput for swarm::AgentsInput {
     }
 }
 
-impl ParseInput for swarm::BroadcastInput {
+impl ParseInput for crate::BroadcastInput {
     type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
@@ -646,7 +653,7 @@ impl ParseInput for swarm::BroadcastInput {
     }
 }
 
-impl ParseInput for swarm::LoadProfileInput {
+impl ParseInput for crate::LoadProfileInput {
     type Input = Self;
 
     fn parse_input(request: &ProtocolRequest) -> Result<Self::Input, ParseError> {
@@ -677,6 +684,12 @@ struct BatchAcc {
     items: Vec<Value>,
 }
 
+/// Main protocol loop for processing commands
+///
+/// # Errors
+/// Returns `SwarmError` if:
+/// - I/O errors occur while reading input
+/// - Protocol processing errors occur
 pub async fn run_protocol_loop() -> std::result::Result<(), SwarmError> {
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
@@ -720,6 +733,13 @@ async fn emit_no_input_envelope() -> std::result::Result<(), SwarmError> {
     stdout.write_all(b"\n").await.map_err(SwarmError::IoError)
 }
 
+/// Processes a single protocol line/command
+///
+/// # Errors
+/// Returns `SwarmError` if:
+/// - JSON parsing fails
+/// - Protocol execution fails
+/// - I/O errors occur while writing output
 pub async fn process_protocol_line(line: &str) -> std::result::Result<(), SwarmError> {
     let mut stdout = tokio::io::stdout();
     let started = Instant::now();
@@ -835,44 +855,65 @@ async fn execute_request_no_batch(
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
     validate_request_args(&request)?;
 
-    match request.cmd.as_str() {
-        "?" | "help" => handle_help(&request).await,
-        "state" => handle_state(&request).await,
-        "history" => handle_history(&request).await,
-        "lock" => handle_lock(&request).await,
-        "unlock" => handle_unlock(&request).await,
-        "agents" => handle_agents(&request).await,
-        "broadcast" => handle_broadcast(&request).await,
-        "monitor" => handle_monitor(&request).await,
-        "register" => handle_register(&request).await,
-        "agent" => handle_agent(&request).await,
-        "status" => handle_status(&request).await,
-        "next" => handle_next(&request).await,
-        "claim-next" => handle_claim_next(&request).await,
-        "assign" => handle_assign(&request).await,
-        "run-once" => handle_run_once(&request).await,
-        "qa" => handle_qa(&request).await,
-        "resume" => handle_resume(&request).await,
-        "resume-context" => handle_resume_context(&request).await,
-        "artifacts" => handle_artifacts(&request).await,
-        "release" => handle_release(&request).await,
-        "init-db" => handle_init_db(&request).await,
-        "init-local-db" => handle_init_local_db(&request).await,
-        "spawn-prompts" => handle_spawn_prompts(&request).await,
-        "smoke" => handle_smoke(&request).await,
-        "prompt" => handle_prompt(&request).await,
-        "doctor" => handle_doctor(&request).await,
-        "load-profile" => handle_load_profile(&request).await,
-        "bootstrap" => handle_bootstrap(&request).await,
-        "init" => handle_init(&request).await,
-        other => Err(Box::new(ProtocolEnvelope::error(
-                request.rid.clone(),
-                code::INVALID.to_string(),
-                format!("Unknown command: {other}"),
-            ).with_fix("Use a valid command: init, doctor, status, next, claim-next, assign, run-once, qa, resume, artifacts, resume-context, agent, smoke, prompt, register, release, monitor, init-db, init-local-db, spawn-prompts, batch, bootstrap, state, or ?/help for help".to_string())
-            .with_ctx(json!({"cmd": other})))),
+    dispatch_request(&request).await
+}
+
+async fn dispatch_request(
+    request: &ProtocolRequest,
+) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
+    let cmd = request.cmd.as_str();
+
+    match cmd {
+        "batch" => handle_batch(request).await,
+        other => dispatch_no_batch(request, other).await,
     }
 }
+
+#[allow(clippy::large_stack_frames)]
+async fn dispatch_no_batch(
+    request: &ProtocolRequest,
+    cmd: &str,
+) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
+    match cmd {
+        "?" | "help" => handle_help(request).await,
+        "state" => handle_state(request).await,
+        "history" => handle_history(request).await,
+        "lock" => handle_lock(request).await,
+        "unlock" => handle_unlock(request).await,
+        "agents" => handle_agents(request).await,
+        "broadcast" => handle_broadcast(request).await,
+        "monitor" => handle_monitor(request).await,
+        "register" => handle_register(request).await,
+        "agent" => handle_agent(request).await,
+        "status" => handle_status(request).await,
+        "next" => handle_next(request).await,
+        "claim-next" => handle_claim_next(request).await,
+        "assign" => handle_assign(request).await,
+        "run-once" => handle_run_once(request).await,
+        "qa" => handle_qa(request).await,
+        "resume" => handle_resume(request).await,
+        "resume-context" => handle_resume_context(request).await,
+        "artifacts" => handle_artifacts(request).await,
+        "release" => handle_release(request).await,
+        "init-db" => handle_init_db(request).await,
+        "init-local-db" => handle_init_local_db(request).await,
+        "spawn-prompts" => handle_spawn_prompts(request).await,
+        "smoke" => handle_smoke(request).await,
+        "prompt" => handle_prompt(request).await,
+        "doctor" => handle_doctor(request).await,
+        "load-profile" => handle_load_profile(request).await,
+        "bootstrap" => handle_bootstrap(request).await,
+        "init" => handle_init(request).await,
+        other => Err(Box::new(ProtocolEnvelope::error(
+            request.rid.clone(),
+            code::INVALID.to_string(),
+            format!("Unknown command: {other}"),
+        ).with_fix("Use a valid command: init, doctor, status, next, claim-next, assign, run-ononce, qa, resume, artifacts, resume-context, agent, smoke, prompt, register, release, monitor, init-db, init-local-db, spawn-prompts, batch, bootstrap, state, or ?/help for help".to_string())
+        .with_ctx(json!({"cmd": other}))))
+    }
+}
+
+// Helper functions to reduce stack frame size
 
 fn allowed_command_args(cmd: &str) -> Option<&'static [&'static str]> {
     match cmd {
@@ -1530,7 +1571,7 @@ async fn handle_assign(
         ));
     };
 
-    if agent_state.status.as_str() != "idle" || agent_state.bead_id.is_some() {
+    if agent_state.status().as_str() != "idle" || agent_state.bead_id().is_some() {
         return Err(Box::new(
             ProtocolEnvelope::error(
                 request.rid.clone(),
@@ -1543,8 +1584,8 @@ async fn handle_assign(
             )
             .with_ctx(json!({
                 "agent_id": agent_id,
-                "agent_status": agent_state.status.as_str(),
-                "current_bead": agent_state.bead_id.map(|b| b.value().to_string()),
+                "agent_status": agent_state.status().as_str(),
+                "current_bead": agent_state.bead_id().map(|b| b.value().to_string()),
             })),
         ));
     }
@@ -1918,15 +1959,15 @@ async fn handle_state(
 async fn handle_history(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
-    let input = swarm::HistoryInput::parse_input(request).map_err(|error| {
+    let input = crate::HistoryInput::parse_input(request).map_err(|error| {
         Box::new(
             ProtocolEnvelope::error(
                 request.rid.clone(),
                 code::INVALID.to_string(),
-                error.to_string(),
+                error.clone(),
             )
             .with_fix("echo '{\"cmd\":\"history\",\"limit\":100}' | swarm".to_string())
-            .with_ctx(json!({"error": error.to_string()})),
+            .with_ctx(json!({"error": error})),
         )
     })?;
 
@@ -2295,7 +2336,7 @@ async fn handle_batch(
 async fn handle_monitor(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
-    let input = swarm::MonitorInput::parse_input(request).map_err(|error| {
+    let input = crate::MonitorInput::parse_input(request).map_err(|error| {
         Box::new(
             ProtocolEnvelope::error(
                 request.rid.clone(),
@@ -2410,7 +2451,7 @@ async fn handle_monitor(
                 .await
                 .map_err(|e| to_protocol_failure(e, request.rid.clone()))?
                 .into_iter()
-                .map(|message: swarm::AgentMessage| {
+                .map(|message: crate::AgentMessage| {
                     json!({
                         "id": message.id,
                         "from_agent_id": message.from_agent_id,
@@ -2448,7 +2489,7 @@ async fn handle_monitor(
 async fn handle_register(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
-    let input = swarm::RegisterInput::parse_input(request).map_err(|error| {
+    let input = crate::RegisterInput::parse_input(request).map_err(|error| {
         Box::new(
             ProtocolEnvelope::error(
                 request.rid.clone(),
@@ -2558,7 +2599,7 @@ fn register_agents_recursive<'a>(
 async fn handle_agent(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
-    let input = swarm::AgentInput::parse_input(request).map_err(|e| {
+    let input = crate::AgentInput::parse_input(request).map_err(|e| {
         Box::new(
             ProtocolEnvelope::error(
                 request.rid.clone(),
@@ -2578,9 +2619,7 @@ async fn handle_agent(
         ));
     }
 
-    let config = load_config(None, false)
-        .await
-        .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
+    let config = load_config();
     let db: SwarmDb = db_from_request(request).await?;
     let repo_id = RepoId::from_current_dir().ok_or_else(|| {
         Box::new(
@@ -2920,6 +2959,7 @@ fn artifact_to_json(artifact: &StageArtifact) -> Value {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod artifact_tests {
     use super::*;
     use serde_json::{map::Map, Value};
@@ -3081,7 +3121,7 @@ async fn handle_release(
 async fn handle_init_db(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
-    let input = swarm::InitDbInput::parse_input(request).map_err(|error| {
+    let input = crate::InitDbInput::parse_input(request).map_err(|error| {
         Box::new(
             ProtocolEnvelope::error(
                 request.rid.clone(),
@@ -3294,8 +3334,8 @@ async fn handle_spawn_prompts(
             (text, path.to_string())
         } else {
             let repo_root = current_repo_root().await?;
-            let template_path = swarm::prompts::canonical_agent_prompt_path(&repo_root);
-            let text = swarm::prompts::load_agent_prompt_template(&repo_root)
+            let template_path = crate::prompts::canonical_agent_prompt_path(&repo_root);
+            let text = crate::prompts::load_agent_prompt_template(&repo_root)
                 .await
                 .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
             (text, template_path.to_string_lossy().to_string())
@@ -3366,7 +3406,7 @@ fn spawn_prompts_recursive<'a>(
 async fn handle_prompt(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
-    let input = swarm::PromptInput::parse_input(request).map_err(|error| {
+    let input = crate::PromptInput::parse_input(request).map_err(|error| {
         Box::new(
             ProtocolEnvelope::error(
                 request.rid.clone(),
@@ -3379,7 +3419,7 @@ async fn handle_prompt(
     })?;
 
     if let Some(skill_name) = input.skill.as_deref() {
-        if let Some(prompt) = swarm::skill_prompts::get_skill_prompt(skill_name) {
+        if let Some(prompt) = crate::skill_prompts::get_skill_prompt(skill_name) {
             return Ok(CommandSuccess {
                 data: json!({"skill": skill_name, "prompt": prompt}),
                 next: "swarm monitor --view progress".to_string(),
@@ -3402,7 +3442,7 @@ async fn handle_prompt(
     let id = input.id;
 
     let repo_root = current_repo_root().await?;
-    let prompt = swarm::prompts::get_agent_prompt(&repo_root, id)
+    let prompt = crate::prompts::get_agent_prompt(&repo_root, id)
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
 
@@ -3545,7 +3585,7 @@ async fn handle_load_profile(
     db.seed_idle_agents(agents)
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
-    db.enqueue_backlog_batch("load", agents.saturating_mul(rounds))
+    db.enqueue_backlog_batch(&repo_id, "load", agents.saturating_mul(rounds))
         .await
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
 
@@ -4027,7 +4067,7 @@ async fn minimal_state_for_request(request: &ProtocolRequest) -> Value {
     }
 }
 
-fn minimal_state_from_progress(progress: &swarm::ProgressSummary) -> Value {
+fn minimal_state_from_progress(progress: &crate::ProgressSummary) -> Value {
     json!({
         "total": progress.total_agents,
         "active": progress.working + progress.waiting + progress.errors,
@@ -4115,6 +4155,7 @@ fn compose_database_url_candidates(
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod database_candidate_tests {
     use super::{
         compose_database_url_candidates, parse_database_connect_timeout_ms,
@@ -4209,6 +4250,7 @@ mod database_candidate_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod history_limit_tests {
     use super::{bounded_history_limit, DEFAULT_HISTORY_LIMIT, MAX_HISTORY_LIMIT};
 
@@ -4229,6 +4271,7 @@ mod history_limit_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod register_input_tests {
     use super::{ParseInput, ProtocolRequest, MAX_REGISTER_COUNT};
     use serde_json::{json, Map, Value};
@@ -4248,14 +4291,14 @@ mod register_input_tests {
     fn register_input_rejects_zero_count() {
         let request = request_with_count(json!(0));
         let err =
-            swarm::RegisterInput::parse_input(&request).expect_err("count=0 should be rejected");
+            crate::RegisterInput::parse_input(&request).expect_err("count=0 should be rejected");
         assert!(err.to_string().contains("must be greater than 0"));
     }
 
     #[test]
     fn register_input_rejects_negative_count() {
         let request = request_with_count(json!(-2));
-        let err = swarm::RegisterInput::parse_input(&request)
+        let err = crate::RegisterInput::parse_input(&request)
             .expect_err("negative count should be rejected");
         assert!(err.to_string().contains("must be greater than 0"));
     }
@@ -4264,20 +4307,21 @@ mod register_input_tests {
     fn register_input_accepts_positive_count() {
         let request = request_with_count(json!(2));
         let parsed =
-            swarm::RegisterInput::parse_input(&request).expect("positive count should be accepted");
+            crate::RegisterInput::parse_input(&request).expect("positive count should be accepted");
         assert_eq!(parsed.count, Some(2));
     }
 
     #[test]
     fn register_input_rejects_count_above_maximum() {
         let request = request_with_count(json!(MAX_REGISTER_COUNT + 1));
-        let err = swarm::RegisterInput::parse_input(&request)
+        let err = crate::RegisterInput::parse_input(&request)
             .expect_err("count above max should be rejected");
         assert!(err.to_string().contains("less than or equal to"));
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod init_db_input_tests {
     use super::{ParseInput, ProtocolRequest};
     use serde_json::{json, Map};
@@ -4296,7 +4340,7 @@ mod init_db_input_tests {
     #[test]
     fn init_db_input_rejects_negative_seed_agents() {
         let request = request_with_seed_agents(json!(-1));
-        let err = swarm::InitDbInput::parse_input(&request)
+        let err = crate::InitDbInput::parse_input(&request)
             .expect_err("negative seed_agents should be rejected");
         assert!(err.to_string().contains("must be non-negative"));
     }
@@ -4305,12 +4349,13 @@ mod init_db_input_tests {
     fn init_db_input_accepts_zero_seed_agents() {
         let request = request_with_seed_agents(json!(0));
         let parsed =
-            swarm::InitDbInput::parse_input(&request).expect("zero seed_agents should be accepted");
+            crate::InitDbInput::parse_input(&request).expect("zero seed_agents should be accepted");
         assert_eq!(parsed.seed_agents, Some(0));
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod stream_capture_tests {
     use super::capture_stream_limited;
     use tokio::io::{AsyncWriteExt, DuplexStream};

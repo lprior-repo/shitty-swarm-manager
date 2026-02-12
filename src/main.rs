@@ -5,15 +5,11 @@
 #![warn(clippy::nursery)]
 #![forbid(unsafe_code)]
 
-mod agent_runtime;
-mod agent_runtime_support;
-mod config;
-mod protocol_runtime;
+use swarm::protocol_runtime;
 
 use serde_json::json;
 use std::env;
 use swarm::protocol_envelope::ProtocolEnvelope;
-use swarm::CliError;
 use swarm::SwarmError;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -190,6 +186,18 @@ pub enum CliCommand {
     Json(String),
 }
 
+#[derive(Debug, Clone, thiserror::Error)]
+enum CliError {
+    #[error("Missing required argument: {}", arg)]
+    MissingRequiredArg { arg: String },
+    #[error("Unknown command: {}", cmd)]
+    UnknownCommand { cmd: String },
+    #[error("Invalid argument type for {}", arg)]
+    InvalidArgType { arg: String },
+    #[error("Invalid argument value for {}: {}", arg, error)]
+    InvalidArgValue { arg: String, error: String },
+}
+
 #[derive(Debug, Clone)]
 enum CliAction {
     ShowHelp,
@@ -214,8 +222,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction, CliError> {
         Some("--json") => {
             if args.len() < 2 {
                 Err(CliError::MissingRequiredArg {
-                    arg_name: "command".to_string(),
-                    usage: "--json <command>".to_string(),
+                    arg: "command".to_string(),
                 })
             } else {
                 Ok(CliAction::Command(CliCommand::Json(args[1].clone())))
@@ -431,8 +438,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliAction, CliError> {
         }
 
         Some(cmd) => Err(CliError::UnknownCommand {
-            command: cmd.to_string(),
-            suggestions: suggest_commands(cmd),
+            cmd: cmd.to_string(),
         }),
     }
 }
@@ -755,31 +761,26 @@ where
     let flag = format!("--{}", name.replace('_', "-"));
     let Some(position) = args.iter().position(|a| a.as_str() == flag) else {
         return Err(CliError::MissingRequiredArg {
-            arg_name: name.to_string(),
-            usage: format!("--{} <value>", name.replace('_', "-")),
+            arg: name.to_string(),
         });
     };
 
     let Some(raw_value) = args.get(position + 1) else {
         return Err(CliError::MissingRequiredArg {
-            arg_name: name.to_string(),
-            usage: format!("--{} <value>", name.replace('_', "-")),
+            arg: name.to_string(),
         });
     };
 
     if raw_value.starts_with("--") {
         return Err(CliError::MissingRequiredArg {
-            arg_name: name.to_string(),
-            usage: format!("--{} <value>", name.replace('_', "-")),
+            arg: name.to_string(),
         });
     }
 
     raw_value
         .parse::<T>()
         .map_err(|_e| CliError::InvalidArgType {
-            arg_name: name.to_string(),
-            got: raw_value.clone(),
-            expected: std::any::type_name::<T>().to_string(),
+            arg: name.to_string(),
         })
 }
 
@@ -804,9 +805,8 @@ where
                     .parse::<T>()
                     .map(Some)
                     .map_err(|e| CliError::InvalidArgValue {
-                        arg_name: name.to_string(),
-                        value: format!("{e}"),
-                        expected: std::any::type_name::<T>().to_string(),
+                        arg: name.to_string(),
+                        error: format!("{e}"),
                     });
             }
 
@@ -814,15 +814,13 @@ where
                 .map(|v| {
                     if v.starts_with("--") {
                         return Err(CliError::MissingRequiredArg {
-                            arg_name: name.to_string(),
-                            usage: format!("--{} <value>", name.replace('_', "-")),
+                            arg: name.to_string(),
                         });
                     }
 
                     v.parse::<T>().map_err(|e| CliError::InvalidArgValue {
-                        arg_name: name.to_string(),
-                        value: format!("{e}"),
-                        expected: std::any::type_name::<T>().to_string(),
+                        arg: name.to_string(),
+                        error: format!("{e}"),
                     })
                 })
                 .transpose()
@@ -841,12 +839,7 @@ fn ensure_no_unknown_flags(args: &[String], allowed_flags: &[&str]) -> Result<()
         })
         .cloned();
 
-    invalid.map_or(Ok(()), |flag| {
-        Err(CliError::UnknownCommand {
-            command: flag,
-            suggestions: Vec::new(),
-        })
-    })
+    invalid.map_or(Ok(()), |flag| Err(CliError::UnknownCommand { cmd: flag }))
 }
 
 fn suggest_commands(typo: &str) -> Vec<String> {
@@ -904,11 +897,8 @@ async fn main() {
         Ok(a) => a,
         Err(err) => {
             eprintln!("Error: {err}");
-            if let CliError::UnknownCommand {
-                command: _,
-                suggestions,
-            } = &err
-            {
+            if let CliError::UnknownCommand { cmd } = &err {
+                let suggestions = suggest_commands(cmd);
                 if let Some(suggestion) = suggestions.first() {
                     eprintln!("Did you mean: {suggestion}?");
                 }

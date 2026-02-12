@@ -210,7 +210,7 @@ async fn execute_implement_stage(
     let previous_attempts = db
         .get_agent_state(agent_id)
         .await?
-        .map_or(0, |state| state.implementation_attempt);
+        .map_or(0, |state| state.implementation_attempt());
 
     let retry_packet_context = if previous_attempts > 0 {
         match db
@@ -382,6 +382,7 @@ fn format_retry_packet(payload: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use crate::stage_executors::execute_implement_stage;
     use crate::types::{ArtifactType, BeadId, RepoId};
@@ -389,7 +390,7 @@ mod tests {
     use sqlx::PgPool;
 
     async fn setup_schema(db: &SwarmDb) {
-        db.initialize_schema_from_sql(include_str!("../crates/swarm-coordinator/schema.sql"))
+        db.initialize_schema_from_sql(include_str!("../swarm_state.sql"))
             .await
             .expect("Failed to initialize schema");
     }
@@ -400,8 +401,9 @@ mod tests {
         agent_id: &AgentId,
     ) -> i64 {
         sqlx::query_scalar::<_, i64>(
-            "INSERT INTO stage_history (agent_id, bead_id, stage, attempt_number, status, started_at)\n             VALUES ($1, $2, 'implement', 1, 'started', NOW())\n             RETURNING id",
+            "INSERT INTO stage_history (repo_id, agent_id, bead_id, stage, attempt_number, status, started_at)\n             VALUES ($1, $2, $3, 'implement', 1, 'started', NOW())\n             RETURNING id",
         )
+        .bind(agent_id.repo_id().value())
         .bind(agent_id.number().cast_signed())
         .bind(bead_id.value())
         .fetch_one(pool)

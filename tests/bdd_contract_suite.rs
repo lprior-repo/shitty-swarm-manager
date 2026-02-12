@@ -247,19 +247,19 @@ fn given_mixed_batch_when_processed_then_reports_pass_and_fail_contract() -> Res
             scenario.output
         ));
     }
-    if scenario.output["d"]["summary"]["total"] != Value::from(2) {
+    if scenario.output["d"]["summary"]["total"] != 2 {
         return Err(format!(
             "expected summary total=2 for mixed batch, got: {}",
             scenario.output
         ));
     }
-    if scenario.output["d"]["summary"]["pass"] != Value::from(1) {
+    if scenario.output["d"]["summary"]["pass"] != 1 {
         return Err(format!(
             "expected summary pass=1 for mixed batch, got: {}",
             scenario.output
         ));
     }
-    if scenario.output["d"]["summary"]["fail"] != Value::from(1) {
+    if scenario.output["d"]["summary"]["fail"] != 1 {
         return Err(format!(
             "expected summary fail=1 for mixed batch, got: {}",
             scenario.output

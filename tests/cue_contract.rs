@@ -9,7 +9,7 @@ fn protocol_response_validates_against_cue_schema_when_cue_is_available() -> Res
         .arg("command -v cue")
         .output()
         .map(|output| output.status.success())
-        .map_or_else(|_| false, |value| value);
+        .unwrap_or_else(|_| false);
 
     if !cue_available {
         return Ok(());
