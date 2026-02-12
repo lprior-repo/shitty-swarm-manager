@@ -43,11 +43,8 @@ pub trait AssignPorts {
         bead_id: &'a str,
     ) -> PortFuture<'a, bool>;
 
-    fn release_agent<'a>(
-        &'a self,
-        repo_id: &'a RuntimeRepoId,
-        agent_id: u32,
-    ) -> PortFuture<'a, ()>;
+    fn release_agent<'a>(&'a self, repo_id: &'a RuntimeRepoId, agent_id: u32)
+        -> PortFuture<'a, ()>;
 
     fn br_assign_in_progress<'a>(
         &'a self,

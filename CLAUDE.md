@@ -109,27 +109,82 @@ moon run :check      # Fast type check
 ### AI Mission & Guidelines
 See **[MISSION.md](MISSION.md)** for the high-level mission statement, operating principles, and detailed pipeline guidance for autonomous agents.
 
-### Project Structure
+### Architecture at a Glance
+
 ```
-src/
-├── main.rs              # Binary entry point
-├── lib.rs               # Library exports
-├── config.rs            # Configuration loading
-├── agent_runtime.rs     # Agent execution logic
-├── types.rs             # Type definitions
-├── error.rs             # Error types
-└── db/                  # Database layer
-    ├── mod.rs           # Database module
-    ├── mappers.rs       # Row/Entity mappers
-    ├── read_ops.rs      # Read operations
-    └── write_ops.rs     # Write operations
+┌─────────────────────────────────────────────────────────────────┐
+│                     PostgreSQL Database                          │
+│     bead_claims │ agent_state │ stage_history │ artifacts       │
+└─────────────────────────────────────────────────────────────────┘
+                            │
+     ┌──────────────────────┼──────────────────────┐
+     │                      │                      │
+┌────▼────┐           ┌────▼────┐           ┌────▼────┐
+│ Agent 1 │           │ Agent 2 │     ...   │ Agent N │
+└────┬────┘           └────┬────┘           └────┬────┘
+     │                      │                      │
+     └──────────────────────┼──────────────────────┘
+                            │
+              ┌─────────────▼─────────────┐
+              │   4-Stage Pipeline        │
+              │  rust-contract → implement│
+              │  → qa-enforcer → red-queen│
+              └───────────────────────────┘
 ```
 
-### Core Types
-- **Agent**: Represents an autonomous agent in the swarm
-- **Task**: Work units assigned to agents
-- **AgentStatus**: Agent lifecycle states (idle, active, failed, etc.)
-- **SwarmDb**: Database abstraction layer
+### Project Structure (43 files across 8 modules)
+
+```
+src/
+├── main.rs                    # Binary entry point
+├── lib.rs                     # Library exports
+├── config.rs                  # Configuration loading
+├── error.rs                   # Error types
+│
+├── ddd.rs                     # Domain entities (Agent, Bead, Stage)
+├── agent_runtime.rs           # Agent lifecycle + stage transitions
+├── agent_runtime_support.rs   # Runtime helpers
+│
+├── orchestrator_service/      # High-level orchestration
+│   ├── orchestrator.rs        # Main orchestrator
+│   ├── claim_next.rs          # Bead claiming
+│   ├── assign.rs              # Assignment logic
+│   └── run_once.rs            # Single execution
+│
+├── protocol_runtime/          # JSONL protocol handling
+│   ├── handlers/              # Command handlers
+│   │   └── orchestration/     # Orchestration handlers
+│   └── input_parsing/         # Input parsers (contract, A, B)
+│
+├── stage_executors/           # Pipeline stage implementations
+│   ├── contract_stage.rs      # Design-by-contract
+│   ├── implement_stage.rs     # Code generation
+│   └── gate_stage.rs          # QA + Red Queen
+│
+├── skill_execution.rs         # AI skill execution engine
+├── skill_execution_parsing.rs # Skill result parsing
+│
+├── types/                     # Core type definitions
+│   ├── identifiers.rs         # AgentId, BeadId, RepoId
+│   ├── state.rs               # AgentState, SwarmStatus
+│   ├── stage.rs               # Stage definitions
+│   └── artifacts.rs           # Stage artifacts
+│
+├── db/                        # Database layer
+│   ├── swarm_db.rs            # Connection + queries
+│   ├── read_ops.rs            # Read operations
+│   ├── write_ops.rs           # Write operations
+│   └── mappers.rs             # Row → Entity mapping
+│
+└── canonical_schema/          # SQL schema
+    └── schema.sql             # PostgreSQL DDL
+```
+
+### Core Domain Types
+- **Agent**: Autonomous worker with lifecycle (Idle → Working → Done)
+- **Bead**: Canonical unit of work with priority (P0/P1/P2)
+- **Stage**: Pipeline phase (RustContract → Implement → QaEnforcer → RedQueen → Done)
+- **SwarmDb**: Database abstraction with repositories
 
 ### Protocol Commands
 

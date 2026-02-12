@@ -1,2 +1,14 @@
+pub(super) mod agent_lifecycle;
 pub(super) mod artifacts;
+pub(super) mod batch_ops;
+pub(super) mod doctor;
+pub(super) mod load_profile;
+pub(super) mod lock_ops;
+pub(super) mod messaging_ops;
+pub(super) mod monitoring;
 pub(super) mod orchestration;
+pub(super) mod prompts;
+pub(super) mod qa_ops;
+pub(super) mod resume;
+pub(super) mod state_ops;
+pub(super) mod swarm_ops;

@@ -7,7 +7,10 @@
 
 pub mod beads_sync;
 pub mod canonical_schema;
+pub mod cli;
 pub mod ddd;
+pub mod domain;
+pub mod infrastructure;
 
 pub use beads_sync::{
     map_terminal_sync_state, BrSyncAction, BrSyncDecision, BrSyncDivergence, BrSyncStatus,

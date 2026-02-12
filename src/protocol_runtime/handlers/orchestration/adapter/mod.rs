@@ -1,85 +1,49 @@
-use super::super::super::{
-    db_from_request, handle_agent, handle_doctor, handle_monitor, handle_status,
-    run_external_json_command, ProtocolRequest,
+#![allow(clippy::all)]
+#![allow(dead_code)]
+#![allow(unused_imports)]
+
+mod agent_adapter;
+mod external_command;
+mod monitor_adapter;
+
+pub(in crate::protocol_runtime) use agent_adapter::{
+    build_agent_request, claim_bead, load_agent_snapshot, release_agent, run_agent,
+    runtime_status_from_db_status,
 };
-use super::claim_next::handle_claim_next;
-use super::helpers::protocol_failure_to_swarm_error;
+pub(in crate::protocol_runtime) use external_command::{
+    br_assign_in_progress, br_show_bead, br_update_in_progress, bv_robot_next, claim_next, doctor,
+    status,
+};
+pub(in crate::protocol_runtime) use monitor_adapter::{
+    build_monitor_progress_request, monitor_progress,
+};
+
+use super::super::super::ProtocolRequest;
 use crate::orchestrator_service::{
     AssignAgentSnapshot, AssignPorts, ClaimNextPorts, PortFuture, RunOncePorts,
 };
-use crate::{AgentId, BeadId, RepoId, RuntimeAgentStatus, RuntimeRepoId};
-use serde_json::{Map, Value};
+use crate::RuntimeRepoId;
 
 #[derive(Clone)]
-pub(super) struct ProtocolCommandAdapter {
+pub(in crate::protocol_runtime) struct ProtocolCommandAdapter {
     request: ProtocolRequest,
 }
 
 impl ProtocolCommandAdapter {
-    pub(super) fn new(request: &ProtocolRequest) -> Self {
+    pub(in crate::protocol_runtime) fn new(request: &ProtocolRequest) -> Self {
         Self {
             request: request.clone(),
         }
     }
 }
 
-fn runtime_status_from_db_status(status: &str) -> RuntimeAgentStatus {
-    match status {
-        "idle" => RuntimeAgentStatus::Idle,
-        "working" => RuntimeAgentStatus::Working,
-        "waiting" => RuntimeAgentStatus::Waiting,
-        "done" => RuntimeAgentStatus::Done,
-        _ => RuntimeAgentStatus::Error,
-    }
-}
-
-fn build_agent_request(rid: Option<String>, agent_id: u32) -> ProtocolRequest {
-    ProtocolRequest {
-        cmd: "agent".to_string(),
-        rid,
-        dry: Some(false),
-        args: Map::from_iter(vec![("id".to_string(), Value::from(agent_id))]),
-    }
-}
-
-fn build_monitor_progress_request(rid: Option<String>) -> ProtocolRequest {
-    ProtocolRequest {
-        cmd: "monitor".to_string(),
-        rid,
-        dry: Some(false),
-        args: Map::from_iter(vec![(
-            "view".to_string(),
-            Value::String("progress".to_string()),
-        )]),
-    }
-}
-
 impl ClaimNextPorts for ProtocolCommandAdapter {
-    fn bv_robot_next(&self) -> PortFuture<'_, Value> {
-        Box::pin(async move {
-            run_external_json_command(
-                "bv",
-                &["--robot-next"],
-                self.request.rid.clone(),
-                "Run `bv --robot-next` manually and verify beads index is available",
-            )
-            .await
-            .map(|payload| super::super::super::project_next_recommendation(&payload))
-            .map_err(|failure| protocol_failure_to_swarm_error(*failure))
-        })
+    fn bv_robot_next(&self) -> PortFuture<'_, serde_json::Value> {
+        bv_robot_next(&self.request)
     }
 
-    fn br_update_in_progress<'a>(&'a self, bead_id: &'a str) -> PortFuture<'a, Value> {
-        Box::pin(async move {
-            run_external_json_command(
-                "br",
-                &["update", bead_id, "--status", "in_progress", "--json"],
-                self.request.rid.clone(),
-                "Run `br update <bead-id> --status in_progress --json` manually",
-            )
-            .await
-            .map_err(|failure| protocol_failure_to_swarm_error(*failure))
-        })
+    fn br_update_in_progress<'a>(&'a self, bead_id: &'a str) -> PortFuture<'a, serde_json::Value> {
+        br_update_in_progress(&self.request, bead_id)
     }
 }
 
@@ -89,46 +53,11 @@ impl AssignPorts for ProtocolCommandAdapter {
         repo_id: &'a RuntimeRepoId,
         agent_id: u32,
     ) -> PortFuture<'a, Option<AssignAgentSnapshot>> {
-        Box::pin(async move {
-            let db = db_from_request(&self.request)
-                .await
-                .map_err(|failure| protocol_failure_to_swarm_error(*failure))?;
-            let repo = RepoId::new(repo_id.value());
-            let valid_ids = db
-                .get_available_agents(&repo)
-                .await
-                .map(|agents| {
-                    agents
-                        .into_iter()
-                        .map(|agent| agent.agent_id)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let agent_key = AgentId::new(repo.clone(), agent_id);
-            let state = db.get_agent_state(&agent_key).await?;
-
-            Ok(state.map(|agent_state| {
-                let status = runtime_status_from_db_status(agent_state.status().as_str());
-                AssignAgentSnapshot {
-                    valid_ids,
-                    status,
-                    current_bead: agent_state.bead_id().map(|bead| bead.value().to_string()),
-                }
-            }))
-        })
+        load_agent_snapshot(&self.request, repo_id, agent_id)
     }
 
-    fn br_show_bead<'a>(&'a self, bead_id: &'a str) -> PortFuture<'a, Value> {
-        Box::pin(async move {
-            run_external_json_command(
-                "br",
-                &["show", bead_id, "--json"],
-                self.request.rid.clone(),
-                "Run `br show <bead-id> --json` and verify bead exists",
-            )
-            .await
-            .map_err(|failure| protocol_failure_to_swarm_error(*failure))
-        })
+    fn br_show_bead<'a>(&'a self, bead_id: &'a str) -> PortFuture<'a, serde_json::Value> {
+        br_show_bead(&self.request, bead_id)
     }
 
     fn claim_bead<'a>(
@@ -137,15 +66,7 @@ impl AssignPorts for ProtocolCommandAdapter {
         agent_id: u32,
         bead_id: &'a str,
     ) -> PortFuture<'a, bool> {
-        Box::pin(async move {
-            let db = db_from_request(&self.request)
-                .await
-                .map_err(|failure| protocol_failure_to_swarm_error(*failure))?;
-            let repo = RepoId::new(repo_id.value());
-            let agent_key = AgentId::new(repo, agent_id);
-            db.claim_bead(&agent_key, &BeadId::new(bead_id.to_string()))
-                .await
-        })
+        claim_bead(&self.request, repo_id, agent_id, bead_id)
     }
 
     fn release_agent<'a>(
@@ -153,88 +74,37 @@ impl AssignPorts for ProtocolCommandAdapter {
         repo_id: &'a RuntimeRepoId,
         agent_id: u32,
     ) -> PortFuture<'a, ()> {
-        Box::pin(async move {
-            let db = db_from_request(&self.request)
-                .await
-                .map_err(|failure| protocol_failure_to_swarm_error(*failure))?;
-            let repo = RepoId::new(repo_id.value());
-            let agent_key = AgentId::new(repo, agent_id);
-            db.release_agent(&agent_key).await.map(|_| ())
-        })
+        release_agent(&self.request, repo_id, agent_id)
     }
 
     fn br_assign_in_progress<'a>(
         &'a self,
         bead_id: &'a str,
         assignee: &'a str,
-    ) -> PortFuture<'a, Value> {
-        Box::pin(async move {
-            run_external_json_command(
-                "br",
-                &[
-                    "update",
-                    bead_id,
-                    "--status",
-                    "in_progress",
-                    "--assignee",
-                    assignee,
-                    "--json",
-                ],
-                self.request.rid.clone(),
-                "Run `br update <bead-id> --status in_progress --assignee swarm-agent-<id> --json` manually",
-            )
-            .await
-            .map_err(|failure| protocol_failure_to_swarm_error(*failure))
-        })
+    ) -> PortFuture<'a, serde_json::Value> {
+        br_assign_in_progress(&self.request, bead_id, assignee)
     }
 }
 
 impl RunOncePorts for ProtocolCommandAdapter {
-    fn doctor(&self) -> PortFuture<'_, Value> {
-        Box::pin(async move {
-            handle_doctor(&self.request)
-                .await
-                .map(|success| success.data)
-                .map_err(|failure| protocol_failure_to_swarm_error(*failure))
-        })
+    fn doctor(&self) -> PortFuture<'_, serde_json::Value> {
+        doctor(&self.request)
     }
 
-    fn status(&self) -> PortFuture<'_, Value> {
-        Box::pin(async move {
-            handle_status(&self.request)
-                .await
-                .map(|success| success.data)
-                .map_err(|failure| protocol_failure_to_swarm_error(*failure))
-        })
+    fn status(&self) -> PortFuture<'_, serde_json::Value> {
+        status(&self.request)
     }
 
-    fn claim_next(&self) -> PortFuture<'_, Value> {
-        Box::pin(async move {
-            handle_claim_next(&self.request)
-                .await
-                .map(|success| success.data)
-                .map_err(|failure| protocol_failure_to_swarm_error(*failure))
-        })
+    fn claim_next(&self) -> PortFuture<'_, serde_json::Value> {
+        claim_next(&self.request)
     }
 
-    fn run_agent(&self, agent_id: u32) -> PortFuture<'_, Value> {
-        Box::pin(async move {
-            let request = build_agent_request(self.request.rid.clone(), agent_id);
-            handle_agent(&request)
-                .await
-                .map(|success| success.data)
-                .map_err(|failure| protocol_failure_to_swarm_error(*failure))
-        })
+    fn run_agent(&self, agent_id: u32) -> PortFuture<'_, serde_json::Value> {
+        run_agent(&self.request, agent_id)
     }
 
-    fn monitor_progress(&self) -> PortFuture<'_, Value> {
-        Box::pin(async move {
-            let request = build_monitor_progress_request(self.request.rid.clone());
-            handle_monitor(&request)
-                .await
-                .map(|success| success.data)
-                .map_err(|failure| protocol_failure_to_swarm_error(*failure))
-        })
+    fn monitor_progress(&self) -> PortFuture<'_, serde_json::Value> {
+        monitor_progress(&self.request)
     }
 }
 
@@ -429,8 +299,8 @@ mod tests {
     mod load_agent_snapshot_tests {
         use super::*;
 
-        fn create_test_request() -> super::super::ProtocolRequest {
-            super::super::ProtocolRequest {
+        fn create_test_request() -> crate::protocol_runtime::ProtocolRequest {
+            crate::protocol_runtime::ProtocolRequest {
                 cmd: "assign".to_string(),
                 rid: Some("test-rid".to_string()),
                 dry: Some(false),
@@ -470,7 +340,7 @@ mod tests {
             let snapshot = state
                 .map(|s| {
                     let status = runtime_status_from_db_status(s.status().as_str());
-                    super::super::AssignAgentSnapshot {
+                    crate::orchestrator_service::AssignAgentSnapshot {
                         valid_ids: valid_ids.clone(),
                         status,
                         current_bead: s.bead_id().map(|b| b.value().to_string()),
@@ -699,6 +569,7 @@ mod tests {
 
     mod external_command_error_handling_tests {
         use crate::protocol_envelope::ProtocolEnvelope;
+        use crate::protocol_runtime::run_external_json_command;
         use std::time::Duration;
 
         #[tokio::test]
@@ -711,7 +582,7 @@ mod tests {
 
             let result = tokio::time::timeout(
                 Duration::from_millis(timeout_ms * 2),
-                super::super::run_external_json_command(program, args, rid.clone(), fix),
+                run_external_json_command(program, args, rid.clone(), fix),
             )
             .await;
 
@@ -725,8 +596,7 @@ mod tests {
             let rid = Some("exit-code-test".to_string());
             let fix = "Check command syntax and try again";
 
-            let result =
-                super::super::run_external_json_command(program, args, rid.clone(), fix).await;
+            let result = run_external_json_command(program, args, rid.clone(), fix).await;
 
             assert!(result.is_err());
             let err = result.unwrap_err();
@@ -742,8 +612,7 @@ mod tests {
             let rid = Some("malformed-json-test".to_string());
             let fix = "Verify command outputs valid JSON";
 
-            let result =
-                super::super::run_external_json_command(program, args, rid.clone(), fix).await;
+            let result = run_external_json_command(program, args, rid.clone(), fix).await;
 
             assert!(result.is_err());
             let err = result.unwrap_err();
@@ -759,8 +628,7 @@ mod tests {
             let rid = Some("valid-json-test".to_string());
             let fix = "";
 
-            let result =
-                super::super::run_external_json_command(program, args, rid.clone(), fix).await;
+            let result = run_external_json_command(program, args, rid.clone(), fix).await;
 
             assert!(result.is_ok());
             let value = result.unwrap();
@@ -774,8 +642,7 @@ mod tests {
             let rid = Some("nonexistent-program".to_string());
             let fix = "Verify the command is installed and in PATH";
 
-            let result =
-                super::super::run_external_json_command(program, args, rid.clone(), fix).await;
+            let result = run_external_json_command(program, args, rid.clone(), fix).await;
 
             assert!(result.is_err());
             let err = result.unwrap_err();

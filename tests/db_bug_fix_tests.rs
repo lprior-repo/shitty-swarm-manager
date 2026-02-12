@@ -3,9 +3,7 @@
 //
 // Functional Rust approach: zero unwrap, zero panic, explicit error handling
 
-use shitty_swarm_manager::{
-    AgentId, BeadId, RepoId, SwarmDb,
-};
+use shitty_swarm_manager::{AgentId, BeadId, RepoId, SwarmDb};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 
@@ -61,16 +59,22 @@ async fn bug1_concurrent_claims_use_for_update_lock() {
     reset_schema(&db).await;
 
     let repo_id = RepoId::new("bug1-repo");
-    db.register_repo(&repo_id, "test", "test").await
+    db.register_repo(&repo_id, "test", "test")
+        .await
         .expect("register_repo failed");
 
     let agent1 = AgentId::new(&repo_id, 1);
     let agent2 = AgentId::new(&repo_id, 2);
-    db.register_agent(&agent1).await.expect("register agent1 failed");
-    db.register_agent(&agent2).await.expect("register agent2 failed");
+    db.register_agent(&agent1)
+        .await
+        .expect("register agent1 failed");
+    db.register_agent(&agent2)
+        .await
+        .expect("register agent2 failed");
 
     let bead_id = BeadId::new("bug1-bead");
-    db.enqueue_backlog_batch(&repo_id, "bug1", 1).await
+    db.enqueue_backlog_batch(&repo_id, "bug1", 1)
+        .await
         .expect("enqueue failed");
 
     // Attempt concurrent claims
@@ -98,11 +102,14 @@ async fn bug2_mark_landing_retryable_is_transactional() {
     reset_schema(&db).await;
 
     let repo_id = RepoId::new("bug2-repo");
-    db.register_repo(&repo_id, "test", "test").await
+    db.register_repo(&repo_id, "test", "test")
+        .await
         .expect("register_repo failed");
 
     let agent = AgentId::new(&repo_id, 1);
-    db.register_agent(&agent).await.expect("register_agent failed");
+    db.register_agent(&agent)
+        .await
+        .expect("register_agent failed");
 
     let bead_id = BeadId::new("bug2-bead");
 
@@ -140,7 +147,7 @@ async fn bug2_mark_landing_retryable_is_transactional() {
 
     // Verify agent is in waiting state
     let row = sqlx::query::<_, (String,)>(
-        "SELECT status FROM agent_state WHERE repo_id = $1 AND agent_id = $2"
+        "SELECT status FROM agent_state WHERE repo_id = $1 AND agent_id = $2",
     )
     .bind(repo_id.value())
     .bind(1)
@@ -158,11 +165,14 @@ async fn bug4_release_agent_has_no_duplicate_update() {
     reset_schema(&db).await;
 
     let repo_id = RepoId::new("bug4-repo");
-    db.register_repo(&repo_id, "test", "test").await
+    db.register_repo(&repo_id, "test", "test")
+        .await
         .expect("register_repo failed");
 
     let agent = AgentId::new(&repo_id, 1);
-    db.register_agent(&agent).await.expect("register_agent failed");
+    db.register_agent(&agent)
+        .await
+        .expect("register_agent failed");
 
     let bead_id = BeadId::new("bug4-bead");
 
@@ -199,7 +209,7 @@ async fn bug4_release_agent_has_no_duplicate_update() {
 
     // Verify agent reset happened
     let row = sqlx::query::<_, (String, Option<String>)>(
-        "SELECT status, bead_id FROM agent_state WHERE repo_id = $1 AND agent_id = $2"
+        "SELECT status, bead_id FROM agent_state WHERE repo_id = $1 AND agent_id = $2",
     )
     .bind(repo_id.value())
     .bind(1)
@@ -218,27 +228,29 @@ async fn bug7_schema_constraints_prevent_negative_agent_ids() {
     reset_schema(&db).await;
 
     let repo_id = RepoId::new("bug7-repo");
-    db.register_repo(&repo_id, "test", "test").await
+    db.register_repo(&repo_id, "test", "test")
+        .await
         .expect("register_repo failed");
 
     // When: Insert negative agent_id
-    let result = sqlx::query(
-        "INSERT INTO agent_state (repo_id, agent_id, status) VALUES ($1, -1, 'idle')"
-    )
-    .bind(repo_id.value())
-    .execute(db.pool())
-    .await;
+    let result =
+        sqlx::query("INSERT INTO agent_state (repo_id, agent_id, status) VALUES ($1, -1, 'idle')")
+            .bind(repo_id.value())
+            .execute(db.pool())
+            .await;
 
     // Then: Should violate CHECK constraint
-    assert!(result.is_err(), "Negative agent_id should fail CHECK constraint");
+    assert!(
+        result.is_err(),
+        "Negative agent_id should fail CHECK constraint"
+    );
 
     // When: Insert valid agent_id
-    let result = sqlx::query(
-        "INSERT INTO agent_state (repo_id, agent_id, status) VALUES ($1, 1, 'idle')"
-    )
-    .bind(repo_id.value())
-    .execute(db.pool())
-    .await;
+    let result =
+        sqlx::query("INSERT INTO agent_state (repo_id, agent_id, status) VALUES ($1, 1, 'idle')")
+            .bind(repo_id.value())
+            .execute(db.pool())
+            .await;
 
     // Then: Should succeed
     assert!(result.is_ok(), "Valid agent_id should succeed");
@@ -255,21 +267,27 @@ async fn contract_claim_bead_has_ownership_invariant() {
     reset_schema(&db).await;
 
     let repo_id = RepoId::new("contract-repo");
-    db.register_repo(&repo_id, "test", "test").await
+    db.register_repo(&repo_id, "test", "test")
+        .await
         .expect("register_repo failed");
 
     let agent1 = AgentId::new(&repo_id, 1);
     let agent2 = AgentId::new(&repo_id, 2);
-    db.register_agent(&agent1).await.expect("register agent1 failed");
-    db.register_agent(&agent2).await.expect("register agent2 failed");
+    db.register_agent(&agent1)
+        .await
+        .expect("register agent1 failed");
+    db.register_agent(&agent2)
+        .await
+        .expect("register agent2 failed");
 
     let bead_id = BeadId::new("contract-bead");
-    db.enqueue_backlog_batch(&repo_id, "contract", 1).await
+    db.enqueue_backlog_batch(&repo_id, "contract", 1)
+        .await
         .expect("enqueue failed");
 
     // Given: Bead is pending
     let row = sqlx::query::<_, (String,)>(
-        "SELECT status FROM bead_backlog WHERE repo_id = $1 AND bead_id = $2"
+        "SELECT status FROM bead_backlog WHERE repo_id = $1 AND bead_id = $2",
     )
     .bind(repo_id.value())
     .bind(bead_id.value())
@@ -297,11 +315,14 @@ async fn behavior_release_clears_all_related_state() {
     reset_schema(&db).await;
 
     let repo_id = RepoId::new("behavior-repo");
-    db.register_repo(&repo_id, "test", "test").await
+    db.register_repo(&repo_id, "test", "test")
+        .await
         .expect("register_repo failed");
 
     let agent = AgentId::new(&repo_id, 1);
-    db.register_agent(&agent).await.expect("register_agent failed");
+    db.register_agent(&agent)
+        .await
+        .expect("register_agent failed");
 
     let bead_id = BeadId::new("behavior-bead");
 
@@ -333,24 +354,21 @@ async fn behavior_release_clears_all_related_state() {
     db.release_agent(&agent).await.expect("release failed");
 
     // Then: All related state is cleared
-    let claim_result = sqlx::query_as(
-        "SELECT COUNT(*) FROM bead_claims"
-    )
-    .fetch_one(db.pool())
-    .await
-    .expect("query failed");
+    let claim_result = sqlx::query_as("SELECT COUNT(*) FROM bead_claims")
+        .fetch_one(db.pool())
+        .await
+        .expect("query failed");
 
     let claim_count: i64 = claim_result.0;
     assert_eq!(claim_count, 0, "Claim should be removed");
 
-    let backlog_result = sqlx::query_as(
-        "SELECT status FROM bead_backlog WHERE repo_id = $1 AND bead_id = $2"
-    )
-    .bind(repo_id.value())
-    .bind(bead_id.value())
-    .fetch_one(db.pool())
-    .await
-    .expect("query failed");
+    let backlog_result =
+        sqlx::query_as("SELECT status FROM bead_backlog WHERE repo_id = $1 AND bead_id = $2")
+            .bind(repo_id.value())
+            .bind(bead_id.value())
+            .fetch_one(db.pool())
+            .await
+            .expect("query failed");
 
     let backlog_status: String = backlog_result.0;
     assert_eq!(backlog_status, "pending", "Backlog should be pending");

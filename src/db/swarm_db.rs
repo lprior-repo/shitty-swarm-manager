@@ -84,6 +84,38 @@ impl SwarmDb {
         }
     }
 
+    pub(crate) async fn table_has_column(
+        &self,
+        table_name: &str,
+        column_name: &str,
+    ) -> Result<bool> {
+        if let Some(cached) = self.check_schema_cache(table_name, column_name) {
+            return Ok(cached);
+        }
+
+        let result = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = $1
+                  AND column_name = $2
+            )",
+        )
+        .bind(table_name)
+        .bind(column_name)
+        .fetch_one(self.pool())
+        .await
+        .map_err(|e| {
+            SwarmError::DatabaseError(format!(
+                "Failed to inspect schema for {table_name}.{column_name}: {e}"
+            ))
+        })?;
+
+        self.update_schema_cache(table_name, column_name, result);
+        Ok(result)
+    }
+
     /// # Errors
     /// Returns [`SwarmError::DatabaseError`] when persistence or mapping fails.
     pub async fn get_stage_artifacts(

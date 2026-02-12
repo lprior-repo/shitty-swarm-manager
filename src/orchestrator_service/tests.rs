@@ -124,7 +124,10 @@ impl ClaimRepository for FakePorts {
 }
 
 impl StageExecutor for FakePorts {
-    fn execute_work(&self, _request: StageExecutionRequest) -> PortFuture<'_, StageExecutionOutcome> {
+    fn execute_work(
+        &self,
+        _request: StageExecutionRequest,
+    ) -> PortFuture<'_, StageExecutionOutcome> {
         Box::pin(async move {
             if *self.fail_on_execute.lock().await {
                 return Err(Error::Internal("simulated execute failure".to_string()));
@@ -145,7 +148,10 @@ impl ArtifactStore for FakePorts {
 }
 
 impl LandingGateway for FakePorts {
-    fn execute_landing<'a>(&'a self, _bead_id: &'a RuntimeBeadId) -> PortFuture<'a, LandingOutcome> {
+    fn execute_landing<'a>(
+        &'a self,
+        _bead_id: &'a RuntimeBeadId,
+    ) -> PortFuture<'a, LandingOutcome> {
         Box::pin(async move { Ok(LandingOutcome::new(true, "noop")) })
     }
 }
