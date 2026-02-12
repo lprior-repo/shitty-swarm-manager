@@ -26,6 +26,8 @@ pub use error::Result;
 pub use error::SwarmError as Error;
 pub use error::{code, SwarmError, ERROR_CODES};
 
+mod agent_runtime;
+mod config;
 pub mod contracts;
 pub mod db;
 pub mod diagnostics;
@@ -33,7 +35,9 @@ mod error;
 pub mod gate_cache;
 pub mod orchestrator_service;
 pub mod prompts;
+pub mod protocol;
 pub mod protocol_envelope;
+pub mod protocol_runtime;
 pub mod skill_execution;
 pub mod skill_execution_parsing;
 pub mod skill_prompts;
@@ -49,6 +53,8 @@ pub use orchestrator_service::{
     OrchestratorPorts, OrchestratorService, OrchestratorTickOutcome, StageArtifactRecord,
     StageExecutionOutcome, StageExecutionRequest, StageExecutor,
 };
+pub use protocol::commands::*;
+pub use protocol_runtime::ProtocolRequest;
 
 pub use types::{
     AgentId, AgentMessage, AgentState, AgentStatus, ArtifactType, BeadId, ClaimStatus,

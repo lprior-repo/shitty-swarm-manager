@@ -697,7 +697,8 @@ impl RuntimePgBeadRepository {
     /// # Errors
     /// Returns [`RuntimeError::RepositoryError`] when persistence fails.
     pub async fn claim_next(&self, agent_id: &RuntimeAgentId) -> Result<Option<RuntimeBeadId>> {
-        sqlx::query_scalar::<_, Option<String>>("SELECT claim_next_bead($1)")
+        sqlx::query_scalar::<_, Option<String>>("SELECT claim_next_bead($1, $2)")
+            .bind(agent_id.repo_id().value())
             .bind(agent_id.number().cast_signed())
             .fetch_one(&self.pool)
             .await
@@ -709,23 +710,31 @@ impl RuntimePgBeadRepository {
     /// Returns [`RuntimeError::RepositoryError`] when persistence fails.
     pub async fn release(&self, agent_id: &RuntimeAgentId) -> Result<()> {
         sqlx::query("UPDATE agent_state SET bead_id = NULL, current_stage = NULL, status = 'idle' WHERE repo_id = $1 AND agent_id = $2")
-            .bind(agent_id.repo_id().value())
-            .bind(agent_id.number().cast_signed())
-            .execute(&self.pool)
-            .await
+             .bind(agent_id.repo_id().value())
+             .bind(agent_id.number().cast_signed())
+             .execute(&self.pool)
+             .await
             .map_err(|e| RuntimeError::RepositoryError(format!("release: {e}")))
             .map(|_| ())
     }
 
     /// # Errors
     /// Returns [`RuntimeError::RepositoryError`] when persistence fails.
-    pub async fn mark_blocked(&self, bead_id: &RuntimeBeadId, _reason: &str) -> Result<()> {
-        sqlx::query("UPDATE bead_backlog SET status = 'blocked' WHERE bead_id = $1")
-            .bind(bead_id.value())
-            .execute(&self.pool)
-            .await
-            .map_err(|e| RuntimeError::RepositoryError(format!("mark_blocked: {e}")))
-            .map(|_| ())
+    pub async fn mark_blocked(
+        &self,
+        repo_id: &RuntimeRepoId,
+        bead_id: &RuntimeBeadId,
+        _reason: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE bead_backlog SET status = 'blocked' WHERE repo_id = $1 AND bead_id = $2",
+        )
+        .bind(repo_id.value())
+        .bind(bead_id.value())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RuntimeError::RepositoryError(format!("mark_blocked: {e}")))
+        .map(|_| ())
     }
 }
 
@@ -755,9 +764,11 @@ impl RuntimePgStageRepository {
         stage: RuntimeStage,
         attempt: u32,
     ) -> Result<i64> {
+        self.ensure_stage_history_repo_scope().await?;
         sqlx::query_scalar::<_, i64>(
-            "INSERT INTO stage_history (agent_id, bead_id, stage, attempt_number, status) VALUES ($1, $2, $3, $4, 'started') RETURNING id",
+            "INSERT INTO stage_history (repo_id, agent_id, bead_id, stage, attempt_number, status) VALUES ($1, $2, $3, $4, $5, 'started') RETURNING id",
         )
+        .bind(agent_id.repo_id().value())
         .bind(agent_id.number().cast_signed())
         .bind(bead_id.value())
         .bind(stage.as_str())
@@ -778,7 +789,9 @@ impl RuntimePgStageRepository {
         result: RuntimeStageResult,
         duration_ms: u64,
     ) -> Result<()> {
-        sqlx::query("UPDATE stage_history SET status = $5, result = $6, feedback = $7, completed_at = NOW(), duration_ms = $8 WHERE id = (SELECT id FROM stage_history WHERE agent_id = $1 AND bead_id = $2 AND stage = $3 AND attempt_number = $4 AND status = 'started' ORDER BY started_at DESC LIMIT 1)")
+        self.ensure_stage_history_repo_scope().await?;
+        sqlx::query("UPDATE stage_history SET status = $6, result = $7, feedback = $8, completed_at = NOW(), duration_ms = $9 WHERE id = (SELECT id FROM stage_history WHERE repo_id = $1 AND agent_id = $2 AND bead_id = $3 AND stage = $4 AND attempt_number = $5 AND status = 'started' ORDER BY started_at DESC LIMIT 1)")
+            .bind(agent_id.repo_id().value())
             .bind(agent_id.number().cast_signed())
             .bind(bead_id.value())
             .bind(stage.as_str())
@@ -791,6 +804,17 @@ impl RuntimePgStageRepository {
             .await
             .map_err(|e| RuntimeError::RepositoryError(format!("record_completed: {e}")))
             .map(|_| ())
+    }
+
+    async fn ensure_stage_history_repo_scope(&self) -> Result<()> {
+        sqlx::query(
+            "ALTER TABLE stage_history
+             ADD COLUMN IF NOT EXISTS repo_id TEXT NOT NULL DEFAULT 'local'",
+        )
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|e| RuntimeError::RepositoryError(format!("ensure stage_history repo scope: {e}")))
     }
 }
 

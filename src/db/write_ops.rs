@@ -22,11 +22,15 @@ const CONTEXT_ARTIFACT_TYPES: [ArtifactType; 3] = [
     ArtifactType::TestOutput,
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum StageTransition {
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum StageTransition {
+    #[error("finalize")]
     Finalize,
+    #[error("advance to {0}")]
     Advance(Stage),
+    #[error("retry implement")]
     RetryImplement,
+    #[error("no op")]
     NoOp,
 }
 
@@ -334,8 +338,9 @@ impl SwarmDb {
     /// # Errors
     ///
     /// Returns `SwarmError::DatabaseError` if the database operation fails.
-    pub async fn recover_expired_claims(&self) -> Result<u32> {
-        sqlx::query_scalar::<_, i32>("SELECT recover_expired_bead_claims()")
+    pub async fn recover_expired_claims(&self, repo_id: &RepoId) -> Result<u32> {
+        sqlx::query_scalar::<_, i32>("SELECT recover_expired_bead_claims($1)")
+            .bind(repo_id.value())
             .fetch_one(self.pool())
             .await
             .map_err(|e| {
@@ -356,6 +361,7 @@ impl SwarmDb {
         stage: Stage,
         attempt: u32,
     ) -> Result<i64> {
+        self.ensure_stage_history_repo_scope().await?;
         let mut tx = self
             .pool()
             .begin()
@@ -368,10 +374,11 @@ impl SwarmDb {
             .map_err(|e| SwarmError::DatabaseError(format!("Failed to acquire tx conn: {e}")))?;
 
         let stage_history_id = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO stage_history (agent_id, bead_id, stage, attempt_number, status)
-             VALUES ($1, $2, $3, $4, 'started')
+            "INSERT INTO stage_history (repo_id, agent_id, bead_id, stage, attempt_number, status)
+             VALUES ($1, $2, $3, $4, $5, 'started')
              RETURNING id",
         )
+        .bind(agent_id.repo_id().value())
         .bind(agent_id.number().cast_signed())
         .bind(bead_id.value())
         .bind(stage.as_str())
@@ -483,6 +490,7 @@ impl SwarmDb {
         result: &StageResult,
         duration_ms: u64,
     ) -> Result<i64> {
+        self.ensure_stage_history_repo_scope().await?;
         let status = result.as_str();
         let message = result.message();
 
@@ -490,24 +498,30 @@ impl SwarmDb {
             SwarmError::DatabaseError("Duration overflow updating stage history".to_string())
         })?;
 
-        let stage_history_row = sqlx::query!(
+        let stage_history_row = sqlx::query_as::<_, (i64, Option<DateTime<Utc>>)>(
             "UPDATE stage_history
-             SET status = $5, result = $6, feedback = $7, completed_at = NOW(), duration_ms = $8
+             SET status = $6, result = $7, feedback = $8, completed_at = NOW(), duration_ms = $9
              WHERE id = (
-                SELECT id FROM stage_history
-                WHERE agent_id = $1 AND bead_id = $2 AND stage = $3 AND attempt_number = $4 AND status = 'started'
-                ORDER BY started_at DESC LIMIT 1
+                 SELECT id FROM stage_history
+                 WHERE repo_id = $1
+                   AND agent_id = $2
+                   AND bead_id = $3
+                   AND stage = $4
+                   AND attempt_number = $5
+                   AND status = 'started'
+                 ORDER BY started_at DESC LIMIT 1
              )
              RETURNING id, completed_at",
-            agent_id.number().cast_signed(),
-            bead_id.value(),
-            stage.as_str(),
-            attempt.cast_signed(),
-            &status,
-            message,
-            message,
-            duration_value
         )
+        .bind(agent_id.repo_id().value())
+        .bind(agent_id.number().cast_signed())
+        .bind(bead_id.value())
+        .bind(stage.as_str())
+        .bind(attempt.cast_signed())
+        .bind(&status)
+        .bind(message)
+        .bind(message)
+        .bind(duration_value)
         .fetch_optional(self.pool())
         .await
         .map_err(|e| SwarmError::DatabaseError(format!("Failed to update stage history: {e}")))?
@@ -517,11 +531,11 @@ impl SwarmDb {
             )
         })?;
 
-        let completed_at = stage_history_row.completed_at.ok_or_else(|| {
+        let completed_at = stage_history_row.1.ok_or_else(|| {
             SwarmError::DatabaseError("Failed to capture stage completion timestamp".to_string())
         })?;
 
-        let stage_history_id = stage_history_row.id;
+        let stage_history_id = stage_history_row.0;
 
         self.persist_stage_transcript(
             agent_id,
@@ -1201,12 +1215,18 @@ impl SwarmDb {
     /// # Errors
     ///
     /// Returns `SwarmError::DatabaseError` if the database operation fails.
-    pub async fn enqueue_backlog_batch(&self, prefix: &str, count: u32) -> Result<()> {
+    pub async fn enqueue_backlog_batch(
+        &self,
+        repo_id: &RepoId,
+        prefix: &str,
+        count: u32,
+    ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO bead_backlog (bead_id, priority, status)
-             SELECT format('%s-%s', $1, g), 'p0', 'pending'
-             FROM generate_series(1, $2) AS g",
+            "INSERT INTO bead_backlog (repo_id, bead_id, priority, status)
+             SELECT $1, format('%s-%s', $2, g), 'p0', 'pending'
+             FROM generate_series(1, $3) AS g",
         )
+        .bind(repo_id.value())
         .bind(prefix)
         .bind(count.cast_signed())
         .execute(self.pool())
@@ -1503,10 +1523,12 @@ impl SwarmDb {
         let claim_update = sqlx::query(
             "UPDATE bead_claims
              SET status = 'completed'
-             WHERE bead_id = $1
-               AND claimed_by = $2
+             WHERE repo_id = $1
+               AND bead_id = $2
+               AND claimed_by = $3
                AND status = 'in_progress'",
         )
+        .bind(agent_id.repo_id().value())
         .bind(bead_id.value())
         .bind(agent_id.number().cast_signed())
         .execute(&mut *conn)
@@ -1517,10 +1539,11 @@ impl SwarmDb {
             let existing_status = sqlx::query_scalar::<_, String>(
                 "SELECT status
                  FROM bead_claims
-                 WHERE bead_id = $1 AND claimed_by = $2
+                 WHERE repo_id = $1 AND bead_id = $2 AND claimed_by = $3
                  ORDER BY claimed_at DESC
                  LIMIT 1",
             )
+            .bind(agent_id.repo_id().value())
             .bind(bead_id.value())
             .bind(agent_id.number().cast_signed())
             .fetch_optional(&mut *conn)
@@ -1774,6 +1797,21 @@ impl SwarmDb {
             ))
         })
     }
+
+    pub(crate) async fn ensure_stage_history_repo_scope(&self) -> Result<()> {
+        sqlx::query(
+            "ALTER TABLE stage_history
+             ADD COLUMN IF NOT EXISTS repo_id TEXT NOT NULL DEFAULT 'local'",
+        )
+        .execute(self.pool())
+        .await
+        .map(|_| ())
+        .map_err(|e| {
+            SwarmError::DatabaseError(format!(
+                "Failed to ensure stage_history.repo_id column exists: {e}"
+            ))
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1914,7 +1952,8 @@ fn event_entity_id(bead_id: &BeadId, repo_id: &RepoId) -> String {
     format!("repo:{}:bead:{}", repo_id.value(), bead_id.value())
 }
 
-fn determine_transition(stage: Stage, result: &StageResult) -> StageTransition {
+#[must_use]
+pub fn determine_transition(stage: Stage, result: &StageResult) -> StageTransition {
     let decision = runtime_determine_transition_decision(
         to_runtime_stage(stage),
         &to_runtime_stage_result(result),
@@ -1962,7 +2001,3 @@ const fn to_stage(stage: RuntimeStage) -> Stage {
         RuntimeStage::Done => Stage::Done,
     }
 }
-
-#[cfg(test)]
-#[path = "write_ops_tests.rs"]
-mod tests;

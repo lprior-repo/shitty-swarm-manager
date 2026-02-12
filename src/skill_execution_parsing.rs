@@ -70,14 +70,14 @@ mod tests {
 
     #[test]
     fn parse_cargo_test_results() {
-        let output = r#"
+        let output = r"
 running 3 tests
 test tests::test_one ... ok
 test tests::test_two ... FAILED
 test tests::test_three ... ok
 
 test result: ok. 2 passed; 1 failed; 0 skipped
-"#;
+";
         let results = parse_test_results(output);
         assert_eq!(results.passed, 2);
         assert_eq!(results.failed, 1);

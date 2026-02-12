@@ -1,6 +1,6 @@
 use crate::{
-    Result, RuntimeAgentId, RuntimeAgentState, RuntimeAgentStatus, RuntimeBeadId, RuntimeStage,
-    RuntimeStageResult,
+    Result, RuntimeAgentId, RuntimeAgentState, RuntimeAgentStatus, RuntimeBeadId, RuntimeRepoId,
+    RuntimeStage, RuntimeStageResult,
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -131,7 +131,7 @@ pub enum OrchestratorEvent {
 }
 
 pub trait ClaimRepository {
-    fn recover_stale_claims(&self) -> PortFuture<'_, u32>;
+    fn recover_stale_claims<'a>(&'a self, repo_id: &'a RuntimeRepoId) -> PortFuture<'a, u32>;
 
     fn get_agent_state<'a>(
         &'a self,
@@ -212,7 +212,7 @@ where
     /// # Errors
     /// Returns any infrastructure/port failure without mutating service decision state.
     pub async fn tick(&self, agent_id: &RuntimeAgentId) -> Result<OrchestratorTickOutcome> {
-        self.ports.recover_stale_claims().await?;
+        self.ports.recover_stale_claims(agent_id.repo_id()).await?;
         let maybe_state = self.ports.get_agent_state(agent_id).await?;
 
         match maybe_state {
@@ -326,7 +326,7 @@ mod tests {
     }
 
     impl ClaimRepository for FakePorts {
-        fn recover_stale_claims(&self) -> PortFuture<'_, u32> {
+        fn recover_stale_claims<'a>(&'a self, _repo_id: &'a RuntimeRepoId) -> PortFuture<'a, u32> {
             Box::pin(async move {
                 let mut recovered = self.recover_count.lock().await;
                 *recovered = recovered.saturating_add(1);

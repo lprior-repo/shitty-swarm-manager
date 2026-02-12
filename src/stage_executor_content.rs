@@ -194,6 +194,7 @@ pub fn process_bead(input: &str) -> Result<String, String> {{
 }}
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod implementation_contract_tests {{
     use super::process_bead;
 
@@ -364,6 +365,7 @@ fn bullet_list(items: &[String]) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
 
