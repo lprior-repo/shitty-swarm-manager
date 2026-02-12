@@ -192,7 +192,7 @@ enum CliError {
     MissingRequiredArg { arg: String },
     #[error("Unknown command: {}", cmd)]
     UnknownCommand { cmd: String },
-    #[error("Invalid argument type for {}", arg)]
+    #[error("Invalid type for {}", arg)]
     InvalidArgType { arg: String },
     #[error("Invalid argument value for {}: {}", arg, error)]
     InvalidArgValue { arg: String, error: String },

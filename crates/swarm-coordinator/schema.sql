@@ -404,9 +404,8 @@ DECLARE
     v_updated INTEGER;
 BEGIN
     UPDATE bead_claims
-    SET heartbeat_at = GREATEST(heartbeat_at, NOW()),
-        lease_expires_at = GREATEST(lease_expires_at, NOW())
-            + (p_lease_extension_ms * INTERVAL '1 millisecond')
+    SET heartbeat_at = NOW(),
+        lease_expires_at = NOW() + (p_lease_extension_ms * INTERVAL '1 millisecond')
     WHERE repo_id = p_repo_id
       AND bead_id = p_bead_id
       AND claimed_by = p_agent_id
@@ -434,6 +433,7 @@ CREATE OR REPLACE FUNCTION claim_next_bead(
 RETURNS TEXT AS $$
 DECLARE
     v_bead_id TEXT;
+    v_claim_inserted BOOLEAN;
 BEGIN
     PERFORM recover_expired_bead_claims(p_repo_id);
 
@@ -478,9 +478,20 @@ BEGIN
     WHERE repo_id = p_repo_id
       AND bead_id = v_bead_id;
 
+    -- Check if claim was inserted successfully
     INSERT INTO bead_claims (repo_id, bead_id, claimed_by, status, heartbeat_at, lease_expires_at)
     VALUES (p_repo_id, v_bead_id, p_agent_id, 'in_progress', NOW(), NOW() + INTERVAL '5 minutes')
     ON CONFLICT (repo_id, bead_id) DO NOTHING;
+
+    GET DIAGNOSTICS v_claim_inserted = ROW_COUNT;
+    IF v_claim_inserted = 0 THEN
+        -- Claim insert failed due to conflict, reset backlog and abort
+        UPDATE bead_backlog
+        SET status = 'pending'
+        WHERE repo_id = p_repo_id
+          AND bead_id = v_bead_id;
+        RETURN NULL;
+    END IF;
 
     UPDATE agent_state
     SET bead_id = v_bead_id,

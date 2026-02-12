@@ -232,7 +232,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_skill_output_from_success() {
+    fn given_successful_shell_output_when_converted_then_feedback_is_empty() {
         let output = SkillOutput::from_shell_output("All tests passed", String::new(), Some(0));
 
         assert!(output.success);
@@ -242,7 +242,7 @@ mod tests {
     }
 
     #[test]
-    fn test_skill_output_from_failure() {
+    fn given_failed_shell_output_when_converted_then_feedback_contains_combined_log() {
         let output =
             SkillOutput::from_shell_output("Running tests", "Test failed".to_string(), Some(1));
 
@@ -250,5 +250,103 @@ mod tests {
         assert!(output.full_log.contains("Test failed"));
         assert_eq!(output.exit_code, Some(1));
         assert!(!output.feedback.is_empty());
+    }
+
+    #[test]
+    fn given_empty_stdout_when_converted_then_full_log_uses_stderr() {
+        let output = SkillOutput::from_shell_output("", "stderr only".to_string(), Some(1));
+
+        assert_eq!(output.full_log, "stderr only");
+        assert_eq!(output.feedback, "stderr only");
+    }
+
+    #[test]
+    fn given_empty_stderr_when_converted_then_full_log_uses_stdout() {
+        let output = SkillOutput::from_shell_output("stdout only", String::new(), Some(0));
+
+        assert_eq!(output.full_log, "stdout only");
+        assert!(output.feedback.is_empty());
+    }
+
+    #[test]
+    fn given_successful_contract_output_when_extracting_contract_artifacts_then_contract_is_persisted(
+    ) {
+        let mut output = SkillOutput::from_shell_output("# Contract", String::new(), Some(0));
+
+        output.extract_contract_artifacts();
+
+        assert_eq!(output.contract_document.as_deref(), Some("# Contract"));
+        assert_eq!(
+            output
+                .artifacts
+                .get("contract_document")
+                .map(String::as_str),
+            Some("# Contract")
+        );
+    }
+
+    #[test]
+    fn given_successful_implementation_output_when_extracting_then_code_artifact_is_persisted() {
+        let mut output = SkillOutput::from_shell_output("fn main() {}", String::new(), Some(0));
+
+        output.extract_implementation_artifacts();
+
+        assert_eq!(output.implementation_code.as_deref(), Some("fn main() {}"));
+        assert_eq!(
+            output
+                .artifacts
+                .get("implementation_code")
+                .map(String::as_str),
+            Some("fn main() {}")
+        );
+    }
+
+    #[test]
+    fn given_failed_qa_output_when_extracting_then_test_and_failure_artifacts_are_recorded() {
+        let mut output =
+            SkillOutput::from_shell_output("running tests\n1 failed", String::new(), Some(1));
+
+        output.extract_qa_artifacts();
+
+        assert!(output.artifacts.contains_key("test_output"));
+        assert!(output.artifacts.contains_key("failure_details"));
+        assert!(output.test_results.is_some());
+    }
+
+    #[test]
+    fn given_successful_red_queen_output_when_extracting_then_quality_gate_report_is_recorded() {
+        let mut output =
+            SkillOutput::from_shell_output("all adversarial checks passed", String::new(), Some(0));
+
+        output.extract_red_queen_artifacts();
+
+        assert_eq!(
+            output
+                .artifacts
+                .get("quality_gate_report")
+                .map(String::as_str),
+            Some("all adversarial checks passed")
+        );
+        assert!(output.adversarial_report.is_none());
+    }
+
+    #[test]
+    fn given_failed_red_queen_output_when_extracting_then_adversarial_report_is_recorded() {
+        let mut output =
+            SkillOutput::from_shell_output("adversarial regression found", String::new(), Some(1));
+
+        output.extract_red_queen_artifacts();
+
+        assert_eq!(
+            output.adversarial_report.as_deref(),
+            Some("adversarial regression found")
+        );
+        assert_eq!(
+            output
+                .artifacts
+                .get("adversarial_report")
+                .map(String::as_str),
+            Some("adversarial regression found")
+        );
     }
 }

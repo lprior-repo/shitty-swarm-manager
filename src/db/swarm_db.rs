@@ -10,10 +10,22 @@ use crate::types::{
 };
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub struct SwarmDb {
     pool: PgPool,
+    schema_cache: Arc<Mutex<HashMap<(String, String), bool>>>,
+}
+
+impl Clone for SwarmDb {
+    fn clone(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            schema_cache: Arc::clone(&self.schema_cache),
+        }
+    }
 }
 
 impl SwarmDb {
@@ -35,20 +47,41 @@ impl SwarmDb {
             .acquire_timeout(connect_timeout)
             .connect(connection_string)
             .await
-            .map(|pool| Self { pool })
+            .map(|pool| Self {
+                pool,
+                schema_cache: Arc::new(Mutex::new(HashMap::new())),
+            })
             .map_err(|error| {
                 SwarmError::DatabaseError(format!("Failed to connect to database: {error}"))
             })
     }
 
     #[must_use]
-    pub const fn new_with_pool(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new_with_pool(pool: PgPool) -> Self {
+        Self {
+            pool,
+            schema_cache: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     #[must_use]
     pub const fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    #[must_use]
+    pub fn check_schema_cache(&self, table_name: &str, column_name: &str) -> Option<bool> {
+        let cache = self.schema_cache.lock().ok()?;
+        // Convert inputs to owned strings for cache lookup
+        let key = (table_name.to_string(), column_name.to_string());
+        cache.get(&key).copied()
+    }
+
+    pub fn update_schema_cache(&self, table_name: &str, column_name: &str, value: bool) {
+        if let Ok(mut cache) = self.schema_cache.lock() {
+            let key = (table_name.to_string(), column_name.to_string());
+            cache.insert(key, value);
+        }
     }
 
     /// # Errors

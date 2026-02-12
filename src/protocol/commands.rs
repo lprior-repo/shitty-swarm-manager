@@ -2,7 +2,6 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use thiserror::Error;
 
-use crate::protocol_runtime::ProtocolRequest;
 use crate::{ArtifactType, StageArtifact};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,21 +252,4 @@ pub async fn artifact_retrieval(
     }
 
     Ok(artifacts)
-}
-
-impl HistoryInput {
-    /// Parses a protocol request into `HistoryInput`
-    ///
-    /// # Errors
-    /// Returns `String` error if:
-    /// - Request parsing fails
-    /// - Required fields are missing or invalid
-    pub fn parse_input(request: &ProtocolRequest) -> Result<Self, String> {
-        Ok(Self {
-            limit: request
-                .args
-                .get("limit")
-                .and_then(serde_json::Value::as_i64),
-        })
-    }
 }

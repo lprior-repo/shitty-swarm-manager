@@ -2,8 +2,10 @@ use crate::{
     Result, RuntimeAgentId, RuntimeAgentState, RuntimeAgentStatus, RuntimeBeadId, RuntimeRepoId,
     RuntimeStage, RuntimeStageResult,
 };
+use serde_json::Value;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Instant;
 
 pub type PortFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
@@ -255,18 +257,314 @@ where
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ClaimNextResult {
+    pub recommendation: Value,
+    pub bead_id: String,
+    pub claim: Value,
+    pub bv_robot_next_ms: u64,
+    pub br_update_ms: u64,
+}
+
+pub trait ClaimNextPorts {
+    fn bv_robot_next(&self) -> PortFuture<'_, Value>;
+    fn br_update_in_progress<'a>(&'a self, bead_id: &'a str) -> PortFuture<'a, Value>;
+}
+
+pub struct ClaimNextAppService<P> {
+    ports: P,
+}
+
+impl<P> ClaimNextAppService<P>
+where
+    P: ClaimNextPorts + Sync,
+{
+    #[must_use]
+    pub const fn new(ports: P) -> Self {
+        Self { ports }
+    }
+
+    /// Execute one claim-next orchestration cycle through external ports.
+    ///
+    /// # Errors
+    /// Returns an error when recommendation retrieval fails, the recommendation
+    /// payload does not contain a bead id, or claim update fails.
+    pub async fn execute<F>(&self, bead_id_from_recommendation: F) -> Result<ClaimNextResult>
+    where
+        F: Fn(&Value) -> Option<String>,
+    {
+        let recommendation_start = Instant::now();
+        let recommendation_payload = self.ports.bv_robot_next().await?;
+        let bv_robot_next_ms = elapsed_ms(recommendation_start);
+        let recommendation = recommendation_payload
+            .get("next")
+            .cloned()
+            .unwrap_or(recommendation_payload);
+        let bead_id = bead_id_from_recommendation(&recommendation).ok_or_else(|| {
+            crate::Error::ConfigError("missing bead id in recommendation".to_string())
+        })?;
+
+        let update_start = Instant::now();
+        let claim = self.ports.br_update_in_progress(&bead_id).await?;
+        let br_update_ms = elapsed_ms(update_start);
+
+        Ok(ClaimNextResult {
+            recommendation,
+            bead_id,
+            claim,
+            bv_robot_next_ms,
+            br_update_ms,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AssignCommand {
+    pub repo_id: RuntimeRepoId,
+    pub bead_id: String,
+    pub agent_id: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssignAgentSnapshot {
+    pub valid_ids: Vec<u32>,
+    pub status: RuntimeAgentStatus,
+    pub current_bead: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AssignResult {
+    pub bead_id: String,
+    pub agent_id: u32,
+    pub assignee: String,
+    pub br_update: Value,
+    pub bead_verify: Value,
+    pub verified_status: Option<String>,
+    pub verified_id: Option<String>,
+}
+
+pub trait AssignPorts {
+    fn load_agent_snapshot<'a>(
+        &'a self,
+        repo_id: &'a RuntimeRepoId,
+        agent_id: u32,
+    ) -> PortFuture<'a, Option<AssignAgentSnapshot>>;
+
+    fn br_show_bead<'a>(&'a self, bead_id: &'a str) -> PortFuture<'a, Value>;
+
+    fn claim_bead<'a>(
+        &'a self,
+        repo_id: &'a RuntimeRepoId,
+        agent_id: u32,
+        bead_id: &'a str,
+    ) -> PortFuture<'a, bool>;
+
+    fn release_agent<'a>(&'a self, repo_id: &'a RuntimeRepoId, agent_id: u32)
+        -> PortFuture<'a, ()>;
+
+    fn br_assign_in_progress<'a>(
+        &'a self,
+        bead_id: &'a str,
+        assignee: &'a str,
+    ) -> PortFuture<'a, Value>;
+}
+
+pub struct AssignAppService<P> {
+    ports: P,
+}
+
+impl<P> AssignAppService<P>
+where
+    P: AssignPorts + Sync,
+{
+    #[must_use]
+    pub const fn new(ports: P) -> Self {
+        Self { ports }
+    }
+
+    /// Execute one explicit assign command through repository and external ports.
+    ///
+    /// # Errors
+    /// Returns an error when agent/bead preconditions are not met or when
+    /// claim/sync side effects fail.
+    pub async fn execute<S, I>(
+        &self,
+        command: AssignCommand,
+        issue_status_from_payload: S,
+        issue_id_from_payload: I,
+    ) -> Result<AssignResult>
+    where
+        S: Fn(&Value) -> Option<String>,
+        I: Fn(&Value) -> Option<String>,
+    {
+        let snapshot = self
+            .ports
+            .load_agent_snapshot(&command.repo_id, command.agent_id)
+            .await?
+            .ok_or_else(|| {
+                crate::Error::BeadError(format!("Agent {} is not registered", command.agent_id))
+            })?;
+
+        if snapshot.status != RuntimeAgentStatus::Idle || snapshot.current_bead.is_some() {
+            return Err(crate::Error::AgentError(format!(
+                "Agent {} is not idle",
+                command.agent_id
+            )));
+        }
+
+        let bead_before = self.ports.br_show_bead(&command.bead_id).await?;
+        let current_status = issue_status_from_payload(&bead_before).ok_or_else(|| {
+            crate::Error::ConfigError("br show returned payload without status".to_string())
+        })?;
+
+        if current_status != "open" {
+            return Err(crate::Error::StageError(format!(
+                "Bead {} is not assignable: status={current_status}",
+                command.bead_id
+            )));
+        }
+
+        let claimed = self
+            .ports
+            .claim_bead(&command.repo_id, command.agent_id, &command.bead_id)
+            .await?;
+        if !claimed {
+            return Err(crate::Error::StageError(format!(
+                "Failed to claim bead {} for agent {}",
+                command.bead_id, command.agent_id
+            )));
+        }
+
+        let assignee = format!("swarm-agent-{}", command.agent_id);
+        let update_result = self
+            .ports
+            .br_assign_in_progress(&command.bead_id, assignee.as_str())
+            .await;
+
+        let br_update = match update_result {
+            Ok(value) => value,
+            Err(err) => {
+                let _ = self
+                    .ports
+                    .release_agent(&command.repo_id, command.agent_id)
+                    .await;
+                return Err(err);
+            }
+        };
+
+        let bead_verify = self.ports.br_show_bead(&command.bead_id).await?;
+        let verified_status = issue_status_from_payload(&bead_verify);
+        let verified_id = issue_id_from_payload(&bead_verify);
+
+        Ok(AssignResult {
+            bead_id: command.bead_id,
+            agent_id: command.agent_id,
+            assignee,
+            br_update,
+            bead_verify,
+            verified_status,
+            verified_id,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RunOnceResult {
+    pub agent_id: u32,
+    pub doctor: Value,
+    pub status_before: Value,
+    pub claim_next: Value,
+    pub agent: Value,
+    pub progress: Value,
+    pub doctor_ms: u64,
+    pub status_before_ms: u64,
+    pub claim_next_ms: u64,
+    pub agent_ms: u64,
+    pub progress_ms: u64,
+}
+
+pub trait RunOncePorts {
+    fn doctor(&self) -> PortFuture<'_, Value>;
+    fn status(&self) -> PortFuture<'_, Value>;
+    fn claim_next(&self) -> PortFuture<'_, Value>;
+    fn run_agent(&self, agent_id: u32) -> PortFuture<'_, Value>;
+    fn monitor_progress(&self) -> PortFuture<'_, Value>;
+}
+
+pub struct RunOnceAppService<P> {
+    ports: P,
+}
+
+impl<P> RunOnceAppService<P>
+where
+    P: RunOncePorts + Sync,
+{
+    #[must_use]
+    pub const fn new(ports: P) -> Self {
+        Self { ports }
+    }
+
+    /// Execute one compact orchestration run-once sequence.
+    ///
+    /// # Errors
+    /// Returns an error when any constituent command port fails.
+    pub async fn execute(&self, agent_id: u32) -> Result<RunOnceResult> {
+        let doctor_start = Instant::now();
+        let doctor = self.ports.doctor().await?;
+        let doctor_ms = elapsed_ms(doctor_start);
+
+        let status_before_start = Instant::now();
+        let status_before = self.ports.status().await?;
+        let status_before_ms = elapsed_ms(status_before_start);
+
+        let claim_start = Instant::now();
+        let claim_next = self.ports.claim_next().await?;
+        let claim_next_ms = elapsed_ms(claim_start);
+
+        let agent_start = Instant::now();
+        let agent = self.ports.run_agent(agent_id).await?;
+        let agent_ms = elapsed_ms(agent_start);
+
+        let progress_start = Instant::now();
+        let progress = self.ports.monitor_progress().await?;
+        let progress_ms = elapsed_ms(progress_start);
+
+        Ok(RunOnceResult {
+            agent_id,
+            doctor,
+            status_before,
+            claim_next,
+            agent,
+            progress,
+            doctor_ms,
+            status_before_ms,
+            claim_next_ms,
+            agent_ms,
+            progress_ms,
+        })
+    }
+}
+
+fn elapsed_ms(start: Instant) -> u64 {
+    let duration = start.elapsed();
+    let ms = duration.as_millis();
+    u64::try_from(ms).map_or(u64::MAX, |value| value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ArtifactStore, ClaimRepository, EventSink, LandingGateway, LandingOutcome,
-        OrchestratorEvent, OrchestratorPorts, OrchestratorService, OrchestratorTickOutcome,
-        PortFuture, StageArtifactRecord, StageExecutionOutcome, StageExecutionRequest,
-        StageExecutor,
+        ArtifactStore, AssignAgentSnapshot, AssignAppService, AssignCommand, AssignPorts,
+        ClaimNextAppService, ClaimNextPorts, ClaimRepository, EventSink, LandingGateway,
+        LandingOutcome, OrchestratorEvent, OrchestratorPorts, OrchestratorService,
+        OrchestratorTickOutcome, PortFuture, RunOnceAppService, RunOncePorts, StageArtifactRecord,
+        StageExecutionOutcome, StageExecutionRequest, StageExecutor,
     };
     use crate::{
         Error, Result, RuntimeAgentId, RuntimeAgentState, RuntimeAgentStatus, RuntimeBeadId,
-        RuntimeRepoId, RuntimeStage,
+        RuntimeRepoId, RuntimeStage, SwarmError,
     };
+    use serde_json::{json, Value};
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
@@ -538,5 +836,236 @@ mod tests {
         let result = service.tick(&agent_id()).await;
 
         assert!(matches!(result, Ok(OrchestratorTickOutcome::Completed)));
+    }
+
+    #[derive(Clone)]
+    struct ClaimNextFakePorts {
+        recommendation: Value,
+        claim: Value,
+    }
+
+    impl ClaimNextPorts for ClaimNextFakePorts {
+        fn bv_robot_next(&self) -> PortFuture<'_, Value> {
+            let payload = self.recommendation.clone();
+            Box::pin(async move { Ok(payload) })
+        }
+
+        fn br_update_in_progress<'a>(&'a self, _bead_id: &'a str) -> PortFuture<'a, Value> {
+            let payload = self.claim.clone();
+            Box::pin(async move { Ok(payload) })
+        }
+    }
+
+    #[tokio::test]
+    async fn given_recommendation_with_id_when_claim_next_executes_then_returns_bead_and_claim() {
+        let service = ClaimNextAppService::new(ClaimNextFakePorts {
+            recommendation: json!({"id":"swm-100"}),
+            claim: json!({"ok":true}),
+        });
+
+        let output = service
+            .execute(|value| {
+                value
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(std::string::ToString::to_string)
+            })
+            .await
+            .expect("claim-next should succeed with recommendation id");
+
+        assert_eq!(output.bead_id, "swm-100");
+        assert_eq!(output.claim, json!({"ok":true}));
+    }
+
+    #[tokio::test]
+    async fn given_recommendation_without_id_when_claim_next_executes_then_returns_error() {
+        let service = ClaimNextAppService::new(ClaimNextFakePorts {
+            recommendation: json!({"priority":1}),
+            claim: json!({"ok":true}),
+        });
+
+        let result = service.execute(|value| {
+            value
+                .get("id")
+                .and_then(Value::as_str)
+                .map(std::string::ToString::to_string)
+        });
+
+        assert!(matches!(
+            result.await,
+            Err(SwarmError::ConfigError(message)) if message.contains("missing bead id")
+        ));
+    }
+
+    #[derive(Clone)]
+    struct AssignFakePorts {
+        snapshot: Option<AssignAgentSnapshot>,
+        bead_status: Option<String>,
+        claim_ok: bool,
+    }
+
+    impl AssignPorts for AssignFakePorts {
+        fn load_agent_snapshot<'a>(
+            &'a self,
+            _repo_id: &'a RuntimeRepoId,
+            _agent_id: u32,
+        ) -> PortFuture<'a, Option<AssignAgentSnapshot>> {
+            let payload = self.snapshot.clone();
+            Box::pin(async move { Ok(payload) })
+        }
+
+        fn br_show_bead<'a>(&'a self, bead_id: &'a str) -> PortFuture<'a, Value> {
+            let status = self.bead_status.clone();
+            Box::pin(async move {
+                Ok(json!({
+                    "id": bead_id,
+                    "status": status,
+                }))
+            })
+        }
+
+        fn claim_bead<'a>(
+            &'a self,
+            _repo_id: &'a RuntimeRepoId,
+            _agent_id: u32,
+            _bead_id: &'a str,
+        ) -> PortFuture<'a, bool> {
+            let ok = self.claim_ok;
+            Box::pin(async move { Ok(ok) })
+        }
+
+        fn release_agent<'a>(
+            &'a self,
+            _repo_id: &'a RuntimeRepoId,
+            _agent_id: u32,
+        ) -> PortFuture<'a, ()> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn br_assign_in_progress<'a>(
+            &'a self,
+            bead_id: &'a str,
+            assignee: &'a str,
+        ) -> PortFuture<'a, Value> {
+            Box::pin(async move {
+                Ok(json!({
+                    "bead_id": bead_id,
+                    "assignee": assignee,
+                }))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn given_idle_agent_and_open_bead_when_assign_executes_then_returns_assignee_result() {
+        let service = AssignAppService::new(AssignFakePorts {
+            snapshot: Some(AssignAgentSnapshot {
+                valid_ids: vec![1],
+                status: RuntimeAgentStatus::Idle,
+                current_bead: None,
+            }),
+            bead_status: Some("open".to_string()),
+            claim_ok: true,
+        });
+
+        let command = AssignCommand {
+            repo_id: RuntimeRepoId::new("local"),
+            bead_id: "swm-200".to_string(),
+            agent_id: 1,
+        };
+
+        let result = service
+            .execute(
+                command,
+                |payload| {
+                    payload
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .map(std::string::ToString::to_string)
+                },
+                |payload| {
+                    payload
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(std::string::ToString::to_string)
+                },
+            )
+            .await;
+
+        assert!(result.is_ok());
+        let output = result.expect("assign should succeed with idle agent and open bead");
+        assert_eq!(output.assignee, "swarm-agent-1");
+        assert_eq!(output.verified_status, Some("open".to_string()));
+        assert_eq!(output.verified_id, Some("swm-200".to_string()));
+    }
+
+    #[tokio::test]
+    async fn given_non_idle_agent_when_assign_executes_then_returns_agent_error() {
+        let service = AssignAppService::new(AssignFakePorts {
+            snapshot: Some(AssignAgentSnapshot {
+                valid_ids: vec![1],
+                status: RuntimeAgentStatus::Working,
+                current_bead: Some("swm-199".to_string()),
+            }),
+            bead_status: Some("open".to_string()),
+            claim_ok: true,
+        });
+
+        let command = AssignCommand {
+            repo_id: RuntimeRepoId::new("local"),
+            bead_id: "swm-200".to_string(),
+            agent_id: 1,
+        };
+
+        let result = service
+            .execute(
+                command,
+                |_payload| Some("open".to_string()),
+                |_payload| Some("swm-200".to_string()),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(SwarmError::AgentError(message)) if message.contains("not idle")
+        ));
+    }
+
+    #[derive(Clone)]
+    struct RunOnceFakePorts;
+
+    impl RunOncePorts for RunOnceFakePorts {
+        fn doctor(&self) -> PortFuture<'_, Value> {
+            Box::pin(async move { Ok(json!({"ok":true,"step":"doctor"})) })
+        }
+
+        fn status(&self) -> PortFuture<'_, Value> {
+            Box::pin(async move { Ok(json!({"ok":true,"step":"status"})) })
+        }
+
+        fn claim_next(&self) -> PortFuture<'_, Value> {
+            Box::pin(async move { Ok(json!({"ok":true,"step":"claim-next"})) })
+        }
+
+        fn run_agent(&self, agent_id: u32) -> PortFuture<'_, Value> {
+            Box::pin(async move { Ok(json!({"ok":true,"step":"agent","id":agent_id})) })
+        }
+
+        fn monitor_progress(&self) -> PortFuture<'_, Value> {
+            Box::pin(async move { Ok(json!({"ok":true,"step":"progress"})) })
+        }
+    }
+
+    #[tokio::test]
+    async fn given_run_once_ports_when_execute_then_returns_compact_step_payload() {
+        let service = RunOnceAppService::new(RunOnceFakePorts);
+
+        let result = service.execute(7).await;
+
+        assert!(result.is_ok());
+        let output = result.expect("run-once should succeed with fake ports");
+        assert_eq!(output.agent_id, 7);
+        assert_eq!(output.agent["id"], Value::from(7));
+        assert_eq!(output.progress["step"], Value::from("progress"));
     }
 }

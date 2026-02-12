@@ -235,6 +235,19 @@ impl SwarmDb {
             .await
             .map_err(|e| SwarmError::DatabaseError(format!("Failed to acquire tx conn: {e}")))?;
 
+        // Lock the bead_backlog row first to prevent concurrent claims
+        sqlx::query(
+            "SELECT 1
+             FROM bead_backlog
+             WHERE repo_id = $1 AND bead_id = $2
+             FOR UPDATE",
+        )
+        .bind(agent_id.repo_id().value())
+        .bind(bead_id.value())
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to lock backlog bead: {e}")))?;
+
         let already_claimed = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(
                  SELECT 1
@@ -242,6 +255,7 @@ impl SwarmDb {
                  WHERE repo_id = $1
                    AND bead_id = $2
                    AND status = 'in_progress'
+                 FOR UPDATE
              )",
         )
         .bind(agent_id.repo_id().value())
@@ -777,8 +791,33 @@ impl SwarmDb {
                     input.message,
                 )
                 .await?;
-                self.apply_failure_transition(input.agent_id, input.message)
-                    .await?;
+
+                // Wrap failure transition and event recording in a transaction
+                let mut tx =
+                    self.pool().begin().await.map_err(|e| {
+                        SwarmError::DatabaseError(format!("Failed to begin tx: {e}"))
+                    })?;
+
+                let conn = tx.acquire().await.map_err(|e| {
+                    SwarmError::DatabaseError(format!("Failed to acquire tx conn: {e}"))
+                })?;
+
+                sqlx::query(
+                    "UPDATE agent_state
+                     SET status = 'waiting', feedback = $3, implementation_attempt = implementation_attempt + 1, current_stage = 'implement'
+                     WHERE repo_id = $1 AND agent_id = $2",
+                )
+                .bind(input.agent_id.repo_id().value())
+                .bind(input.agent_id.number().cast_signed())
+                .bind(input.message)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| SwarmError::DatabaseError(format!("Failed to record failed stage: {e}")))?;
+
+                tx.commit()
+                    .await
+                    .map_err(|e| SwarmError::DatabaseError(format!("Failed to commit tx: {e}")))?;
+
                 self.record_execution_event(
                     input.bead_id,
                     input.agent_id,
@@ -1354,23 +1393,25 @@ impl SwarmDb {
         .map_err(|e| SwarmError::DatabaseError(format!("Failed to read agent state: {e}")))?
         .flatten();
 
-        if let Some(bead_id) = bead.as_deref() {
-            sqlx::query(
-                "UPDATE agent_state
-                 SET bead_id = NULL,
-                     current_stage = NULL,
-                     stage_started_at = NULL,
-                     status = 'idle',
-                     feedback = NULL,
-                     implementation_attempt = 0
-                 WHERE repo_id = $1 AND agent_id = $2",
-            )
-            .bind(agent_id.repo_id().value())
-            .bind(agent_id.number().cast_signed())
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| SwarmError::DatabaseError(format!("Failed to reset agent state: {e}")))?;
+        // Reset agent state unconditionally
+        sqlx::query(
+            "UPDATE agent_state
+             SET bead_id = NULL,
+                 current_stage = NULL,
+                 stage_started_at = NULL,
+                 status = 'idle',
+                 feedback = NULL,
+                 implementation_attempt = 0
+             WHERE repo_id = $1 AND agent_id = $2",
+        )
+        .bind(agent_id.repo_id().value())
+        .bind(agent_id.number().cast_signed())
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| SwarmError::DatabaseError(format!("Failed to reset agent state: {e}")))?;
 
+        // Cleanup only if bead was assigned
+        if let Some(bead_id) = bead.as_deref() {
             sqlx::query("DELETE FROM agent_messages WHERE bead_id = $1")
                 .bind(bead_id)
                 .execute(&mut *conn)
@@ -1404,24 +1445,6 @@ impl SwarmDb {
             .map_err(|e| {
                 SwarmError::DatabaseError(format!("Failed to reset backlog status on release: {e}"))
             })?;
-        }
-
-        if bead.is_none() {
-            sqlx::query(
-                "UPDATE agent_state
-                 SET bead_id = NULL,
-                     current_stage = NULL,
-                     stage_started_at = NULL,
-                     status = 'idle',
-                     feedback = NULL,
-                     implementation_attempt = 0
-                 WHERE repo_id = $1 AND agent_id = $2",
-            )
-            .bind(agent_id.repo_id().value())
-            .bind(agent_id.number().cast_signed())
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| SwarmError::DatabaseError(format!("Failed to reset agent state: {e}")))?;
         }
 
         tx.commit()
@@ -1463,21 +1486,51 @@ impl SwarmDb {
     ///
     /// Returns `SwarmError::DatabaseError` if the database operation fails.
     pub async fn mark_landing_retryable(&self, agent_id: &AgentId, reason: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE agent_state
-             SET status = 'waiting', feedback = $3, current_stage = 'red-queen'
-             WHERE repo_id = $1 AND agent_id = $2",
-        )
-        .bind(agent_id.repo_id().value())
-        .bind(agent_id.number().cast_signed())
-        .bind(reason)
-        .execute(self.pool())
-        .await
-        .map_err(|e| SwarmError::DatabaseError(format!("Failed to mark landing retryable: {e}")))
-        .map(|_| ())?;
+        // Update agent state and lookup bead_id atomically
+        let bead_id = {
+            let mut tx = self
+                .pool()
+                .begin()
+                .await
+                .map_err(|e| SwarmError::DatabaseError(format!("Failed to begin tx: {e}")))?;
 
-        let bead_id = self.lookup_agent_bead(agent_id).await?;
+            let conn = tx.acquire().await.map_err(|e| {
+                SwarmError::DatabaseError(format!("Failed to acquire tx conn: {e}"))
+            })?;
+
+            sqlx::query(
+                "UPDATE agent_state
+                 SET status = 'waiting', feedback = $3, current_stage = 'red-queen'
+                 WHERE repo_id = $1 AND agent_id = $2",
+            )
+            .bind(agent_id.repo_id().value())
+            .bind(agent_id.number().cast_signed())
+            .bind(reason)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| {
+                SwarmError::DatabaseError(format!("Failed to mark landing retryable: {e}"))
+            })?;
+
+            let bead_id = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT bead_id FROM agent_state WHERE repo_id = $1 AND agent_id = $2",
+            )
+            .bind(agent_id.repo_id().value())
+            .bind(agent_id.number().cast_signed())
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| SwarmError::DatabaseError(format!("Failed to lookup bead in tx: {e}")))?
+            .flatten();
+
+            tx.commit()
+                .await
+                .map_err(|e| SwarmError::DatabaseError(format!("Failed to commit tx: {e}")))?;
+
+            bead_id
+        };
+
         if let Some(bead_id) = bead_id {
+            let bead_id = BeadId::new(bead_id);
             let causation_id = Some(landing_retry_causation_id(reason));
             self.record_execution_event_if_absent(
                 &bead_id,
@@ -1778,7 +1831,12 @@ impl SwarmDb {
     }
 
     async fn table_has_column(&self, table_name: &str, column_name: &str) -> Result<bool> {
-        sqlx::query_scalar::<_, bool>(
+        // Check cache first
+        if let Some(cached) = self.check_schema_cache(table_name, column_name) {
+            return Ok(cached);
+        }
+
+        let result = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS (
                 SELECT 1
                 FROM information_schema.columns
@@ -1795,7 +1853,11 @@ impl SwarmDb {
             SwarmError::DatabaseError(format!(
                 "Failed to inspect schema for {table_name}.{column_name}: {e}"
             ))
-        })
+        })?;
+
+        // Update cache
+        self.update_schema_cache(table_name, column_name, result);
+        Ok(result)
     }
 
     pub(crate) async fn ensure_stage_history_repo_scope(&self) -> Result<()> {
@@ -1908,7 +1970,10 @@ fn landing_sync_causation_id(status: BrSyncStatus, reason: Option<&str>) -> Stri
 
 #[cfg(test)]
 mod causation_tests {
-    use super::{landing_retry_causation_id, landing_sync_causation_id, BrSyncStatus};
+    use super::{
+        landing_retry_causation_id, landing_sync_causation_id, landing_sync_status_key,
+        BrSyncStatus,
+    };
 
     #[test]
     fn landing_retry_causation_id_is_stable() {
@@ -1927,6 +1992,148 @@ mod causation_tests {
         assert_eq!(
             landing_sync_causation_id(BrSyncStatus::Synchronized, Some("ignored")),
             "landing-sync:synchronized"
+        );
+    }
+
+    #[test]
+    fn given_diverged_status_when_building_sync_causation_id_then_reason_is_normalized() {
+        assert_eq!(
+            landing_sync_causation_id(BrSyncStatus::Diverged, Some("  JJ Push Rejected  ")),
+            "landing-sync:diverged:jj-push-rejected"
+        );
+    }
+
+    #[test]
+    fn given_each_sync_status_when_mapping_status_key_then_expected_key_is_returned() {
+        assert_eq!(
+            landing_sync_status_key(BrSyncStatus::Synchronized),
+            "synchronized"
+        );
+        assert_eq!(
+            landing_sync_status_key(BrSyncStatus::RetryScheduled),
+            "retry_scheduled"
+        );
+        assert_eq!(landing_sync_status_key(BrSyncStatus::Diverged), "diverged");
+    }
+}
+
+#[cfg(test)]
+mod diagnostics_tests {
+    use super::{
+        build_failure_diagnostics, classify_failure_category, determine_transition,
+        event_entity_id, redact_sensitive, StageTransition,
+    };
+    use crate::types::{BeadId, RepoId, Stage, StageResult};
+
+    #[test]
+    fn given_timeout_message_when_classifying_failure_then_timeout_category_is_returned() {
+        assert_eq!(
+            classify_failure_category("command timeout after 30s"),
+            "timeout"
+        );
+    }
+
+    #[test]
+    fn given_compile_message_when_classifying_failure_then_compile_error_category_is_returned() {
+        assert_eq!(
+            classify_failure_category("compile failed with syntax error"),
+            "compile_error"
+        );
+    }
+
+    #[test]
+    fn given_mixed_case_timeout_message_when_classifying_failure_then_case_is_ignored() {
+        assert_eq!(
+            classify_failure_category("Network TIMEOUT while fetching dependencies"),
+            "timeout"
+        );
+    }
+
+    #[test]
+    fn given_message_matching_multiple_categories_when_classifying_then_timeout_takes_precedence() {
+        assert_eq!(
+            classify_failure_category("test suite hit timeout and assert failed"),
+            "timeout"
+        );
+    }
+
+    #[test]
+    fn given_assert_message_when_classifying_failure_then_test_failure_category_is_returned() {
+        assert_eq!(
+            classify_failure_category("assert failed in test suite"),
+            "test_failure"
+        );
+    }
+
+    #[test]
+    fn given_sensitive_tokens_when_redacting_then_secret_values_are_removed() {
+        let input = "token=abc password=123 ok=value";
+        assert_eq!(
+            redact_sensitive(input),
+            "token=<redacted> password=<redacted> ok=value"
+        );
+    }
+
+    #[test]
+    fn given_mixed_case_sensitive_keys_when_redacting_then_values_are_removed() {
+        let input = "API_KEY=topsecret DataBase_Url=postgres://localhost safe=yes";
+        assert_eq!(
+            redact_sensitive(input),
+            "API_KEY=<redacted> DataBase_Url=<redacted> safe=yes"
+        );
+    }
+
+    #[test]
+    fn given_message_without_key_value_tokens_when_redacting_then_message_is_unchanged() {
+        let input = "plain text without assignments";
+        assert_eq!(redact_sensitive(input), input);
+    }
+
+    #[test]
+    fn given_failure_message_when_building_diagnostics_then_payload_contains_expected_defaults() {
+        let payload = build_failure_diagnostics(Some("test assertion failed"));
+        assert_eq!(payload.category, "test_failure");
+        assert!(payload.retryable);
+        assert_eq!(payload.next_command, "swarm stage --stage implement");
+        assert_eq!(payload.detail, Some("test assertion failed".to_string()));
+    }
+
+    #[test]
+    fn given_whitespace_only_failure_message_when_building_diagnostics_then_detail_is_omitted() {
+        let payload = build_failure_diagnostics(Some("   \n\t   "));
+        assert_eq!(payload.category, "stage_failure");
+        assert!(payload.detail.is_none());
+    }
+
+    #[test]
+    fn given_missing_failure_message_when_building_diagnostics_then_defaults_are_used() {
+        let payload = build_failure_diagnostics(None);
+        assert_eq!(payload.category, "stage_failure");
+        assert!(payload.retryable);
+        assert_eq!(payload.next_command, "swarm stage --stage implement");
+        assert!(payload.detail.is_none());
+    }
+
+    #[test]
+    fn given_repo_and_bead_when_building_event_entity_id_then_id_is_repo_scoped() {
+        let repo = RepoId::new("local");
+        let bead = BeadId::new("bd-7");
+        assert_eq!(event_entity_id(&bead, &repo), "repo:local:bead:bd-7");
+    }
+
+    #[test]
+    fn given_started_result_when_determining_transition_then_noop_is_returned() {
+        assert_eq!(
+            determine_transition(Stage::Implement, &StageResult::Started),
+            StageTransition::NoOp
+        );
+    }
+
+    #[test]
+    fn given_done_stage_pass_result_when_determining_transition_then_noop_is_returned() {
+        assert_eq!(
+            determine_transition(Stage::Done, &StageResult::Passed),
+            StageTransition::NoOp
         );
     }
 }

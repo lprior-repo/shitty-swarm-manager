@@ -28,7 +28,13 @@ use tokio::fs;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
-const EMBEDDED_COORDINATOR_SCHEMA_SQL: &str = include_str!("canonical_schema/schema.sql");
+mod db_resolution;
+mod handlers;
+mod helpers;
+mod parsing;
+mod validation;
+
+const EMBEDDED_COORDINATOR_SCHEMA_SQL: &str = include_str!("../schema.sql");
 const EMBEDDED_COORDINATOR_SCHEMA_REF: &str = "embedded:crates/swarm-coordinator/schema.sql";
 const DEFAULT_DB_CONNECT_TIMEOUT_MS: u64 = 3_000;
 const MIN_DB_CONNECT_TIMEOUT_MS: u64 = 100;
@@ -37,7 +43,6 @@ const DEFAULT_HISTORY_LIMIT: i64 = 100;
 const MAX_HISTORY_LIMIT: i64 = 10_000;
 const MAX_REGISTER_COUNT: u32 = 100;
 const MAX_EXTERNAL_OUTPUT_CAPTURE_BYTES: usize = 1_048_576;
-const GLOBAL_ALLOWED_REQUEST_ARGS: &[&str] = &["repo_id", "database_url", "connect_timeout_ms"];
 
 #[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct ProtocolRequest {
@@ -267,85 +272,25 @@ fn parse_optional_non_negative_u64(
     request: &ProtocolRequest,
     field: &str,
 ) -> Result<Option<u64>, ParseError> {
-    let Some(raw) = request.args.get(field) else {
-        return Ok(None);
-    };
-
-    if let Some(value) = raw.as_u64() {
-        return Ok(Some(value));
-    }
-
-    if raw.as_i64().is_some_and(|value| value < 0) {
-        return Err(ParseError::InvalidValue {
-            field: field.to_string(),
-            value: "must be non-negative".to_string(),
-        });
-    }
-
-    Err(ParseError::InvalidType {
-        field: field.to_string(),
-        expected: "u64".to_string(),
-        got: json_value_type_name(raw).to_string(),
-    })
+    parsing::parse_optional_non_negative_u64(request, field)
 }
 
 fn parse_optional_non_negative_i64(
     request: &ProtocolRequest,
     field: &str,
 ) -> Result<Option<i64>, ParseError> {
-    let Some(raw) = request.args.get(field) else {
-        return Ok(None);
-    };
-
-    if let Some(value) = raw.as_i64() {
-        if value < 0 {
-            return Err(ParseError::InvalidValue {
-                field: field.to_string(),
-                value: "must be non-negative".to_string(),
-            });
-        }
-        return Ok(Some(value));
-    }
-
-    Err(ParseError::InvalidType {
-        field: field.to_string(),
-        expected: "i64".to_string(),
-        got: json_value_type_name(raw).to_string(),
-    })
+    parsing::parse_optional_non_negative_i64(request, field)
 }
 
 fn parse_optional_non_negative_u32(
     request: &ProtocolRequest,
     field: &str,
 ) -> Result<Option<u32>, ParseError> {
-    let Some(raw) = request.args.get(field) else {
-        return Ok(None);
-    };
-
-    if raw.as_i64().is_some_and(|value| value < 0) {
-        return Err(ParseError::InvalidValue {
-            field: field.to_string(),
-            value: "must be non-negative".to_string(),
-        });
-    }
-
-    let value_as_u64 = raw.as_u64().ok_or_else(|| ParseError::InvalidType {
-        field: field.to_string(),
-        expected: "u32".to_string(),
-        got: json_value_type_name(raw).to_string(),
-    })?;
-
-    let value = u32::try_from(value_as_u64).map_err(|_| ParseError::InvalidValue {
-        field: field.to_string(),
-        value: format!("{value_as_u64} exceeds max u32"),
-    })?;
-
-    Ok(Some(value))
+    parsing::parse_optional_non_negative_u32(request, field)
 }
 
 fn bounded_history_limit(limit: Option<i64>) -> i64 {
-    let requested = limit.map_or(DEFAULT_HISTORY_LIMIT, |value| value);
-    requested.min(MAX_HISTORY_LIMIT)
+    parsing::bounded_history_limit(limit, DEFAULT_HISTORY_LIMIT, MAX_HISTORY_LIMIT)
 }
 
 impl ParseInput for crate::InitDbInput {
@@ -913,147 +858,16 @@ async fn dispatch_no_batch(
     }
 }
 
-// Helper functions to reduce stack frame size
-
-fn allowed_command_args(cmd: &str) -> Option<&'static [&'static str]> {
-    match cmd {
-        "?" | "help" => Some(&["short", "s"]),
-        "state" | "history" => Some(&["limit"]),
-        "doctor" | "status" | "resume" | "agents" => Some(&[]),
-        "lock" => Some(&["resource", "agent", "ttl_ms", "dry"]),
-        "unlock" => Some(&["resource", "agent", "dry"]),
-        "broadcast" => Some(&["msg", "from", "dry"]),
-        "monitor" => Some(&["view", "watch_ms"]),
-        "register" => Some(&["count", "dry"]),
-        "agent" | "run-once" | "smoke" => Some(&["id", "dry"]),
-        "next" | "claim-next" | "bootstrap" => Some(&["dry"]),
-        "assign" => Some(&["bead_id", "agent_id", "dry"]),
-        "qa" => Some(&["target", "id", "dry"]),
-        "resume-context" => Some(&["bead_id"]),
-        "artifacts" => Some(&["bead_id", "artifact_type"]),
-        "release" => Some(&["agent_id", "dry"]),
-        "init-db" => Some(&["url", "schema", "seed_agents", "dry"]),
-        "init-local-db" => Some(&[
-            "container_name",
-            "port",
-            "user",
-            "database",
-            "schema",
-            "seed_agents",
-            "dry",
-        ]),
-        "spawn-prompts" => Some(&["template", "out_dir", "count", "dry"]),
-        "prompt" => Some(&["id", "skill"]),
-        "load-profile" => Some(&["agents", "rounds", "timeout_ms", "dry"]),
-        "init" => Some(&["dry", "database_url", "schema", "seed_agents"]),
-        "batch" => Some(&["ops", "cmds", "dry"]),
-        _ => None,
-    }
-}
-
 fn validate_request_args(
     request: &ProtocolRequest,
 ) -> std::result::Result<(), Box<ProtocolEnvelope>> {
-    let Some(allowed_command_specific) = allowed_command_args(request.cmd.as_str()) else {
-        return Ok(());
-    };
-    let unknown = request
-        .args
-        .keys()
-        .filter(|key| {
-            !allowed_command_specific.contains(&key.as_str())
-                && !GLOBAL_ALLOWED_REQUEST_ARGS.contains(&key.as_str())
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-
-    if unknown.is_empty() {
-        return Ok(());
-    }
-
-    let mut allowed = allowed_command_specific
-        .iter()
-        .map(|key| (*key).to_string())
-        .collect::<Vec<_>>();
-    allowed.extend(
-        GLOBAL_ALLOWED_REQUEST_ARGS
-            .iter()
-            .map(|key| (*key).to_string()),
-    );
-    allowed.sort();
-    allowed.dedup();
-
-    Err(Box::new(
-        ProtocolEnvelope::error(
-            request.rid.clone(),
-            code::INVALID.to_string(),
-            format!(
-                "Unknown field(s) for {}: {}",
-                request.cmd,
-                unknown.join(", ")
-            ),
-        )
-        .with_fix("Remove unknown fields or use documented command arguments".to_string())
-        .with_ctx(json!({"cmd": request.cmd, "unknown": unknown, "allowed": allowed})),
-    ))
+    validation::validate_request_args(request)
 }
 
 fn validate_request_null_bytes(
     request: &ProtocolRequest,
 ) -> std::result::Result<(), Box<ProtocolEnvelope>> {
-    if request.cmd.contains('\0') {
-        return Err(Box::new(
-            ProtocolEnvelope::error(
-                request.rid.clone(),
-                code::INVALID.to_string(),
-                "Null byte is not allowed in cmd".to_string(),
-            )
-            .with_fix("Remove null bytes from request fields".to_string())
-            .with_ctx(json!({"field": "cmd"})),
-        ));
-    }
-
-    if let Some(field) = first_null_byte_field_in_map(&request.args, "") {
-        return Err(Box::new(
-            ProtocolEnvelope::error(
-                request.rid.clone(),
-                code::INVALID.to_string(),
-                format!("Null byte is not allowed in field {field}"),
-            )
-            .with_fix("Remove null bytes from request fields".to_string())
-            .with_ctx(json!({"field": field})),
-        ));
-    }
-
-    Ok(())
-}
-
-fn first_null_byte_field_in_map(map: &Map<String, Value>, prefix: &str) -> Option<String> {
-    map.iter().find_map(|(key, value)| {
-        let field = if prefix.is_empty() {
-            key.clone()
-        } else {
-            format!("{prefix}.{key}")
-        };
-        first_null_byte_field_in_value(value, &field)
-    })
-}
-
-fn first_null_byte_field_in_value(value: &Value, field: &str) -> Option<String> {
-    match value {
-        Value::String(text) => {
-            if text.contains('\0') {
-                Some(field.to_string())
-            } else {
-                None
-            }
-        }
-        Value::Array(items) => items.iter().enumerate().find_map(|(index, item)| {
-            first_null_byte_field_in_value(item, &format!("{field}[{index}]"))
-        }),
-        Value::Object(object) => first_null_byte_field_in_map(object, field),
-        Value::Null | Value::Bool(_) | Value::Number(_) => None,
-    }
+    validation::validate_request_null_bytes(request)
 }
 
 struct CommandSuccess {
@@ -1396,403 +1210,19 @@ async fn handle_next(
 async fn handle_claim_next(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
-    let total_start = Instant::now();
-    if dry_flag(request) {
-        return Ok(dry_run_success(
-            request,
-            vec![
-                json!({"step": 1, "action": "bv_robot_next", "target": "bv --robot-next"}),
-                json!({"step": 2, "action": "br_update", "target": "br update <bead-id> --status in_progress --json"}),
-            ],
-            "swarm status",
-        ));
-    }
-
-    let (recommendation_payload, bv_robot_next_ms) = run_external_json_command_with_ms(
-        "bv",
-        &["--robot-next"],
-        request.rid.clone(),
-        "Run `bv --robot-next` manually and verify beads index is available",
-    )
-    .await?;
-    let recommendation = project_next_recommendation(&recommendation_payload);
-    let bead_id = bead_id_from_recommendation(&recommendation).ok_or_else(|| {
-        Box::new(
-            ProtocolEnvelope::error(
-                request.rid.clone(),
-                code::INVALID.to_string(),
-                "bv --robot-next returned no bead id".to_string(),
-            )
-            .with_fix("Run `bv --robot-next` and verify it returns an object with id".to_string())
-            .with_ctx(json!({"next": recommendation})),
-        )
-    })?;
-
-    let (claim, br_update_ms) = run_external_json_command_with_ms(
-        "br",
-        &[
-            "update",
-            bead_id.as_str(),
-            "--status",
-            "in_progress",
-            "--json",
-        ],
-        request.rid.clone(),
-        "Run `br update <bead-id> --status in_progress --json` manually",
-    )
-    .await?;
-
-    Ok(CommandSuccess {
-        data: json!({
-            "selection": recommendation,
-            "claim": claim,
-            "timing": {
-                "external": {
-                    "bv_robot_next_ms": bv_robot_next_ms,
-                    "br_update_ms": br_update_ms,
-                },
-                "total_ms": elapsed_ms(total_start),
-            }
-        }),
-        next: format!("br show {bead_id}"),
-        state: minimal_state_for_request(request).await,
-    })
-}
-
-fn first_issue_from_br_payload(payload: &Value) -> Option<&Value> {
-    if payload.is_object() {
-        return Some(payload);
-    }
-
-    payload.as_array().and_then(|items| items.first())
-}
-
-fn issue_status_from_br_payload(payload: &Value) -> Option<String> {
-    first_issue_from_br_payload(payload)
-        .and_then(|issue| issue.get("status"))
-        .and_then(Value::as_str)
-        .map(std::string::ToString::to_string)
-}
-
-fn issue_id_from_br_payload(payload: &Value) -> Option<String> {
-    first_issue_from_br_payload(payload)
-        .and_then(|issue| issue.get("id"))
-        .and_then(Value::as_str)
-        .map(std::string::ToString::to_string)
-}
-
-async fn valid_agent_ids(db: &SwarmDb, repo_id: &RepoId) -> Vec<u32> {
-    db.get_available_agents(repo_id)
-        .await
-        .map(|agents| {
-            agents
-                .into_iter()
-                .map(|agent| agent.agent_id)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
+    handlers::orchestration::handle_claim_next(request).await
 }
 
 async fn handle_assign(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
-    let db: SwarmDb = db_from_request(request).await?;
-    let repo_id = repo_id_from_request(request);
-
-    let bead_id = request
-        .args
-        .get("bead_id")
-        .and_then(Value::as_str)
-        .map(std::string::ToString::to_string)
-        .ok_or_else(|| {
-            Box::new(
-                ProtocolEnvelope::error(
-                    request.rid.clone(),
-                    code::INVALID.to_string(),
-                    "Missing required field: bead_id".to_string(),
-                )
-                .with_fix(
-                    "echo '{\"cmd\":\"assign\",\"bead_id\":\"<bead-id>\",\"agent_id\":1}' | swarm"
-                        .to_string(),
-                )
-                .with_ctx(json!({"bead_id": "required"})),
-            )
-        })?;
-
-    let valid_ids = valid_agent_ids(&db, &repo_id).await;
-    let agent_id = request
-        .args
-        .get("agent_id")
-        .and_then(Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or_else(|| {
-            Box::new(
-                ProtocolEnvelope::error(
-                    request.rid.clone(),
-                    code::INVALID.to_string(),
-                    "Missing required field: agent_id".to_string(),
-                )
-                .with_fix(
-                    "echo '{\"cmd\":\"assign\",\"bead_id\":\"<bead-id>\",\"agent_id\":1}' | swarm"
-                        .to_string(),
-                )
-                .with_ctx(json!({"agent_id": "required", "valid_ids": valid_ids})),
-            )
-        })?;
-
-    if dry_flag(request) {
-        return Ok(dry_run_success(
-            request,
-            vec![
-                json!({"step": 1, "action": "br_show", "target": format!("br show {bead_id} --json")}),
-                json!({"step": 2, "action": "claim_bead", "target": format!("agent:{agent_id}, bead:{bead_id}")}),
-                json!({"step": 3, "action": "br_update", "target": format!("br update {bead_id} --status in_progress --assignee swarm-agent-{agent_id} --json")}),
-                json!({"step": 4, "action": "br_verify", "target": format!("br show {bead_id} --json")}),
-            ],
-            "swarm monitor --view active",
-        ));
-    }
-
-    let agent_key = AgentId::new(repo_id.clone(), agent_id);
-    let state = db
-        .get_agent_state(&agent_key)
-        .await
-        .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
-
-    let Some(agent_state) = state else {
-        return Err(Box::new(
-            ProtocolEnvelope::error(
-                request.rid.clone(),
-                code::NOTFOUND.to_string(),
-                format!("Agent {agent_id} is not registered"),
-            )
-            .with_fix("swarm register --count <n>".to_string())
-            .with_ctx(json!({"agent_id": agent_id, "valid_ids": valid_ids})),
-        ));
-    };
-
-    if agent_state.status().as_str() != "idle" || agent_state.bead_id().is_some() {
-        return Err(Box::new(
-            ProtocolEnvelope::error(
-                request.rid.clone(),
-                code::CONFLICT.to_string(),
-                format!("Agent {agent_id} is not idle"),
-            )
-            .with_fix(
-                "Choose an idle agent from `swarm monitor --view active` or `swarm state`"
-                    .to_string(),
-            )
-            .with_ctx(json!({
-                "agent_id": agent_id,
-                "agent_status": agent_state.status().as_str(),
-                "current_bead": agent_state.bead_id().map(|b| b.value().to_string()),
-            })),
-        ));
-    }
-
-    let bead_before = run_external_json_command(
-        "br",
-        &["show", bead_id.as_str(), "--json"],
-        request.rid.clone(),
-        "Run `br show <bead-id> --json` and verify bead exists",
-    )
-    .await?;
-
-    let current_status = issue_status_from_br_payload(&bead_before).ok_or_else(|| {
-        Box::new(
-            ProtocolEnvelope::error(
-                request.rid.clone(),
-                code::INVALID.to_string(),
-                "br show returned payload without status".to_string(),
-            )
-            .with_fix("Run `br show <bead-id> --json` and inspect response shape".to_string())
-            .with_ctx(json!({"payload": bead_before})),
-        )
-    })?;
-
-    if current_status != "open" {
-        return Err(Box::new(
-            ProtocolEnvelope::error(
-                request.rid.clone(),
-                code::CONFLICT.to_string(),
-                format!("Bead {bead_id} is not assignable: status={current_status}"),
-            )
-            .with_fix("Use an open bead id from `br ready --json`".to_string())
-            .with_ctx(json!({"bead_id": bead_id, "status": current_status})),
-        ));
-    }
-
-    let claimed = db
-        .claim_bead(&agent_key, &BeadId::new(bead_id.clone()))
-        .await
-        .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
-
-    if !claimed {
-        return Err(Box::new(
-            ProtocolEnvelope::error(
-                request.rid.clone(),
-                code::CONFLICT.to_string(),
-                format!("Failed to claim bead {bead_id} for agent {agent_id}"),
-            )
-            .with_fix("Verify bead is not already claimed and retry".to_string())
-            .with_ctx(json!({"bead_id": bead_id, "agent_id": agent_id})),
-        ));
-    }
-
-    let assignee = format!("swarm-agent-{agent_id}");
-    let update_result = run_external_json_command(
-        "br",
-        &[
-            "update",
-            bead_id.as_str(),
-            "--status",
-            "in_progress",
-            "--assignee",
-            assignee.as_str(),
-            "--json",
-        ],
-        request.rid.clone(),
-        "Run `br update <bead-id> --status in_progress --assignee swarm-agent-<id> --json` manually",
-    )
-    .await;
-
-    let br_update = match update_result {
-        Ok(value) => value,
-        Err(err) => {
-            let _ = db.release_agent(&agent_key).await;
-            return Err(Box::new(
-                ProtocolEnvelope::error(
-                    request.rid.clone(),
-                    code::CONFLICT.to_string(),
-                    format!(
-                        "assign failed during br update and was rolled back for bead {bead_id}"
-                    ),
-                )
-                .with_fix(
-                    "Retry once br command succeeds. Local claim was reverted to avoid drift"
-                        .to_string(),
-                )
-                .with_ctx(json!({"bead_id": bead_id, "agent_id": agent_id, "br_error": err.err})),
-            ));
-        }
-    };
-
-    let bead_after = run_external_json_command(
-        "br",
-        &["show", bead_id.as_str(), "--json"],
-        request.rid.clone(),
-        "Run `br show <bead-id> --json` and verify bead status",
-    )
-    .await?;
-
-    let verified_status = issue_status_from_br_payload(&bead_after);
-    let verified_id = issue_id_from_br_payload(&bead_after);
-
-    Ok(CommandSuccess {
-        data: json!({
-            "bead_id": bead_id,
-            "agent_id": agent_id,
-            "assignee": assignee,
-            "swarm_claim": {
-                "claimed": true,
-                "agent_status": "working",
-            },
-            "br_sync": {
-                "update": br_update,
-                "verify": bead_after,
-                "verified_status": verified_status,
-                "verified_id": verified_id,
-            },
-            "synced": true,
-            "timestamp": chrono::Utc::now().to_rfc3339(),
-        }),
-        next: "swarm monitor --view active".to_string(),
-        state: minimal_state_for_request(request).await,
-    })
+    handlers::orchestration::handle_assign(request).await
 }
 
 async fn handle_run_once(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
-    let total_start = Instant::now();
-    let agent_id = request
-        .args
-        .get("id")
-        .and_then(Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-        .map_or(1_u32, |value| value);
-
-    if dry_flag(request) {
-        return Ok(dry_run_success(
-            request,
-            vec![
-                json!({"step": 1, "action": "doctor"}),
-                json!({"step": 2, "action": "status"}),
-                json!({"step": 3, "action": "claim_next"}),
-                json!({"step": 4, "action": "agent", "target": agent_id}),
-                json!({"step": 5, "action": "monitor", "target": "progress"}),
-            ],
-            "swarm status",
-        ));
-    }
-
-    let doctor_start = Instant::now();
-    let doctor = handle_doctor(request).await?.data;
-    let doctor_ms = elapsed_ms(doctor_start);
-    let status_before_start = Instant::now();
-    let status_before = handle_status(request).await?.data;
-    let status_before_ms = elapsed_ms(status_before_start);
-    let claim_start = Instant::now();
-    let claim = handle_claim_next(request).await?.data;
-    let claim_ms = elapsed_ms(claim_start);
-
-    let agent_request = ProtocolRequest {
-        cmd: "agent".to_string(),
-        rid: request.rid.clone(),
-        dry: Some(false),
-        args: Map::from_iter(vec![("id".to_string(), Value::from(agent_id))]),
-    };
-    let agent_start = Instant::now();
-    let agent = handle_agent(&agent_request).await?.data;
-    let agent_ms = elapsed_ms(agent_start);
-
-    let progress_request = ProtocolRequest {
-        cmd: "monitor".to_string(),
-        rid: request.rid.clone(),
-        dry: Some(false),
-        args: Map::from_iter(vec![(
-            "view".to_string(),
-            Value::String("progress".to_string()),
-        )]),
-    };
-    let progress_start = Instant::now();
-    let progress = handle_monitor(&progress_request).await?.data;
-    let progress_ms = elapsed_ms(progress_start);
-
-    Ok(CommandSuccess {
-        data: json!({
-            "agent_id": agent_id,
-            "steps": {
-                "doctor": doctor,
-                "status_before": status_before,
-                "claim_next": claim,
-                "agent": agent,
-                "progress": progress,
-            },
-            "timing": {
-                "steps_ms": {
-                    "doctor": doctor_ms,
-                    "status_before": status_before_ms,
-                    "claim_next": claim_ms,
-                    "agent": agent_ms,
-                    "progress": progress_ms,
-                },
-                "total_ms": elapsed_ms(total_start),
-            }
-        }),
-        next: "swarm monitor --view failures".to_string(),
-        state: minimal_state_for_request(request).await,
-    })
+    handlers::orchestration::handle_run_once(request).await
 }
 
 async fn handle_qa(
@@ -1960,14 +1390,15 @@ async fn handle_history(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
     let input = crate::HistoryInput::parse_input(request).map_err(|error| {
+        let error_message = error.to_string();
         Box::new(
             ProtocolEnvelope::error(
                 request.rid.clone(),
                 code::INVALID.to_string(),
-                error.clone(),
+                error_message.clone(),
             )
             .with_fix("echo '{\"cmd\":\"history\",\"limit\":100}' | swarm".to_string())
-            .with_ctx(json!({"error": error})),
+            .with_ctx(json!({"error": error_message})),
         )
     })?;
 
@@ -3133,7 +2564,6 @@ async fn handle_init_db(
         )
     })?;
 
-    let url = resolve_database_url_for_init(request).await?;
     let schema = input
         .schema
         .as_deref()
@@ -3142,16 +2572,22 @@ async fn handle_init_db(
     let seed_agents = input.seed_agents.map_or(12, |value| value);
 
     if dry_flag(request) {
+        let dry_database_target = input.url.as_deref().map_or_else(
+            || "auto-discover-on-execution".to_string(),
+            mask_database_url,
+        );
         return Ok(dry_run_success(
             request,
             vec![
-                json!({"step": 1, "action": "connect_db", "target": mask_database_url(&url)}),
+                json!({"step": 1, "action": "connect_db", "target": dry_database_target}),
                 json!({"step": 2, "action": "apply_schema", "target": schema.clone().unwrap_or_else(|| EMBEDDED_COORDINATOR_SCHEMA_REF.to_string())}),
                 json!({"step": 3, "action": "seed_agents", "target": seed_agents}),
             ],
             "swarm state",
         ));
     }
+
+    let url = resolve_database_url_for_init(request).await?;
 
     let (schema_sql, schema_ref) = load_schema_sql(request.rid.clone(), schema.as_deref()).await?;
     let db: SwarmDb = SwarmDb::new(&url)
@@ -3314,10 +2750,6 @@ async fn handle_init_local_db(
 async fn handle_spawn_prompts(
     request: &ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
-    let db: SwarmDb = db_from_request(request).await?;
-    let repo_id = repo_id_from_request(request);
-    let config = db.get_config(&repo_id).await.ok();
-
     let (template_text, template_name) =
         if let Some(path) = request.args.get("template").and_then(Value::as_str) {
             let text = fs::read_to_string(path).await.map_err(|err| {
@@ -3352,7 +2784,6 @@ async fn handle_spawn_prompts(
         .get("count")
         .and_then(Value::as_u64)
         .and_then(|v| u32::try_from(v).ok())
-        .or_else(|| config.as_ref().map(|c| c.max_agents))
         .unwrap_or(10);
 
     if dry_flag(request) {
@@ -3366,15 +2797,30 @@ async fn handle_spawn_prompts(
         ));
     }
 
+    let db: SwarmDb = db_from_request(request).await?;
+    let repo_id = repo_id_from_request(request);
+    let configured_count = db
+        .get_config(&repo_id)
+        .await
+        .ok()
+        .map_or(count, |cfg| cfg.max_agents);
+
     fs::create_dir_all(out_dir)
         .await
         .map_err(SwarmError::IoError)
         .map_err(|e| to_protocol_failure(e, request.rid.clone()))?;
 
-    spawn_prompts_recursive(out_dir, &template_text, 1, count, request.rid.clone()).await?;
+    spawn_prompts_recursive(
+        out_dir,
+        &template_text,
+        1,
+        configured_count,
+        request.rid.clone(),
+    )
+    .await?;
 
     Ok(CommandSuccess {
-        data: json!({"count": count, "out_dir": out_dir, "template": template_name}),
+        data: json!({"count": configured_count, "out_dir": out_dir, "template": template_name}),
         next: "swarm monitor --view active".to_string(),
         state: minimal_state_for_request(request).await,
     })
@@ -3878,200 +3324,86 @@ fn required_string_arg(
     request: &ProtocolRequest,
     key: &str,
 ) -> std::result::Result<String, Box<ProtocolEnvelope>> {
-    request
-        .args
-        .get(key)
-        .and_then(Value::as_str)
-        .map(std::string::ToString::to_string)
-        .ok_or_else(|| {
-            Box::new(ProtocolEnvelope::error(
-                request.rid.clone(),
-                code::INVALID.to_string(),
-                format!("Missing required field: {key}"),
-            )
-            .with_fix(format!("Add '{key}' field to request. Example: echo '{{\"cmd\":\"agent\",\"{key}\":<value>}}' | swarm"))
-            .with_ctx(json!({key: "required"})))
-        })
+    helpers::required_string_arg(request, key)
 }
 
 async fn db_from_request(
     request: &ProtocolRequest,
 ) -> std::result::Result<SwarmDb, Box<ProtocolEnvelope>> {
-    let explicit_database_url = request
-        .args
-        .get("database_url")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let candidates =
-        compose_database_url_candidates(explicit_database_url, database_url_candidates_for_cli());
-    let timeout_ms = request_connect_timeout_ms(request)?;
-    connect_using_candidates(candidates, timeout_ms, request.rid.clone()).await
+    db_resolution::db_from_request(
+        request,
+        DEFAULT_DB_CONNECT_TIMEOUT_MS,
+        MIN_DB_CONNECT_TIMEOUT_MS,
+        MAX_DB_CONNECT_TIMEOUT_MS,
+    )
+    .await
 }
 
 async fn resolve_database_url_for_init(
     request: &ProtocolRequest,
 ) -> std::result::Result<String, Box<ProtocolEnvelope>> {
-    if let Some(url) = request
-        .args
-        .get("url")
-        .and_then(Value::as_str)
-        .map(std::string::ToString::to_string)
-    {
-        return Ok(url);
-    }
-
-    if let Some(url) = request
-        .args
-        .get("database_url")
-        .and_then(Value::as_str)
-        .map(std::string::ToString::to_string)
-    {
-        return Ok(url);
-    }
-
-    let candidates = database_url_candidates_for_cli();
-    let timeout_ms = request_connect_timeout_ms(request)?;
-    let (connected, failures) = try_connect_candidates(&candidates, timeout_ms).await;
-    if let Some((_db, connected_url)) = connected {
-        return Ok(connected_url);
-    }
-
-    let masked: Vec<String> = candidates
-        .iter()
-        .map(|candidate| mask_database_url(candidate))
-        .collect();
-
-    Err(Box::new(
-        ProtocolEnvelope::error(
-            request.rid.clone(),
-            code::INTERNAL.to_string(),
-            "Unable to resolve a reachable database URL for init-db".to_string(),
-        )
-        .with_fix("Pass --url <database_url> or run 'swarm init-local-db'".to_string())
-        .with_ctx(json!({"tried": masked, "errors": failures})),
-    ))
-}
-
-async fn connect_using_candidates(
-    candidates: Vec<String>,
-    timeout_ms: u64,
-    rid: Option<String>,
-) -> std::result::Result<SwarmDb, Box<ProtocolEnvelope>> {
-    let (connected, failures) = try_connect_candidates(&candidates, timeout_ms).await;
-    if let Some((db, _connected_url)) = connected {
-        return Ok(db);
-    }
-
-    let masked: Vec<String> = candidates
-        .iter()
-        .map(|candidate| mask_database_url(candidate))
-        .collect();
-
-    Err(Box::new(
-        ProtocolEnvelope::error(
-            rid,
-            code::INTERNAL.to_string(),
-            "Unable to connect to any configured database URL".to_string(),
-        )
-        .with_fix(
-            "Set DATABASE_URL, verify postgres is reachable, or run 'swarm init-local-db'"
-                .to_string(),
-        )
-        .with_ctx(json!({"tried": masked, "errors": failures})),
-    ))
+    db_resolution::resolve_database_url_for_init(
+        request,
+        DEFAULT_DB_CONNECT_TIMEOUT_MS,
+        MIN_DB_CONNECT_TIMEOUT_MS,
+        MAX_DB_CONNECT_TIMEOUT_MS,
+    )
+    .await
 }
 
 async fn try_connect_candidates(
     candidates: &[String],
     timeout_ms: u64,
 ) -> (Option<(SwarmDb, String)>, Vec<String>) {
-    let mut failures = Vec::new();
-
-    for candidate in candidates {
-        match SwarmDb::new_with_timeout(candidate, Some(timeout_ms)).await {
-            Ok(db) => return (Some((db, candidate.clone())), failures),
-            Err(err) => failures.push(format!("{}: {}", mask_database_url(candidate), err)),
-        }
-    }
-
-    (None, failures)
+    db_resolution::try_connect_candidates(candidates, timeout_ms).await
 }
 
 fn database_connect_timeout_ms() -> u64 {
-    parse_database_connect_timeout_ms(std::env::var("SWARM_DB_CONNECT_TIMEOUT_MS").ok().as_deref())
+    parsing::parse_database_connect_timeout_ms(
+        std::env::var("SWARM_DB_CONNECT_TIMEOUT_MS").ok().as_deref(),
+        DEFAULT_DB_CONNECT_TIMEOUT_MS,
+        MIN_DB_CONNECT_TIMEOUT_MS,
+        MAX_DB_CONNECT_TIMEOUT_MS,
+    )
 }
 
+#[cfg(test)]
 fn parse_database_connect_timeout_ms(raw: Option<&str>) -> u64 {
-    raw.map(str::trim)
-        .filter(|value| !value.is_empty())
-        .and_then(|value| value.parse::<u64>().ok())
-        .map_or(DEFAULT_DB_CONNECT_TIMEOUT_MS, |value| {
-            value.clamp(MIN_DB_CONNECT_TIMEOUT_MS, MAX_DB_CONNECT_TIMEOUT_MS)
-        })
-}
-
-fn parse_connect_timeout_value(raw: &Value) -> std::result::Result<u64, ParseError> {
-    let Some(value) = raw.as_u64() else {
-        return Err(ParseError::InvalidType {
-            field: "connect_timeout_ms".to_string(),
-            expected: "u64".to_string(),
-            got: json_value_type_name(raw).to_string(),
-        });
-    };
-
-    Ok(value.clamp(MIN_DB_CONNECT_TIMEOUT_MS, MAX_DB_CONNECT_TIMEOUT_MS))
+    parsing::parse_database_connect_timeout_ms(
+        raw,
+        DEFAULT_DB_CONNECT_TIMEOUT_MS,
+        MIN_DB_CONNECT_TIMEOUT_MS,
+        MAX_DB_CONNECT_TIMEOUT_MS,
+    )
 }
 
 fn request_connect_timeout_ms(
     request: &ProtocolRequest,
 ) -> std::result::Result<u64, Box<ProtocolEnvelope>> {
-    request
-        .args
-        .get("connect_timeout_ms")
-        .map(parse_connect_timeout_value)
-        .transpose()
-        .map(|maybe| maybe.unwrap_or_else(database_connect_timeout_ms))
-        .map_err(|error| {
-            Box::new(
-                ProtocolEnvelope::error(
-                    request.rid.clone(),
-                    code::INVALID.to_string(),
-                    error.to_string(),
-                )
-                .with_fix("Use connect_timeout_ms as an integer between 100 and 30000".to_string())
-                .with_ctx(json!({"error": error.to_string()})),
-            )
-        })
+    parsing::request_connect_timeout_ms(
+        request,
+        DEFAULT_DB_CONNECT_TIMEOUT_MS,
+        MIN_DB_CONNECT_TIMEOUT_MS,
+        MAX_DB_CONNECT_TIMEOUT_MS,
+    )
 }
 
 const fn json_value_type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "bool",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
+    parsing::json_value_type_name(value)
 }
 
 async fn minimal_state_for_request(request: &ProtocolRequest) -> Value {
-    let repo_id = repo_id_from_request(request);
-    match db_from_request(request).await {
-        Ok(db) => match db.get_progress(&repo_id).await {
-            Ok(progress) => minimal_state_from_progress(&progress),
-            Err(_) => json!({"total": 0, "active": 0}),
-        },
-        Err(_) => json!({"total": 0, "active": 0}),
-    }
+    helpers::minimal_state_for_request(
+        request,
+        DEFAULT_DB_CONNECT_TIMEOUT_MS,
+        MIN_DB_CONNECT_TIMEOUT_MS,
+        MAX_DB_CONNECT_TIMEOUT_MS,
+    )
+    .await
 }
 
 fn minimal_state_from_progress(progress: &crate::ProgressSummary) -> Value {
-    json!({
-        "total": progress.total_agents,
-        "active": progress.working + progress.waiting + progress.errors,
-    })
+    helpers::minimal_state_from_progress(progress)
 }
 
 async fn check_command(command: &str) -> Value {
@@ -4356,6 +3688,996 @@ mod init_db_input_tests {
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
+mod parse_input_tests {
+    use super::{ParseInput, ProtocolRequest};
+    use serde_json::{json, Map, Value};
+
+    fn make_request(cmd: &str, args: Map<String, Value>) -> ProtocolRequest {
+        ProtocolRequest {
+            cmd: cmd.to_string(),
+            rid: None,
+            dry: None,
+            args,
+        }
+    }
+
+    mod agent_input_tests {
+        use super::*;
+
+        fn request_with_id(id: Value) -> ProtocolRequest {
+            let mut args = Map::new();
+            args.insert("id".to_string(), id);
+            make_request("agent", args)
+        }
+
+        #[test]
+        fn agent_input_rejects_missing_id() {
+            let request = make_request("agent", Map::new());
+            let err = crate::AgentInput::parse_input(&request)
+                .expect_err("missing id should be rejected");
+            assert!(err.to_string().contains("Missing required field: id"));
+        }
+
+        #[test]
+        fn agent_input_rejects_zero_id() {
+            let request = request_with_id(json!(0));
+            let err =
+                crate::AgentInput::parse_input(&request).expect_err("id=0 should be rejected");
+            assert!(err.to_string().contains("must be greater than 0"));
+        }
+
+        #[test]
+        fn agent_input_rejects_negative_id() {
+            let request = request_with_id(json!(-1));
+            let err = crate::AgentInput::parse_input(&request)
+                .expect_err("negative id should be rejected");
+            assert!(err.to_string().contains("must be greater than 0"));
+        }
+
+        #[test]
+        fn agent_input_rejects_string_id() {
+            let request = request_with_id(json!("not-a-number"));
+            let err =
+                crate::AgentInput::parse_input(&request).expect_err("string id should be rejected");
+            assert!(err.to_string().contains("Invalid type"));
+        }
+
+        #[test]
+        fn agent_input_rejects_id_exceeding_u32_max() {
+            let request = request_with_id(json!(u32::MAX as u64 + 1));
+            let err = crate::AgentInput::parse_input(&request)
+                .expect_err("id exceeding u32 max should be rejected");
+            assert!(err.to_string().contains("exceeds max u32"));
+        }
+
+        #[test]
+        fn agent_input_accepts_valid_id() {
+            let request = request_with_id(json!(5));
+            let parsed =
+                crate::AgentInput::parse_input(&request).expect("valid id should be accepted");
+            assert_eq!(parsed.id, 5);
+        }
+
+        #[test]
+        fn agent_input_accepts_dry_flag() {
+            let mut args = Map::new();
+            args.insert("id".to_string(), json!(1));
+            args.insert("dry".to_string(), json!(true));
+            let request = make_request("agent", args);
+            let parsed = crate::AgentInput::parse_input(&request)
+                .expect("request with dry flag should be accepted");
+            assert_eq!(parsed.dry, Some(true));
+        }
+    }
+
+    mod lock_input_tests {
+        use super::*;
+
+        fn request_with_lock(resource: Value, agent: Value, ttl_ms: Value) -> ProtocolRequest {
+            let mut args = Map::new();
+            args.insert("resource".to_string(), resource);
+            args.insert("agent".to_string(), agent);
+            args.insert("ttl_ms".to_string(), ttl_ms);
+            make_request("lock", args)
+        }
+
+        #[test]
+        fn lock_input_rejects_missing_resource() {
+            let mut args = Map::new();
+            args.insert("agent".to_string(), json!("agent-1"));
+            args.insert("ttl_ms".to_string(), json!(30000));
+            let request = make_request("lock", args);
+            let err = crate::LockInput::parse_input(&request)
+                .expect_err("missing resource should be rejected");
+            assert!(err.to_string().contains("Missing required field: resource"));
+        }
+
+        #[test]
+        fn lock_input_rejects_missing_agent() {
+            let mut args = Map::new();
+            args.insert("resource".to_string(), json!("repo-123"));
+            args.insert("ttl_ms".to_string(), json!(30000));
+            let request = make_request("lock", args);
+            let err = crate::LockInput::parse_input(&request)
+                .expect_err("missing agent should be rejected");
+            assert!(err.to_string().contains("Missing required field: agent"));
+        }
+
+        #[test]
+        fn lock_input_rejects_missing_ttl_ms() {
+            let mut args = Map::new();
+            args.insert("resource".to_string(), json!("repo-123"));
+            args.insert("agent".to_string(), json!("agent-1"));
+            let request = make_request("lock", args);
+            let err = crate::LockInput::parse_input(&request)
+                .expect_err("missing ttl_ms should be rejected");
+            assert!(err.to_string().contains("Missing required field: ttl_ms"));
+        }
+
+        #[test]
+        fn lock_input_accepts_all_required_fields() {
+            let request = request_with_lock(json!("repo-123"), json!("agent-1"), json!(30000));
+            let parsed = crate::LockInput::parse_input(&request)
+                .expect("all required fields should be accepted");
+            assert_eq!(parsed.resource, "repo-123");
+            assert_eq!(parsed.agent, "agent-1");
+            assert_eq!(parsed.ttl_ms, 30000);
+        }
+
+        #[test]
+        fn lock_input_accepts_dry_flag() {
+            let mut args = Map::new();
+            args.insert("resource".to_string(), json!("repo-123"));
+            args.insert("agent".to_string(), json!("agent-1"));
+            args.insert("ttl_ms".to_string(), json!(30000));
+            args.insert("dry".to_string(), json!(true));
+            let request = make_request("lock", args);
+            let parsed = crate::LockInput::parse_input(&request)
+                .expect("request with dry flag should be accepted");
+            assert_eq!(parsed.dry, Some(true));
+        }
+    }
+
+    mod broadcast_input_tests {
+        use super::*;
+
+        fn request_with_broadcast(msg: Value, from: Value) -> ProtocolRequest {
+            let mut args = Map::new();
+            args.insert("msg".to_string(), msg);
+            args.insert("from".to_string(), from);
+            make_request("broadcast", args)
+        }
+
+        #[test]
+        fn broadcast_input_rejects_missing_msg() {
+            let mut args = Map::new();
+            args.insert("from".to_string(), json!("agent-1"));
+            let request = make_request("broadcast", args);
+            let err = crate::BroadcastInput::parse_input(&request)
+                .expect_err("missing msg should be rejected");
+            assert!(err.to_string().contains("Missing required field: msg"));
+        }
+
+        #[test]
+        fn broadcast_input_rejects_missing_from() {
+            let mut args = Map::new();
+            args.insert("msg".to_string(), json!("hello world"));
+            let request = make_request("broadcast", args);
+            let err = crate::BroadcastInput::parse_input(&request)
+                .expect_err("missing from should be rejected");
+            assert!(err.to_string().contains("Missing required field: from"));
+        }
+
+        #[test]
+        fn broadcast_input_accepts_all_required_fields() {
+            let request = request_with_broadcast(json!("hello"), json!("agent-1"));
+            let parsed = crate::BroadcastInput::parse_input(&request)
+                .expect("all required fields should be accepted");
+            assert_eq!(parsed.msg, "hello");
+            assert_eq!(parsed.from, "agent-1");
+        }
+
+        #[test]
+        fn broadcast_input_accepts_dry_flag() {
+            let mut args = Map::new();
+            args.insert("msg".to_string(), json!("hello"));
+            args.insert("from".to_string(), json!("agent-1"));
+            args.insert("dry".to_string(), json!(true));
+            let request = make_request("broadcast", args);
+            let parsed = crate::BroadcastInput::parse_input(&request)
+                .expect("request with dry flag should be accepted");
+            assert_eq!(parsed.dry, Some(true));
+        }
+    }
+
+    mod prompt_input_tests {
+        use super::*;
+
+        fn request_with_prompt(id: Option<Value>, skill: Option<Value>) -> ProtocolRequest {
+            let mut args = Map::new();
+            if let Some(id_val) = id {
+                args.insert("id".to_string(), id_val);
+            }
+            if let Some(skill_val) = skill {
+                args.insert("skill".to_string(), skill_val);
+            }
+            make_request("prompt", args)
+        }
+
+        #[test]
+        fn prompt_input_defaults_id_to_one() {
+            let request = request_with_prompt(None, None);
+            let parsed = crate::PromptInput::parse_input(&request)
+                .expect("request without id should be accepted");
+            assert_eq!(parsed.id, 1);
+        }
+
+        #[test]
+        fn prompt_input_accepts_custom_id() {
+            let request = request_with_prompt(Some(json!(5)), None);
+            let parsed = crate::PromptInput::parse_input(&request)
+                .expect("request with custom id should be accepted");
+            assert_eq!(parsed.id, 5);
+        }
+
+        #[test]
+        fn prompt_input_rejects_zero_id() {
+            let request = request_with_prompt(Some(json!(0)), None);
+            let err =
+                crate::PromptInput::parse_input(&request).expect_err("id=0 should be rejected");
+            assert!(err.to_string().contains("must be greater than 0"));
+        }
+
+        #[test]
+        fn prompt_input_rejects_negative_id() {
+            let request = request_with_prompt(Some(json!(-1)), None);
+            let err = crate::PromptInput::parse_input(&request)
+                .expect_err("negative id should be rejected");
+            assert!(err.to_string().contains("must be greater than 0"));
+        }
+
+        #[test]
+        fn prompt_input_accepts_skill() {
+            let request = request_with_prompt(None, Some(json!("rust")));
+            let parsed = crate::PromptInput::parse_input(&request)
+                .expect("request with skill should be accepted");
+            assert_eq!(parsed.skill, Some("rust".to_string()));
+        }
+
+        #[test]
+        fn prompt_input_accepts_id_and_skill() {
+            let request = request_with_prompt(Some(json!(3)), Some(json!("python")));
+            let parsed = crate::PromptInput::parse_input(&request)
+                .expect("request with id and skill should be accepted");
+            assert_eq!(parsed.id, 3);
+            assert_eq!(parsed.skill, Some("python".to_string()));
+        }
+    }
+
+    mod smoke_input_tests {
+        use super::*;
+
+        fn request_with_smoke(id: Option<Value>) -> ProtocolRequest {
+            let mut args = Map::new();
+            if let Some(id_val) = id {
+                args.insert("id".to_string(), id_val);
+            }
+            make_request("smoke", args)
+        }
+
+        #[test]
+        fn smoke_input_defaults_id_to_one() {
+            let request = request_with_smoke(None);
+            let parsed = crate::SmokeInput::parse_input(&request)
+                .expect("request without id should be accepted");
+            assert_eq!(parsed.id, 1);
+        }
+
+        #[test]
+        fn smoke_input_accepts_custom_id() {
+            let request = request_with_smoke(Some(json!(7)));
+            let parsed = crate::SmokeInput::parse_input(&request)
+                .expect("request with custom id should be accepted");
+            assert_eq!(parsed.id, 7);
+        }
+
+        #[test]
+        fn smoke_input_accepts_dry_flag() {
+            let mut args = Map::new();
+            args.insert("id".to_string(), json!(1));
+            args.insert("dry".to_string(), json!(true));
+            let request = make_request("smoke", args);
+            let parsed = crate::SmokeInput::parse_input(&request)
+                .expect("request with dry flag should be accepted");
+            assert_eq!(parsed.dry, Some(true));
+        }
+    }
+
+    mod monitor_input_tests {
+        use super::*;
+
+        fn request_with_monitor(view: Option<Value>, watch_ms: Option<Value>) -> ProtocolRequest {
+            let mut args = Map::new();
+            if let Some(view_val) = view {
+                args.insert("view".to_string(), view_val);
+            }
+            if let Some(watch_val) = watch_ms {
+                args.insert("watch_ms".to_string(), watch_val);
+            }
+            make_request("monitor", args)
+        }
+
+        #[test]
+        fn monitor_input_accepts_view() {
+            let request = request_with_monitor(Some(json!("progress")), None);
+            let parsed = crate::MonitorInput::parse_input(&request)
+                .expect("request with view should be accepted");
+            assert_eq!(parsed.view, Some("progress".to_string()));
+        }
+
+        #[test]
+        fn monitor_input_accepts_watch_ms() {
+            let request = request_with_monitor(None, Some(json!(5000)));
+            let parsed = crate::MonitorInput::parse_input(&request)
+                .expect("request with watch_ms should be accepted");
+            assert_eq!(parsed.watch_ms, Some(5000));
+        }
+
+        #[test]
+        fn monitor_input_accepts_view_and_watch_ms_with_values() {
+            let request = request_with_monitor(Some(json!("failures")), Some(json!(10000)));
+            let parsed = crate::MonitorInput::parse_input(&request)
+                .expect("request with view and watch_ms should be accepted");
+            assert_eq!(parsed.view, Some("failures".to_string()));
+            assert_eq!(parsed.watch_ms, Some(10000));
+        }
+
+        #[test]
+        fn monitor_input_rejects_negative_watch_ms() {
+            let request = request_with_monitor(None, Some(json!(-1)));
+            let err = crate::MonitorInput::parse_input(&request)
+                .expect_err("negative watch_ms should be rejected");
+            assert!(err.to_string().contains("must be non-negative"));
+        }
+    }
+
+    mod init_local_db_input_tests {
+        use super::*;
+
+        fn request_with_init_local_db(
+            container_name: Option<Value>,
+            port: Option<Value>,
+            user: Option<Value>,
+            database: Option<Value>,
+            schema: Option<Value>,
+            seed_agents: Option<Value>,
+        ) -> ProtocolRequest {
+            let mut args = Map::new();
+            if let Some(v) = container_name {
+                args.insert("container_name".to_string(), v);
+            }
+            if let Some(v) = port {
+                args.insert("port".to_string(), v);
+            }
+            if let Some(v) = user {
+                args.insert("user".to_string(), v);
+            }
+            if let Some(v) = database {
+                args.insert("database".to_string(), v);
+            }
+            if let Some(v) = schema {
+                args.insert("schema".to_string(), v);
+            }
+            if let Some(v) = seed_agents {
+                args.insert("seed_agents".to_string(), v);
+            }
+            make_request("init-local-db", args)
+        }
+
+        #[test]
+        fn init_local_db_input_accepts_empty_args() {
+            let request = make_request("init-local-db", Map::new());
+            let parsed = crate::InitLocalDbInput::parse_input(&request)
+                .expect("empty args should be accepted");
+            assert_eq!(parsed.container_name, None);
+            assert_eq!(parsed.port, None);
+            assert_eq!(parsed.user, None);
+            assert_eq!(parsed.database, None);
+            assert_eq!(parsed.schema, None);
+            assert_eq!(parsed.seed_agents, None);
+        }
+
+        #[test]
+        fn init_local_db_input_accepts_all_fields() {
+            let request = request_with_init_local_db(
+                Some(json!("swarm-db")),
+                Some(json!(5437)),
+                Some(json!("user")),
+                Some(json!("db")),
+                Some(json!("public")),
+                Some(json!(5)),
+            );
+            let parsed = crate::InitLocalDbInput::parse_input(&request)
+                .expect("all fields should be accepted");
+            assert_eq!(parsed.container_name, Some("swarm-db".to_string()));
+            assert_eq!(parsed.port, Some(5437));
+            assert_eq!(parsed.user, Some("user".to_string()));
+            assert_eq!(parsed.database, Some("db".to_string()));
+            assert_eq!(parsed.schema, Some("public".to_string()));
+            assert_eq!(parsed.seed_agents, Some(5));
+        }
+
+        #[test]
+        fn init_local_db_input_rejects_port_exceeding_u16_max() {
+            let mut args = Map::new();
+            args.insert("port".to_string(), json!(u16::MAX as u64 + 1));
+            let request = make_request("init-local-db", args);
+            let err = crate::InitLocalDbInput::parse_input(&request)
+                .expect_err("port exceeding u16 max should be rejected");
+            assert!(err.to_string().contains("exceeds max"));
+        }
+
+        #[test]
+        fn init_local_db_input_accepts_dry_flag() {
+            let mut args = Map::new();
+            args.insert("dry".to_string(), json!(true));
+            let request = make_request("init-local-db", args);
+            let parsed = crate::InitLocalDbInput::parse_input(&request)
+                .expect("request with dry flag should be accepted");
+            assert_eq!(parsed.dry, Some(true));
+        }
+    }
+
+    mod init_input_tests {
+        use super::*;
+
+        fn request_with_init(
+            database_url: Option<Value>,
+            schema: Option<Value>,
+            seed_agents: Option<Value>,
+        ) -> ProtocolRequest {
+            let mut args = Map::new();
+            if let Some(v) = database_url {
+                args.insert("database_url".to_string(), v);
+            }
+            if let Some(v) = schema {
+                args.insert("schema".to_string(), v);
+            }
+            if let Some(v) = seed_agents {
+                args.insert("seed_agents".to_string(), v);
+            }
+            make_request("init", args)
+        }
+
+        #[test]
+        fn init_input_accepts_empty_args() {
+            let request = make_request("init", Map::new());
+            let parsed =
+                crate::InitInput::parse_input(&request).expect("empty args should be accepted");
+            assert_eq!(parsed.database_url, None);
+            assert_eq!(parsed.schema, None);
+            assert_eq!(parsed.seed_agents, None);
+        }
+
+        #[test]
+        fn init_input_accepts_database_url() {
+            let request = request_with_init(Some(json!("postgres://localhost/test")), None, None);
+            let parsed = crate::InitInput::parse_input(&request)
+                .expect("request with database_url should be accepted");
+            assert_eq!(
+                parsed.database_url,
+                Some("postgres://localhost/test".to_string())
+            );
+        }
+
+        #[test]
+        fn init_input_accepts_schema() {
+            let request = request_with_init(None, Some(json!("custom-schema")), None);
+            let parsed = crate::InitInput::parse_input(&request)
+                .expect("request with schema should be accepted");
+            assert_eq!(parsed.schema, Some("custom-schema".to_string()));
+        }
+
+        #[test]
+        fn init_input_accepts_seed_agents() {
+            let request = request_with_init(None, None, Some(json!(10)));
+            let parsed = crate::InitInput::parse_input(&request)
+                .expect("request with seed_agents should be accepted");
+            assert_eq!(parsed.seed_agents, Some(10));
+        }
+
+        #[test]
+        fn init_input_accepts_all_fields() {
+            let request = request_with_init(
+                Some(json!("postgres://localhost/test")),
+                Some(json!("public")),
+                Some(json!(5)),
+            );
+            let parsed =
+                crate::InitInput::parse_input(&request).expect("all fields should be accepted");
+            assert_eq!(
+                parsed.database_url,
+                Some("postgres://localhost/test".to_string())
+            );
+            assert_eq!(parsed.schema, Some("public".to_string()));
+            assert_eq!(parsed.seed_agents, Some(5));
+        }
+
+        #[test]
+        fn init_input_accepts_dry_flag() {
+            let mut args = Map::new();
+            args.insert("dry".to_string(), json!(true));
+            let request = make_request("init", args);
+            let parsed = crate::InitInput::parse_input(&request)
+                .expect("request with dry flag should be accepted");
+            assert_eq!(parsed.dry, Some(true));
+        }
+    }
+
+    mod release_input_tests {
+        use super::*;
+
+        fn request_with_release(agent_id: Value) -> ProtocolRequest {
+            let mut args = Map::new();
+            args.insert("agent_id".to_string(), agent_id);
+            make_request("release", args)
+        }
+
+        #[test]
+        fn release_input_rejects_missing_agent_id() {
+            let request = make_request("release", Map::new());
+            let err = crate::ReleaseInput::parse_input(&request)
+                .expect_err("missing agent_id should be rejected");
+            assert!(err.to_string().contains("Missing required field: agent_id"));
+        }
+
+        #[test]
+        fn release_input_accepts_valid_agent_id() {
+            let request = request_with_release(json!(5));
+            let parsed = crate::ReleaseInput::parse_input(&request)
+                .expect("valid agent_id should be accepted");
+            assert_eq!(parsed.agent_id, 5);
+        }
+
+        #[test]
+        fn release_input_rejects_string_agent_id() {
+            let request = request_with_release(json!("not-a-number"));
+            let err = crate::ReleaseInput::parse_input(&request)
+                .expect_err("string agent_id should be rejected");
+            assert!(err.to_string().contains("Missing required field"));
+        }
+
+        #[test]
+        fn release_input_accepts_dry_flag() {
+            let mut args = Map::new();
+            args.insert("agent_id".to_string(), json!(1));
+            args.insert("dry".to_string(), json!(true));
+            let request = make_request("release", args);
+            let parsed = crate::ReleaseInput::parse_input(&request)
+                .expect("request with dry flag should be accepted");
+            assert_eq!(parsed.dry, Some(true));
+        }
+    }
+
+    mod spawn_prompts_input_tests {
+        use super::*;
+
+        fn request_with_spawn_prompts(
+            template: Option<Value>,
+            out_dir: Option<Value>,
+            count: Option<Value>,
+        ) -> ProtocolRequest {
+            let mut args = Map::new();
+            if let Some(v) = template {
+                args.insert("template".to_string(), v);
+            }
+            if let Some(v) = out_dir {
+                args.insert("out_dir".to_string(), v);
+            }
+            if let Some(v) = count {
+                args.insert("count".to_string(), v);
+            }
+            make_request("spawn-prompts", args)
+        }
+
+        #[test]
+        fn spawn_prompts_input_accepts_empty_args() {
+            let request = make_request("spawn-prompts", Map::new());
+            let parsed = crate::SpawnPromptsInput::parse_input(&request)
+                .expect("empty args should be accepted");
+            assert_eq!(parsed.template, None);
+            assert_eq!(parsed.out_dir, None);
+            assert_eq!(parsed.count, None);
+        }
+
+        #[test]
+        fn spawn_prompts_input_accepts_template() {
+            let request = request_with_spawn_prompts(Some(json!("default")), None, None);
+            let parsed = crate::SpawnPromptsInput::parse_input(&request)
+                .expect("request with template should be accepted");
+            assert_eq!(parsed.template, Some("default".to_string()));
+        }
+
+        #[test]
+        fn spawn_prompts_input_accepts_out_dir() {
+            let request = request_with_spawn_prompts(None, Some(json!("/tmp/output")), None);
+            let parsed = crate::SpawnPromptsInput::parse_input(&request)
+                .expect("request with out_dir should be accepted");
+            assert_eq!(parsed.out_dir, Some("/tmp/output".to_string()));
+        }
+
+        #[test]
+        fn spawn_prompts_input_accepts_count() {
+            let request = request_with_spawn_prompts(None, None, Some(json!(50)));
+            let parsed = crate::SpawnPromptsInput::parse_input(&request)
+                .expect("request with count should be accepted");
+            assert_eq!(parsed.count, Some(50));
+        }
+
+        #[test]
+        fn spawn_prompts_input_accepts_all_fields() {
+            let request = request_with_spawn_prompts(
+                Some(json!("custom")),
+                Some(json!("/out")),
+                Some(json!(100)),
+            );
+            let parsed = crate::SpawnPromptsInput::parse_input(&request)
+                .expect("all fields should be accepted");
+            assert_eq!(parsed.template, Some("custom".to_string()));
+            assert_eq!(parsed.out_dir, Some("/out".to_string()));
+            assert_eq!(parsed.count, Some(100));
+        }
+
+        #[test]
+        fn spawn_prompts_input_accepts_dry_flag() {
+            let mut args = Map::new();
+            args.insert("dry".to_string(), json!(true));
+            let request = make_request("spawn-prompts", args);
+            let parsed = crate::SpawnPromptsInput::parse_input(&request)
+                .expect("request with dry flag should be accepted");
+            assert_eq!(parsed.dry, Some(true));
+        }
+    }
+
+    mod batch_input_tests {
+        use super::*;
+
+        fn request_with_batch(ops: Value) -> ProtocolRequest {
+            let mut args = Map::new();
+            args.insert("ops".to_string(), ops);
+            make_request("batch", args)
+        }
+
+        #[test]
+        fn batch_input_rejects_missing_ops() {
+            let request = make_request("batch", Map::new());
+            let err = crate::BatchInput::parse_input(&request)
+                .expect_err("missing ops should be rejected");
+            assert!(err.to_string().contains("Missing required field: ops"));
+        }
+
+        #[test]
+        fn batch_input_accepts_empty_ops_array() {
+            let request = request_with_batch(json!([]));
+            let parsed = crate::BatchInput::parse_input(&request)
+                .expect("empty ops array should be accepted");
+            assert!(parsed.ops.is_empty());
+        }
+
+        #[test]
+        fn batch_input_accepts_ops_with_commands() {
+            let request = request_with_batch(json!([{"cmd": "doctor"}, {"cmd": "status"}]));
+            let parsed = crate::BatchInput::parse_input(&request)
+                .expect("ops with commands should be accepted");
+            assert_eq!(parsed.ops.len(), 2);
+        }
+
+        #[test]
+        fn batch_input_accepts_dry_flag() {
+            let mut args = Map::new();
+            args.insert("ops".to_string(), json!([]));
+            args.insert("dry".to_string(), json!(true));
+            let request = make_request("batch", args);
+            let parsed = crate::BatchInput::parse_input(&request)
+                .expect("request with dry flag should be accepted");
+            assert_eq!(parsed.dry, Some(true));
+        }
+    }
+
+    mod history_input_tests {
+        use super::*;
+
+        fn request_with_history(limit: Option<Value>) -> ProtocolRequest {
+            let mut args = Map::new();
+            if let Some(v) = limit {
+                args.insert("limit".to_string(), v);
+            }
+            make_request("history", args)
+        }
+
+        #[test]
+        fn history_input_accepts_no_limit() {
+            let request = request_with_history(None);
+            let parsed =
+                crate::HistoryInput::parse_input(&request).expect("no limit should be accepted");
+            assert_eq!(parsed.limit, None);
+        }
+
+        #[test]
+        fn history_input_accepts_limit() {
+            let request = request_with_history(Some(json!(100)));
+            let parsed =
+                crate::HistoryInput::parse_input(&request).expect("limit should be accepted");
+            assert_eq!(parsed.limit, Some(100));
+        }
+
+        #[test]
+        fn history_input_accepts_zero_limit() {
+            let request = request_with_history(Some(json!(0)));
+            let parsed =
+                crate::HistoryInput::parse_input(&request).expect("zero limit should be accepted");
+            assert_eq!(parsed.limit, Some(0));
+        }
+
+        #[test]
+        fn history_input_rejects_negative_limit() {
+            let request = request_with_history(Some(json!(-1)));
+            let err = crate::HistoryInput::parse_input(&request)
+                .expect_err("negative limit should be rejected");
+            assert!(err.to_string().contains("must be non-negative"));
+        }
+
+        #[test]
+        fn history_input_rejects_string_limit() {
+            let request = request_with_history(Some(json!("invalid")));
+            let err = crate::HistoryInput::parse_input(&request)
+                .expect_err("string limit should be rejected");
+            assert!(err.to_string().contains("must be non-negative"));
+        }
+    }
+
+    mod unlock_input_tests {
+        use super::*;
+
+        fn request_with_unlock(resource: Value, agent: Value) -> ProtocolRequest {
+            let mut args = Map::new();
+            args.insert("resource".to_string(), resource);
+            args.insert("agent".to_string(), agent);
+            make_request("unlock", args)
+        }
+
+        #[test]
+        fn unlock_input_rejects_missing_resource() {
+            let mut args = Map::new();
+            args.insert("agent".to_string(), json!("agent-1"));
+            let request = make_request("unlock", args);
+            let err = crate::UnlockInput::parse_input(&request)
+                .expect_err("missing resource should be rejected");
+            assert!(err.to_string().contains("Missing required field: resource"));
+        }
+
+        #[test]
+        fn unlock_input_rejects_missing_agent() {
+            let mut args = Map::new();
+            args.insert("resource".to_string(), json!("repo-123"));
+            let request = make_request("unlock", args);
+            let err = crate::UnlockInput::parse_input(&request)
+                .expect_err("missing agent should be rejected");
+            assert!(err.to_string().contains("Missing required field: agent"));
+        }
+
+        #[test]
+        fn unlock_input_accepts_all_required_fields() {
+            let request = request_with_unlock(json!("repo-123"), json!("agent-1"));
+            let parsed = crate::UnlockInput::parse_input(&request)
+                .expect("all required fields should be accepted");
+            assert_eq!(parsed.resource, "repo-123");
+            assert_eq!(parsed.agent, "agent-1");
+        }
+
+        #[test]
+        fn unlock_input_accepts_dry_flag() {
+            let mut args = Map::new();
+            args.insert("resource".to_string(), json!("repo-123"));
+            args.insert("agent".to_string(), json!("agent-1"));
+            args.insert("dry".to_string(), json!(true));
+            let request = make_request("unlock", args);
+            let parsed = crate::UnlockInput::parse_input(&request)
+                .expect("request with dry flag should be accepted");
+            assert_eq!(parsed.dry, Some(true));
+        }
+    }
+
+    mod load_profile_input_tests {
+        use super::*;
+
+        fn request_with_load_profile(
+            agents: Option<Value>,
+            rounds: Option<Value>,
+            timeout_ms: Option<Value>,
+        ) -> ProtocolRequest {
+            let mut args = Map::new();
+            if let Some(v) = agents {
+                args.insert("agents".to_string(), v);
+            }
+            if let Some(v) = rounds {
+                args.insert("rounds".to_string(), v);
+            }
+            if let Some(v) = timeout_ms {
+                args.insert("timeout_ms".to_string(), v);
+            }
+            make_request("load-profile", args)
+        }
+
+        #[test]
+        fn load_profile_input_accepts_empty_args() {
+            let request = make_request("load-profile", Map::new());
+            let parsed = crate::LoadProfileInput::parse_input(&request)
+                .expect("empty args should be accepted");
+            assert_eq!(parsed.agents, None);
+            assert_eq!(parsed.rounds, None);
+            assert_eq!(parsed.timeout_ms, None);
+        }
+
+        #[test]
+        fn load_profile_input_accepts_agents() {
+            let request = request_with_load_profile(Some(json!(10)), None, None);
+            let parsed = crate::LoadProfileInput::parse_input(&request)
+                .expect("request with agents should be accepted");
+            assert_eq!(parsed.agents, Some(10));
+        }
+
+        #[test]
+        fn load_profile_input_accepts_rounds() {
+            let request = request_with_load_profile(None, Some(json!(5)), None);
+            let parsed = crate::LoadProfileInput::parse_input(&request)
+                .expect("request with rounds should be accepted");
+            assert_eq!(parsed.rounds, Some(5));
+        }
+
+        #[test]
+        fn load_profile_input_accepts_timeout_ms() {
+            let request = request_with_load_profile(None, None, Some(json!(60000)));
+            let parsed = crate::LoadProfileInput::parse_input(&request)
+                .expect("request with timeout_ms should be accepted");
+            assert_eq!(parsed.timeout_ms, Some(60000));
+        }
+
+        #[test]
+        fn load_profile_input_accepts_all_fields() {
+            let request =
+                request_with_load_profile(Some(json!(10)), Some(json!(5)), Some(json!(60000)));
+            let parsed = crate::LoadProfileInput::parse_input(&request)
+                .expect("all fields should be accepted");
+            assert_eq!(parsed.agents, Some(10));
+            assert_eq!(parsed.rounds, Some(5));
+            assert_eq!(parsed.timeout_ms, Some(60000));
+        }
+
+        #[test]
+        fn load_profile_input_accepts_dry_flag() {
+            let mut args = Map::new();
+            args.insert("dry".to_string(), json!(true));
+            let request = make_request("load-profile", args);
+            let parsed = crate::LoadProfileInput::parse_input(&request)
+                .expect("request with dry flag should be accepted");
+            assert_eq!(parsed.dry, Some(true));
+        }
+    }
+
+    mod bootstrap_input_tests {
+        use super::*;
+
+        #[test]
+        fn bootstrap_input_accepts_no_args() {
+            let request = make_request("bootstrap", Map::new());
+            let parsed =
+                crate::BootstrapInput::parse_input(&request).expect("no args should be accepted");
+            assert_eq!(parsed.dry, None);
+        }
+
+        #[test]
+        fn bootstrap_input_accepts_dry_flag() {
+            let mut args = Map::new();
+            args.insert("dry".to_string(), json!(true));
+            let request = make_request("bootstrap", args);
+            let parsed =
+                crate::BootstrapInput::parse_input(&request).expect("dry flag should be accepted");
+            assert_eq!(parsed.dry, Some(true));
+        }
+    }
+
+    mod doctor_input_tests {
+        use super::*;
+
+        #[test]
+        fn doctor_input_accepts_no_args() {
+            let request = make_request("doctor", Map::new());
+            let parsed =
+                crate::DoctorInput::parse_input(&request).expect("no args should be accepted");
+            assert_eq!(parsed.json, None);
+        }
+
+        #[test]
+        fn doctor_input_accepts_json_flag() {
+            let mut args = Map::new();
+            args.insert("json".to_string(), json!(true));
+            let request = make_request("doctor", args);
+            let parsed =
+                crate::DoctorInput::parse_input(&request).expect("json flag should be accepted");
+            assert_eq!(parsed.json, Some(true));
+        }
+    }
+
+    mod help_input_tests {
+        use super::*;
+
+        #[test]
+        fn help_input_accepts_no_args() {
+            let request = make_request("help", Map::new());
+            let parsed =
+                crate::HelpInput::parse_input(&request).expect("no args should be accepted");
+            assert_eq!(parsed.short, None);
+            assert_eq!(parsed.s, None);
+        }
+
+        #[test]
+        fn help_input_accepts_short_flag() {
+            let mut args = Map::new();
+            args.insert("short".to_string(), json!(true));
+            let request = make_request("help", args);
+            let parsed =
+                crate::HelpInput::parse_input(&request).expect("short flag should be accepted");
+            assert_eq!(parsed.short, Some(true));
+        }
+
+        #[test]
+        fn help_input_accepts_s_flag() {
+            let mut args = Map::new();
+            args.insert("s".to_string(), json!(true));
+            let request = make_request("help", args);
+            let parsed =
+                crate::HelpInput::parse_input(&request).expect("s flag should be accepted");
+            assert_eq!(parsed.s, Some(true));
+        }
+    }
+
+    mod status_input_tests {
+        use super::*;
+
+        #[test]
+        fn status_input_accepts_no_args() {
+            let request = make_request("status", Map::new());
+            let _parsed =
+                crate::StatusInput::parse_input(&request).expect("no args should be accepted");
+        }
+    }
+
+    mod state_input_tests {
+        use super::*;
+
+        #[test]
+        fn state_input_accepts_no_args() {
+            let request = make_request("state", Map::new());
+            let _parsed =
+                crate::StateInput::parse_input(&request).expect("no args should be accepted");
+        }
+    }
+
+    mod agents_input_tests {
+        use super::*;
+
+        #[test]
+        fn agents_input_accepts_no_args() {
+            let request = make_request("agents", Map::new());
+            let _parsed =
+                crate::AgentsInput::parse_input(&request).expect("no args should be accepted");
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod stream_capture_tests {
     use super::capture_stream_limited;
     use tokio::io::{AsyncWriteExt, DuplexStream};
@@ -4397,15 +4719,7 @@ mod stream_capture_tests {
 }
 
 fn mask_database_url(url: &str) -> String {
-    match url::Url::parse(url) {
-        Ok(mut parsed) => {
-            if parsed.password().is_some() {
-                let _ = parsed.set_password(Some("********"));
-            }
-            parsed.to_string()
-        }
-        Err(_) => "<invalid-database-url>".to_string(),
-    }
+    db_resolution::mask_database_url(url)
 }
 
 async fn current_repo_root() -> std::result::Result<PathBuf, Box<ProtocolEnvelope>> {
@@ -4470,25 +4784,19 @@ fn dry_run_success(_request: &ProtocolRequest, steps: Vec<Value>, next: &str) ->
 }
 
 fn to_protocol_failure(error: SwarmError, rid: Option<String>) -> Box<ProtocolEnvelope> {
-    Box::new(
-        ProtocolEnvelope::error(rid, error.code().to_string(), error.to_string())
-            .with_fix("Check error details and retry with corrected parameters".to_string())
-            .with_ctx(json!({"error": error.to_string()})),
-    )
+    helpers::to_protocol_failure(error, rid)
 }
 
 fn parse_rid(raw: &str) -> Option<String> {
-    serde_json::from_str::<Value>(raw)
-        .ok()
-        .and_then(|value| value.get("rid").and_then(Value::as_str).map(str::to_string))
+    parsing::parse_rid(raw)
 }
 
 fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
+    helpers::now_ms()
 }
 
 fn dry_flag(request: &ProtocolRequest) -> bool {
-    request.dry.is_some_and(|value| value)
+    helpers::dry_flag(request)
 }
 
 async fn load_schema_sql(
@@ -4520,15 +4828,7 @@ async fn load_schema_sql(
 }
 
 fn repo_id_from_request(request: &ProtocolRequest) -> RepoId {
-    request
-        .args
-        .get("repo_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(RepoId::new)
-        .or_else(RepoId::from_current_dir)
-        .unwrap_or_else(|| RepoId::new("local"))
+    db_resolution::repo_id_from_request(request)
 }
 
 fn process_batch_items<'a>(

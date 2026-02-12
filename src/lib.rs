@@ -28,7 +28,6 @@ pub use error::{code, SwarmError, ERROR_CODES};
 
 mod agent_runtime;
 mod config;
-pub mod contracts;
 pub mod db;
 pub mod diagnostics;
 mod error;
@@ -45,7 +44,6 @@ pub mod stage_executor_content;
 pub mod stage_executors;
 pub mod types;
 
-pub use contracts::*;
 pub use db::SwarmDb;
 pub use gate_cache::GateExecutionCache;
 pub use orchestrator_service::{

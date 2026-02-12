@@ -374,3 +374,99 @@ fn given_agent_request_with_string_id_when_processed_then_response_reports_expli
 
     Ok(())
 }
+
+#[test]
+fn given_batch_payload_with_cmds_field_when_processed_then_returns_invalid_with_ops_fix_guidance(
+) -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"batch","cmds":[{"cmd":"?"}],"dry":false}"#)?;
+
+    assert_protocol_envelope(&scenario.output)?;
+    if scenario.output["ok"] != Value::Bool(false) {
+        return Err(format!(
+            "expected cmds alias to be rejected, got: {}",
+            scenario.output
+        ));
+    }
+    if scenario.output["err"]["code"] != Value::String("INVALID".to_string()) {
+        return Err(format!(
+            "expected INVALID code for cmds alias, got: {}",
+            scenario.output
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn given_batch_payload_with_empty_ops_when_processed_then_returns_invalid_with_minimum_ops_guidance(
+) -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(r#"{"cmd":"batch","ops":[],"dry":false}"#)?;
+
+    assert_protocol_envelope(&scenario.output)?;
+    if scenario.output["ok"] != Value::Bool(false) {
+        return Err(format!(
+            "expected empty ops to fail validation, got: {}",
+            scenario.output
+        ));
+    }
+    if scenario.output["err"]["code"] != Value::String("INVALID".to_string()) {
+        return Err(format!(
+            "expected INVALID code for empty ops, got: {}",
+            scenario.output
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn given_nested_null_byte_in_batch_operation_when_processed_then_returns_invalid_with_field_path_context(
+) -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(
+        r#"{"cmd":"batch","ops":[{"cmd":"lock","resource":"bad\u0000resource","agent":"agent-bdd","ttl_ms":1000}],"dry":false}"#,
+    )?;
+
+    assert_protocol_envelope(&scenario.output)?;
+    if scenario.output["ok"] != Value::Bool(false) {
+        return Err(format!(
+            "expected nested null byte to fail validation, got: {}",
+            scenario.output
+        ));
+    }
+    if scenario.output["err"]["code"] != Value::String("INVALID".to_string()) {
+        return Err(format!(
+            "expected INVALID code for null byte payload, got: {}",
+            scenario.output
+        ));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn given_artifacts_request_with_unknown_artifact_type_when_processed_then_error_context_echoes_rejected_type(
+) -> Result<(), String> {
+    let harness = ProtocolScenarioHarness::new();
+    let scenario = harness.run_protocol(
+        r#"{"cmd":"artifacts","bead_id":"swm-123","artifact_type":"not-a-real-artifact"}"#,
+    )?;
+
+    assert_protocol_envelope(&scenario.output)?;
+    if scenario.output["ok"] != Value::Bool(false) {
+        return Err(format!(
+            "expected unknown artifact type to fail, got: {}",
+            scenario.output
+        ));
+    }
+    if scenario.output["err"]["code"] != Value::String("INVALID".to_string()) {
+        return Err(format!(
+            "expected INVALID code for unknown artifact type, got: {}",
+            scenario.output
+        ));
+    }
+
+    Ok(())
+}

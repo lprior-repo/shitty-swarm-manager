@@ -16,6 +16,24 @@ tasks:
   test:
     command: "cargo test"
 
+  coverage-prereq:
+    command: "cargo llvm-cov --version"
+
+  coverage-report:
+    command: "mkdir -p target/coverage && cargo llvm-cov --workspace --all-targets --summary-only --lcov --output-path target/coverage/lcov.info --ignore-filename-regex '(^tests/|/tests/|/target/)'"
+    deps:
+      - coverage-prereq
+
+  coverage-html:
+    command: "cargo llvm-cov --workspace --all-targets --html --output-dir target/coverage/html --ignore-filename-regex '(^tests/|/tests/|/target/)'"
+    deps:
+      - coverage-prereq
+
+  coverage-gate:
+    command: "cargo llvm-cov --workspace --all-targets --summary-only --fail-under-lines 80 --ignore-filename-regex '(^tests/|/tests/|/target/)'"
+    deps:
+      - coverage-prereq
+
   db-test:
     command: "bash scripts/run_db_test_from_env.sh"
 
@@ -46,3 +64,4 @@ tasks:
       - check
       - test
       - db-test
+      - coverage-gate
