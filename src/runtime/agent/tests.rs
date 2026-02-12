@@ -7,9 +7,9 @@
 
 #[cfg(test)]
 mod bdd_tests {
-    use crate::domain::agent::{AgentState, AgentStatus};
-    use crate::domain::shared::{RuntimeAgentId, RuntimeBeadId, RuntimeRepoId};
-    use crate::domain::stage::Stage;
+    use crate::runtime::agent::{AgentState, AgentStatus};
+    use crate::runtime::shared::{RuntimeAgentId, RuntimeBeadId, RuntimeRepoId};
+    use crate::runtime::stage::Stage;
 
     fn given_an_idle_agent() -> AgentState {
         let repo_id = RuntimeRepoId::new("test-repo");

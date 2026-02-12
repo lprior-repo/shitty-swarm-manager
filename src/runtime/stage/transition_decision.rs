@@ -107,9 +107,9 @@ pub const fn passed_stage_transition(stage: Stage) -> TransitionDecision {
 pub fn validate_completion_requires_push_confirmation(
     transition: StageTransition,
     push_confirmed: bool,
-) -> crate::domain::shared::Result<()> {
+) -> crate::runtime::shared::Result<()> {
     if transition.should_complete() && !push_confirmed {
-        return Err(crate::domain::shared::RuntimeError::InvariantViolation(
+        return Err(crate::runtime::shared::RuntimeError::InvariantViolation(
             "completion_implies_push_confirmed violated: completion requires push confirmation"
                 .to_string(),
         ));

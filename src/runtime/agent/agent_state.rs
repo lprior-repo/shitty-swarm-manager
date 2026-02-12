@@ -5,7 +5,7 @@
 #![warn(clippy::nursery)]
 #![forbid(unsafe_code)]
 
-use crate::domain::shared::{RuntimeAgentId, RuntimeBeadId, RuntimeError};
+use crate::runtime::shared::{RuntimeAgentId, RuntimeBeadId, RuntimeError};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,7 +59,7 @@ impl TryFrom<&str> for AgentStatus {
 pub struct AgentState {
     agent_id: RuntimeAgentId,
     bead_id: Option<RuntimeBeadId>,
-    current_stage: Option<crate::domain::stage::Stage>,
+    current_stage: Option<crate::runtime::stage::Stage>,
     status: AgentStatus,
     implementation_attempt: u32,
 }
@@ -69,7 +69,7 @@ impl AgentState {
     pub const fn new(
         agent_id: RuntimeAgentId,
         bead_id: Option<RuntimeBeadId>,
-        current_stage: Option<crate::domain::stage::Stage>,
+        current_stage: Option<crate::runtime::stage::Stage>,
         status: AgentStatus,
         implementation_attempt: u32,
     ) -> Self {
@@ -93,7 +93,7 @@ impl AgentState {
     }
 
     #[must_use]
-    pub const fn current_stage(&self) -> Option<crate::domain::stage::Stage> {
+    pub const fn current_stage(&self) -> Option<crate::runtime::stage::Stage> {
         self.current_stage
     }
 
@@ -122,7 +122,7 @@ impl AgentState {
         self.bead_id.is_some()
     }
 
-    pub fn validate_invariants(&self) -> crate::domain::shared::Result<()> {
+    pub fn validate_invariants(&self) -> crate::runtime::shared::Result<()> {
         match self.status {
             AgentStatus::Working => {
                 if self.bead_id.is_none() {
@@ -143,7 +143,7 @@ impl AgentState {
                     ));
                 }
                 if self.current_stage.is_some()
-                    && self.current_stage != Some(crate::domain::stage::Stage::Done)
+                    && self.current_stage != Some(crate::runtime::stage::Stage::Done)
                 {
                     return Err(RuntimeError::InvariantViolation(
                         "Agent with Done status must have current_stage = Done or None".to_string(),

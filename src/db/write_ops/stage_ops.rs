@@ -9,11 +9,10 @@ use super::helpers::{
     build_failure_diagnostics, determine_transition, event_entity_id, landing_retry_causation_id,
     redact_sensitive,
 };
-pub use super::types::StageTransition;
 use super::types::{ExecutionEventWriteInput, FailureDiagnosticsPayload, StageTransitionInput};
 use crate::db::SwarmDb;
-use crate::ddd::validate_completion_implies_push_confirmed;
 use crate::error::{Result, SwarmError};
+use crate::runtime::validate_completion_requires_push_confirmation;
 use crate::types::{AgentId, ArtifactType, BeadId, EventSchemaVersion, Stage, StageResult};
 use crate::BrSyncStatus;
 use chrono::{DateTime, Utc};
@@ -542,8 +541,8 @@ impl SwarmDb {
         bead_id: &BeadId,
         push_confirmed: bool,
     ) -> Result<()> {
-        validate_completion_implies_push_confirmed(
-            crate::ddd::RuntimeStageTransition::Complete,
+        validate_completion_requires_push_confirmation(
+            crate::runtime::RuntimeStageTransition::Complete,
             push_confirmed,
         )
         .map_err(|err| SwarmError::AgentError(err.to_string()))?;

@@ -10,7 +10,9 @@ use crate::orchestrator_service::{AssignAgentSnapshot, AssignPorts, PortFuture};
 use crate::{AgentId, BeadId, RepoId, RuntimeAgentStatus, RuntimeRepoId};
 use serde_json::{Map, Value};
 
-pub(super) fn runtime_status_from_db_status(status: &str) -> RuntimeAgentStatus {
+pub(in crate::protocol_runtime) fn runtime_status_from_db_status(
+    status: &str,
+) -> RuntimeAgentStatus {
     match status {
         "idle" => RuntimeAgentStatus::Idle,
         "working" => RuntimeAgentStatus::Working,
@@ -20,7 +22,10 @@ pub(super) fn runtime_status_from_db_status(status: &str) -> RuntimeAgentStatus 
     }
 }
 
-pub(super) fn build_agent_request(rid: Option<String>, agent_id: u32) -> ProtocolRequest {
+pub(in crate::protocol_runtime) fn build_agent_request(
+    rid: Option<String>,
+    agent_id: u32,
+) -> ProtocolRequest {
     ProtocolRequest {
         cmd: "agent".to_string(),
         rid,
@@ -29,7 +34,10 @@ pub(super) fn build_agent_request(rid: Option<String>, agent_id: u32) -> Protoco
     }
 }
 
-pub(super) fn run_agent(request: &ProtocolRequest, agent_id: u32) -> PortFuture<'_, Value> {
+pub(in crate::protocol_runtime) fn run_agent(
+    request: &ProtocolRequest,
+    agent_id: u32,
+) -> PortFuture<'_, Value> {
     let request = request.clone();
     Box::pin(async move {
         let req = build_agent_request(request.rid.clone(), agent_id);
@@ -40,7 +48,7 @@ pub(super) fn run_agent(request: &ProtocolRequest, agent_id: u32) -> PortFuture<
     })
 }
 
-pub(super) fn load_agent_snapshot<'a>(
+pub(in crate::protocol_runtime) fn load_agent_snapshot<'a>(
     request: &'a ProtocolRequest,
     repo_id: &'a RuntimeRepoId,
     agent_id: u32,
@@ -74,7 +82,7 @@ pub(super) fn load_agent_snapshot<'a>(
     })
 }
 
-pub(super) fn claim_bead<'a>(
+pub(in crate::protocol_runtime) fn claim_bead<'a>(
     request: &'a ProtocolRequest,
     repo_id: &'a RuntimeRepoId,
     agent_id: u32,
@@ -91,7 +99,7 @@ pub(super) fn claim_bead<'a>(
     })
 }
 
-pub(super) fn release_agent<'a>(
+pub(in crate::protocol_runtime) fn release_agent<'a>(
     request: &'a ProtocolRequest,
     repo_id: &'a RuntimeRepoId,
     agent_id: u32,

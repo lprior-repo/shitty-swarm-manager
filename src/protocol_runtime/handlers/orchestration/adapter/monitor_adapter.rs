@@ -9,7 +9,9 @@ use super::super::helpers::protocol_failure_to_swarm_error;
 use crate::orchestrator_service::PortFuture;
 use serde_json::{Map, Value};
 
-pub(super) fn build_monitor_progress_request(rid: Option<String>) -> ProtocolRequest {
+pub(in crate::protocol_runtime) fn build_monitor_progress_request(
+    rid: Option<String>,
+) -> ProtocolRequest {
     ProtocolRequest {
         cmd: "monitor".to_string(),
         rid,
@@ -21,7 +23,9 @@ pub(super) fn build_monitor_progress_request(rid: Option<String>) -> ProtocolReq
     }
 }
 
-pub(super) fn monitor_progress(request: &ProtocolRequest) -> PortFuture<'_, Value> {
+pub(in crate::protocol_runtime) fn monitor_progress(
+    request: &ProtocolRequest,
+) -> PortFuture<'_, Value> {
     let request = request.clone();
     Box::pin(async move {
         let req = build_monitor_progress_request(request.rid.clone());

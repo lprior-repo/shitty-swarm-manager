@@ -8,15 +8,14 @@
 pub mod beads_sync;
 pub mod canonical_schema;
 pub mod cli;
-pub mod ddd;
-pub mod domain;
 pub mod infrastructure;
+pub mod runtime;
 
 pub use beads_sync::{
     map_terminal_sync_state, BrSyncAction, BrSyncDecision, BrSyncDivergence, BrSyncStatus,
     CoordinatorSyncTerminal,
 };
-pub use ddd::{
+pub use runtime::{
     runtime_determine_transition, runtime_determine_transition_decision, RuntimeAgentId,
     RuntimeAgentState, RuntimeAgentStatus, RuntimeBeadId, RuntimeError, RuntimePgAgentRepository,
     RuntimePgBeadRepository, RuntimePgStageRepository, RuntimeRepoId, RuntimeStage,

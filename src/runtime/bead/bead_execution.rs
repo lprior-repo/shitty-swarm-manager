@@ -6,8 +6,8 @@
 #![forbid(unsafe_code)]
 
 use super::BeadExecutionStatus;
-use crate::domain::shared::RuntimeError;
-use crate::domain::stage::{decision_from_stage_dag, Stage, StageResult, TransitionDecision};
+use crate::runtime::shared::RuntimeError;
+use crate::runtime::stage::{decision_from_stage_dag, Stage, StageResult, TransitionDecision};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,7 +24,7 @@ impl BeadExecution {
         implementation_attempt: u32,
         max_implementation_attempts: u32,
         status: BeadExecutionStatus,
-    ) -> crate::domain::shared::Result<Self> {
+    ) -> crate::runtime::shared::Result<Self> {
         let execution = Self {
             current_stage,
             implementation_attempt,
@@ -58,7 +58,7 @@ impl BeadExecution {
     pub fn determine_transition(
         &self,
         result: &StageResult,
-    ) -> crate::domain::shared::Result<TransitionDecision> {
+    ) -> crate::runtime::shared::Result<TransitionDecision> {
         self.validate_invariants()?;
 
         if matches!(result, StageResult::Started) {
@@ -75,7 +75,7 @@ impl BeadExecution {
         ))
     }
 
-    pub fn validate_invariants(&self) -> crate::domain::shared::Result<()> {
+    pub fn validate_invariants(&self) -> crate::runtime::shared::Result<()> {
         if self.max_implementation_attempts == 0 {
             return Err(RuntimeError::InvariantViolation(
                 "BeadExecution max_implementation_attempts must be greater than zero".to_string(),

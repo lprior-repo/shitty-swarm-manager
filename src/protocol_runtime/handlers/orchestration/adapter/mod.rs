@@ -113,7 +113,7 @@ mod tests {
     use super::{
         build_agent_request, build_monitor_progress_request, runtime_status_from_db_status,
     };
-    use crate::ddd::{
+    use crate::runtime::{
         RuntimeAgentId as RuntimeAgentIdStruct, RuntimeAgentState, RuntimeAgentStatus,
         RuntimeBeadId, RuntimeRepoId, RuntimeStage,
     };

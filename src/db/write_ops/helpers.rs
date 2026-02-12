@@ -6,7 +6,7 @@
 #![forbid(unsafe_code)]
 
 use super::types::{FailureDiagnosticsPayload, StageTransition};
-use crate::ddd::{
+use crate::runtime::{
     runtime_determine_transition_decision, RuntimeStage, RuntimeStageResult, RuntimeStageTransition,
 };
 use crate::types::{BeadId, RepoId, Stage, StageResult};

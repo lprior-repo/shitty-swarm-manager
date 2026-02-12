@@ -7,7 +7,7 @@
 
 #[cfg(test)]
 mod bdd_tests {
-    use crate::domain::stage::{
+    use crate::runtime::stage::{
         decision_from_stage_dag, passed_stage_transition,
         validate_completion_requires_push_confirmation, Stage, StageResult, StageTransition,
         TransitionDecision, TransitionReason,

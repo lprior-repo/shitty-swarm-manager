@@ -10,7 +10,9 @@ use super::super::helpers::protocol_failure_to_swarm_error;
 use crate::orchestrator_service::{ClaimNextPorts, PortFuture, RunOncePorts};
 use serde_json::Value;
 
-pub(super) fn bv_robot_next(request: &ProtocolRequest) -> PortFuture<'_, Value> {
+pub(in crate::protocol_runtime) fn bv_robot_next(
+    request: &ProtocolRequest,
+) -> PortFuture<'_, Value> {
     let request = request.clone();
     Box::pin(async move {
         run_external_json_command(
@@ -25,7 +27,7 @@ pub(super) fn bv_robot_next(request: &ProtocolRequest) -> PortFuture<'_, Value> 
     })
 }
 
-pub(super) fn br_update_in_progress<'a>(
+pub(in crate::protocol_runtime) fn br_update_in_progress<'a>(
     request: &'a ProtocolRequest,
     bead_id: &'a str,
 ) -> PortFuture<'a, Value> {
@@ -41,7 +43,7 @@ pub(super) fn br_update_in_progress<'a>(
     })
 }
 
-pub(super) fn br_show_bead<'a>(
+pub(in crate::protocol_runtime) fn br_show_bead<'a>(
     request: &'a ProtocolRequest,
     bead_id: &'a str,
 ) -> PortFuture<'a, Value> {
@@ -57,7 +59,7 @@ pub(super) fn br_show_bead<'a>(
     })
 }
 
-pub(super) fn br_assign_in_progress<'a>(
+pub(in crate::protocol_runtime) fn br_assign_in_progress<'a>(
     request: &'a ProtocolRequest,
     bead_id: &'a str,
     assignee: &'a str,
@@ -82,7 +84,7 @@ pub(super) fn br_assign_in_progress<'a>(
     })
 }
 
-pub(super) fn doctor(request: &ProtocolRequest) -> PortFuture<'_, Value> {
+pub(in crate::protocol_runtime) fn doctor(request: &ProtocolRequest) -> PortFuture<'_, Value> {
     let request = request.clone();
     Box::pin(async move {
         handle_doctor(&request)
@@ -92,7 +94,7 @@ pub(super) fn doctor(request: &ProtocolRequest) -> PortFuture<'_, Value> {
     })
 }
 
-pub(super) fn status(request: &ProtocolRequest) -> PortFuture<'_, Value> {
+pub(in crate::protocol_runtime) fn status(request: &ProtocolRequest) -> PortFuture<'_, Value> {
     let request = request.clone();
     Box::pin(async move {
         handle_status(&request)
@@ -102,7 +104,7 @@ pub(super) fn status(request: &ProtocolRequest) -> PortFuture<'_, Value> {
     })
 }
 
-pub(super) fn claim_next(request: &ProtocolRequest) -> PortFuture<'_, Value> {
+pub(in crate::protocol_runtime) fn claim_next(request: &ProtocolRequest) -> PortFuture<'_, Value> {
     let request = request.clone();
     Box::pin(async move {
         handle_claim_next(&request)

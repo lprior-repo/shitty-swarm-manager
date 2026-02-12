@@ -7,8 +7,8 @@
 
 #[cfg(test)]
 mod bdd_tests {
-    use crate::domain::bead::{BeadExecution, BeadExecutionStatus};
-    use crate::domain::stage::{Stage, StageResult, StageTransition};
+    use crate::runtime::bead::{BeadExecution, BeadExecutionStatus};
+    use crate::runtime::stage::{Stage, StageResult, StageTransition};
 
     fn given_an_active_bead_at(stage: Stage, attempt: u32) -> BeadExecution {
         BeadExecution::new(stage, attempt, 3, BeadExecutionStatus::Active).expect("valid bead")

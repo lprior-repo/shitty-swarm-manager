@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod swarm_db_query_tests {
-    use crate::ddd::{RuntimeAgentId, RuntimeAgentState, RuntimeAgentStatus, RuntimeBeadId, RuntimeRepoId, RuntimeStage};
+    use crate::runtime::{RuntimeAgentId, RuntimeAgentState, RuntimeAgentStatus, RuntimeBeadId, RuntimeRepoId, RuntimeStage};
     use crate::error::SwarmError;
     use crate::types::{
         ArtifactType, AgentMessage, BeadId, ExecutionEvent, MessageType,
