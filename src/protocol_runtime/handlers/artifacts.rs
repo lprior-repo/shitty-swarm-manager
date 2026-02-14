@@ -29,7 +29,11 @@ struct ArtifactQuery {
 }
 
 impl ArtifactQuery {
-    const fn new(repo_id: crate::RepoId, bead_id: BeadId, artifact_type: Option<ArtifactType>) -> Self {
+    const fn new(
+        repo_id: crate::RepoId,
+        bead_id: BeadId,
+        artifact_type: Option<ArtifactType>,
+    ) -> Self {
         Self {
             repo_id,
             bead_id,

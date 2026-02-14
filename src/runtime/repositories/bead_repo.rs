@@ -68,7 +68,7 @@ impl RuntimePgBeadRepository {
         .execute(&self.pool)
         .await
         .map_err(|e| RuntimeError::RepositoryError(format!("mark_blocked: {e}")))
-            .map(|_| ())
+        .map(|_| ())
     }
 
     /// # Errors
@@ -110,9 +110,9 @@ impl crate::orchestrator_service::ClaimRepository for RuntimePgBeadRepository {
         repo_id: &'a crate::RuntimeRepoId,
     ) -> PortFuture<'a, u32> {
         Box::pin(async move {
-            self.recover_stale_claims(repo_id).await.map_err(|e| {
-                crate::error::SwarmError::DatabaseError(e.to_string())
-            })
+            self.recover_stale_claims(repo_id)
+                .await
+                .map_err(|e| crate::error::SwarmError::DatabaseError(e.to_string()))
         })
     }
 
@@ -132,9 +132,9 @@ impl crate::orchestrator_service::ClaimRepository for RuntimePgBeadRepository {
         agent_id: &'a RuntimeAgentId,
     ) -> PortFuture<'a, Option<RuntimeBeadId>> {
         Box::pin(async move {
-            self.claim_next(agent_id).await.map_err(|e| {
-                crate::error::SwarmError::DatabaseError(e.to_string())
-            })
+            self.claim_next(agent_id)
+                .await
+                .map_err(|e| crate::error::SwarmError::DatabaseError(e.to_string()))
         })
     }
 

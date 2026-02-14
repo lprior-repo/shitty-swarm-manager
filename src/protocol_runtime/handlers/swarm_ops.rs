@@ -362,8 +362,7 @@ pub(in crate::protocol_runtime) async fn handle_init_local_db(
         match ready_check {
             Ok(check) if check.status.success() => break,
             Ok(check) => {
-                last_error =
-                    String::from_utf8_lossy(&check.stderr).trim().to_string();
+                last_error = String::from_utf8_lossy(&check.stderr).trim().to_string();
             }
             Err(e) => {
                 last_error = e.to_string();
