@@ -40,6 +40,9 @@ tasks:
   db-test-full:
     command: "bash scripts/run_db_test_suite.sh"
 
+  ralph-combative-loop:
+    command: "bash scripts/run_ralph_combative_loop.sh"
+
   build:
     command: "cargo build --release"
 

@@ -6,7 +6,7 @@
 #![forbid(unsafe_code)]
 
 use super::helpers::build_failure_diagnostics;
-use super::types::{ExecutionEventWriteInput, FailureDiagnosticsPayload, StageTransitionInput};
+use super::types::{ExecutionEventWriteInput, StageTransitionInput};
 use crate::db::SwarmDb;
 use crate::error::{Result, SwarmError};
 use crate::types::{AgentId, BeadId, Stage};

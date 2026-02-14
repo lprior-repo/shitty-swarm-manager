@@ -521,7 +521,7 @@ mod external_command_error_handling_tests {
         assert!(result.is_ok());
         let value = result.unwrap();
         assert_eq!(
-            value.get("ok").and_then(std::serde_json::Value::as_bool),
+            value.get("ok").and_then(serde_json::Value::as_bool),
             Some(true)
         );
     }

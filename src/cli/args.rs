@@ -7,6 +7,8 @@
 
 use super::parser::CliError;
 
+/// # Errors
+/// Returns `CliError::UnknownCommand` if an unknown flag is found.
 pub fn ensure_no_unknown_flags(args: &[String], allowed_flags: &[&str]) -> Result<(), CliError> {
     let invalid = args
         .iter()
@@ -21,6 +23,7 @@ pub fn ensure_no_unknown_flags(args: &[String], allowed_flags: &[&str]) -> Resul
     invalid.map_or(Ok(()), |flag| Err(CliError::UnknownCommand { cmd: flag }))
 }
 
+#[must_use]
 pub fn suggest_commands(typo: &str) -> Vec<String> {
     const VALID_COMMANDS: &[&str] = &[
         "doctor",

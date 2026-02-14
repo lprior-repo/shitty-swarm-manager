@@ -129,6 +129,7 @@ pub enum CliCommand {
 }
 
 #[allow(clippy::too_many_lines)]
+#[must_use]
 pub fn cli_command_to_request(cmd: CliCommand) -> String {
     let (cmd_name, dry, args) = match cmd {
         CliCommand::Doctor => ("doctor".to_string(), None, Map::new()),

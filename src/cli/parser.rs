@@ -20,6 +20,9 @@ pub enum CliError {
     InvalidArgValue { arg: String, error: String },
 }
 
+/// # Errors
+/// Returns `CliError` for invalid or missing arguments.
+#[allow(clippy::too_many_lines)]
 pub fn parse_cli_args(args: &[String]) -> Result<CliAction, CliError> {
     if args
         .get(1)

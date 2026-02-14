@@ -20,6 +20,8 @@ impl AgentRepository {
         Self { pool }
     }
 
+    /// # Errors
+    /// Returns database errors if the insert fails.
     pub async fn register(&self, agent_id: &AgentId) -> Result<bool> {
         let repo_scoped = self.table_has_column("agent_state", "repo_id").await?;
 
@@ -31,7 +33,7 @@ impl AgentRepository {
                  ON CONFLICT (repo_id, agent_id) DO NOTHING",
             )
             .bind(agent_id.repo_id().value())
-            .bind(agent_id.number() as i32)
+            .bind(agent_id.number().cast_signed())
             .execute(&self.pool)
             .await
             .map(|rows| rows.rows_affected() > 0)
@@ -41,7 +43,7 @@ impl AgentRepository {
                 "INSERT INTO agent_state (agent_id, status) VALUES ($1, 'idle')
                  ON CONFLICT (agent_id) DO NOTHING",
             )
-            .bind(agent_id.number() as i32)
+            .bind(agent_id.number().cast_signed())
             .execute(&self.pool)
             .await
             .map(|rows| rows.rows_affected() > 0)

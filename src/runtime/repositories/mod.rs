@@ -7,6 +7,8 @@
 
 mod agent_repo;
 mod bead_repo;
+#[cfg(test)]
+mod contract_tests;
 mod stage_repo;
 
 pub use agent_repo::RuntimePgAgentRepository;

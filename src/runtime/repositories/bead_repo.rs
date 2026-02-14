@@ -62,4 +62,32 @@ impl RuntimePgBeadRepository {
         .map_err(|e| RuntimeError::RepositoryError(format!("mark_blocked: {e}")))
         .map(|_| ())
     }
+
+    pub async fn recover_stale_claims(
+        &self,
+        repo_id: &RuntimeRepoId,
+    ) -> crate::runtime::shared::Result<u32> {
+        sqlx::query_scalar::<_, i32>("SELECT recover_expired_bead_claims($1)")
+            .bind(repo_id.value())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| RuntimeError::RepositoryError(format!("recover_stale_claims: {e}")))
+            .map(|count| u32::try_from(count).unwrap_or(0))
+    }
+
+    pub async fn heartbeat_claim(
+        &self,
+        agent_id: &RuntimeAgentId,
+        bead_id: &RuntimeBeadId,
+        lease_extension_ms: i32,
+    ) -> crate::runtime::shared::Result<bool> {
+        sqlx::query_scalar::<_, bool>("SELECT heartbeat_bead_claim($1, $2, $3, $4)")
+            .bind(agent_id.repo_id().value())
+            .bind(agent_id.number().cast_signed())
+            .bind(bead_id.value())
+            .bind(lease_extension_ms)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| RuntimeError::RepositoryError(format!("heartbeat_claim: {e}")))
+    }
 }

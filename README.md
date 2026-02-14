@@ -88,6 +88,38 @@ swarm monitor --view messages   # Inter-agent messages
 
 ---
 
+## Combative Ralph Loop
+
+Run an iterative Red-Queen style hardening loop that repeatedly writes adversarial tests, patches code, and re-runs gates with Scott Wlaschin + Dan North review criteria.
+
+```bash
+# Default (opencode + GLM-5)
+bash scripts/run_ralph_combative_loop.sh
+
+# Or via Moon
+moon run :ralph-combative-loop
+
+# Override model/limits
+RALPH_MODEL="zai-coding-plan/glm-5" \
+RALPH_MIN_ITERATIONS=3 \
+RALPH_MAX_ITERATIONS=40 \
+bash scripts/run_ralph_combative_loop.sh
+```
+
+Useful environment variables:
+
+- `RALPH_MODEL` - model id for your best model
+- `RALPH_AGENT` - `opencode` / `claude-code` / `codex`
+- `RALPH_MIN_ITERATIONS`, `RALPH_MAX_ITERATIONS` - loop bounds
+- `RALPH_NO_COMMIT` - `1` (default) avoids auto-commit, set `0` to allow commits
+- `RALPH_ALLOW_ALL` - `1` (default) auto-approves tools, set `0` for prompts
+- `RALPH_PROMPT_FILE` - custom prompt path
+
+The default completion promise is `COMBATIVE_LOOP_COMPLETE`.
+Default loop bounds are `min=30`, `max=200`.
+
+---
+
 ## Architecture
 
 | Table | Purpose |

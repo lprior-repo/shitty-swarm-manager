@@ -154,28 +154,7 @@ fn database_connect_timeout_ms() -> u64 {
     )
 }
 
-#[cfg(test)]
-fn parse_database_connect_timeout_ms(raw: Option<&str>) -> u64 {
-    parsing::parse_database_connect_timeout_ms(
-        raw,
-        DEFAULT_DB_CONNECT_TIMEOUT_MS,
-        MIN_DB_CONNECT_TIMEOUT_MS,
-        MAX_DB_CONNECT_TIMEOUT_MS,
-    )
-}
-
-fn request_connect_timeout_ms(
-    request: &ProtocolRequest,
-) -> std::result::Result<u64, Box<ProtocolEnvelope>> {
-    parsing::request_connect_timeout_ms(
-        request,
-        DEFAULT_DB_CONNECT_TIMEOUT_MS,
-        MIN_DB_CONNECT_TIMEOUT_MS,
-        MAX_DB_CONNECT_TIMEOUT_MS,
-    )
-}
-
-async fn db_from_request(
+pub(in crate::protocol_runtime) async fn db_from_request(
     request: &ProtocolRequest,
 ) -> std::result::Result<crate::SwarmDb, Box<ProtocolEnvelope>> {
     db_resolution::db_from_request(
@@ -187,7 +166,7 @@ async fn db_from_request(
     .await
 }
 
-async fn resolve_database_url_for_init(
+pub(in crate::protocol_runtime) async fn resolve_database_url_for_init(
     request: &ProtocolRequest,
 ) -> std::result::Result<String, Box<ProtocolEnvelope>> {
     db_resolution::resolve_database_url_for_init(
@@ -199,14 +178,9 @@ async fn resolve_database_url_for_init(
     .await
 }
 
-async fn try_connect_candidates(
-    candidates: &[String],
-    timeout_ms: u64,
-) -> (Option<(crate::SwarmDb, String)>, Vec<String>) {
-    db_resolution::try_connect_candidates(candidates, timeout_ms).await
-}
-
-async fn minimal_state_for_request(request: &ProtocolRequest) -> Value {
+pub(in crate::protocol_runtime) async fn minimal_state_for_request(
+    request: &ProtocolRequest,
+) -> Value {
     helpers::minimal_state_for_request(
         request,
         DEFAULT_DB_CONNECT_TIMEOUT_MS,
@@ -216,35 +190,48 @@ async fn minimal_state_for_request(request: &ProtocolRequest) -> Value {
     .await
 }
 
-fn minimal_state_from_progress(progress: &crate::ProgressSummary) -> Value {
+pub(in crate::protocol_runtime) fn minimal_state_from_progress(
+    progress: &crate::ProgressSummary,
+) -> Value {
     helpers::minimal_state_from_progress(progress)
 }
 
-fn required_string_arg(
+pub(in crate::protocol_runtime) fn required_string_arg(
     request: &ProtocolRequest,
     key: &str,
 ) -> std::result::Result<String, Box<ProtocolEnvelope>> {
     helpers::required_string_arg(request, key)
 }
 
-fn to_protocol_failure(error: SwarmError, rid: Option<String>) -> Box<ProtocolEnvelope> {
+pub(in crate::protocol_runtime) fn to_protocol_failure(
+    error: SwarmError,
+    rid: Option<String>,
+) -> Box<ProtocolEnvelope> {
     helpers::to_protocol_failure(error, rid)
 }
 
-fn parse_rid(raw: &str) -> Option<String> {
-    parsing::parse_rid(raw)
-}
-
-fn dry_flag(request: &ProtocolRequest) -> bool {
+pub(in crate::protocol_runtime) fn dry_flag(request: &ProtocolRequest) -> bool {
     helpers::dry_flag(request)
 }
 
-fn repo_id_from_request(request: &ProtocolRequest) -> crate::RepoId {
+pub(in crate::protocol_runtime) fn repo_id_from_request(
+    request: &ProtocolRequest,
+) -> crate::RepoId {
     db_resolution::repo_id_from_request(request)
 }
 
-fn elapsed_ms(start: Instant) -> u64 {
+pub(in crate::protocol_runtime) fn elapsed_ms(start: Instant) -> u64 {
     loop_executor::elapsed_ms(start)
+}
+
+#[cfg(test)]
+fn parse_database_connect_timeout_ms(raw: Option<&str>) -> u64 {
+    parsing::parse_database_connect_timeout_ms(
+        raw,
+        DEFAULT_DB_CONNECT_TIMEOUT_MS,
+        MIN_DB_CONNECT_TIMEOUT_MS,
+        MAX_DB_CONNECT_TIMEOUT_MS,
+    )
 }
 
 #[cfg(test)]

@@ -3,6 +3,7 @@ use crate::code;
 use crate::protocol_envelope::ProtocolEnvelope;
 use serde_json::{json, Value};
 
+#[cfg(test)]
 pub(super) fn parse_optional_non_negative_u64(
     request: &ProtocolRequest,
     key: &str,
@@ -27,6 +28,7 @@ pub(super) fn parse_optional_non_negative_u64(
         .transpose()
 }
 
+#[cfg(test)]
 pub(super) fn parse_optional_non_negative_i64(
     request: &ProtocolRequest,
     key: &str,
@@ -52,6 +54,7 @@ pub(super) fn parse_optional_non_negative_i64(
     })
 }
 
+#[cfg(test)]
 pub(super) fn parse_optional_non_negative_u32(
     request: &ProtocolRequest,
     key: &str,
