@@ -5,7 +5,9 @@
 #![warn(clippy::nursery)]
 #![forbid(unsafe_code)]
 
+use crate::orchestrator_service::PortFuture;
 use crate::runtime::shared::{RuntimeAgentId, RuntimeBeadId, RuntimeError, RuntimeRepoId};
+use crate::RuntimeAgentState;
 use sqlx::PgPool;
 
 pub struct RuntimePgBeadRepository {
@@ -89,5 +91,61 @@ impl RuntimePgBeadRepository {
             .fetch_one(&self.pool)
             .await
             .map_err(|e| RuntimeError::RepositoryError(format!("heartbeat_claim: {e}")))
+    }
+}
+
+impl crate::orchestrator_service::ClaimRepository for RuntimePgBeadRepository {
+    fn recover_stale_claims<'a>(
+        &'a self,
+        repo_id: &'a crate::RuntimeRepoId,
+    ) -> PortFuture<'a, u32> {
+        Box::pin(async move {
+            self.recover_stale_claims(repo_id).await.map_err(|e| {
+                crate::error::SwarmError::DatabaseError(e.to_string())
+            })
+        })
+    }
+
+    fn get_agent_state<'a>(
+        &'a self,
+        _agent_id: &'a RuntimeAgentId,
+    ) -> PortFuture<'a, Option<RuntimeAgentState>> {
+        Box::pin(async move {
+            Err(crate::error::SwarmError::AgentError(
+                "get_agent_state not implemented for bead repository".to_string(),
+            ))
+        })
+    }
+
+    fn claim_next_bead<'a>(
+        &'a self,
+        agent_id: &'a RuntimeAgentId,
+    ) -> PortFuture<'a, Option<RuntimeBeadId>> {
+        Box::pin(async move {
+            self.claim_next(agent_id).await.map_err(|e| {
+                crate::error::SwarmError::DatabaseError(e.to_string())
+            })
+        })
+    }
+
+    fn create_workspace<'a>(
+        &'a self,
+        _agent_id: &'a RuntimeAgentId,
+        _bead_id: &'a RuntimeBeadId,
+    ) -> PortFuture<'a, ()> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn heartbeat_claim<'a>(
+        &'a self,
+        agent_id: &'a RuntimeAgentId,
+        bead_id: &'a RuntimeBeadId,
+        lease_extension_ms: i32,
+    ) -> PortFuture<'a, bool> {
+        Box::pin(async move {
+            self.heartbeat_claim(agent_id, bead_id, lease_extension_ms)
+                .await
+                .map_err(|e| crate::error::SwarmError::DatabaseError(e.to_string()))
+        })
     }
 }
