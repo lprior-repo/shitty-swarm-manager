@@ -292,45 +292,99 @@ pub(in crate::protocol_runtime) async fn handle_init_local_db(
     }
 
     let port_mapping = format!("{port}:5432");
-    let _ = Command::new("docker")
+    let start_result = Command::new("docker")
         .args(["start", container_name.as_str()])
         .output()
         .await;
 
-    let _ = Command::new("docker")
-        .args([
-            "run",
-            "-d",
-            "--name",
-            container_name.as_str(),
-            "-p",
-            port_mapping.as_str(),
-            "-e",
-            format!("POSTGRES_USER={user}").as_str(),
-            "-e",
-            "POSTGRES_HOST_AUTH_METHOD=trust",
-            "-e",
-            format!("POSTGRES_DB={database}").as_str(),
-            "postgres:16",
-        ])
-        .output()
-        .await;
+    let container_started = start_result
+        .as_ref()
+        .is_ok_and(|output| output.status.success());
+
+    if !container_started {
+        let run_result = Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--name",
+                container_name.as_str(),
+                "-p",
+                port_mapping.as_str(),
+                "-e",
+                format!("POSTGRES_USER={user}").as_str(),
+                "-e",
+                "POSTGRES_HOST_AUTH_METHOD=trust",
+                "-e",
+                format!("POSTGRES_DB={database}").as_str(),
+                "postgres:16",
+            ])
+            .output()
+            .await;
+
+        if let Err(e) = run_result.as_ref() {
+            return Err(Box::new(
+                ProtocolEnvelope::error(
+                    request.rid.clone(),
+                    code::INTERNAL.to_string(),
+                    format!("Failed to run docker container: {e}"),
+                )
+                .with_fix("Ensure docker is running and container name is available".to_string()),
+            ));
+        }
+
+        if let Ok(output) = &run_result {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                return Err(Box::new(
+                    ProtocolEnvelope::error(
+                        request.rid.clone(),
+                        code::INTERNAL.to_string(),
+                        format!("Docker run failed: {stderr}"),
+                    )
+                    .with_fix(
+                        "Check docker logs, ensure port is available and container name is unique"
+                            .to_string(),
+                    ),
+                ));
+            }
+        }
+    }
 
     let mut retry_count = 0;
     let max_retries = 10;
+    let mut last_error = String::new();
     while retry_count < max_retries {
         let ready_check = Command::new("docker")
             .args(["exec", container_name.as_str(), "pg_isready", "-U", &user])
             .output()
             .await;
 
-        if let Ok(check) = ready_check {
-            if check.status.success() {
-                break;
+        match ready_check {
+            Ok(check) if check.status.success() => break,
+            Ok(check) => {
+                last_error =
+                    String::from_utf8_lossy(&check.stderr).trim().to_string();
+            }
+            Err(e) => {
+                last_error = e.to_string();
             }
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         retry_count += 1;
+    }
+
+    if retry_count >= max_retries {
+        return Err(Box::new(
+            ProtocolEnvelope::error(
+                request.rid.clone(),
+                code::INTERNAL.to_string(),
+                format!("Database container not ready after {max_retries}s: {last_error}"),
+            )
+            .with_fix(
+                "Check docker logs for the container, verify postgres is starting correctly"
+                    .to_string(),
+            ),
+        ));
     }
 
     let url = format!("postgresql://{user}@localhost:{port}/{database}");
