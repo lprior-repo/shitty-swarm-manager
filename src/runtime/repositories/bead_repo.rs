@@ -25,6 +25,8 @@ impl RuntimePgBeadRepository {
         &self.pool
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn claim_next(
         &self,
         agent_id: &RuntimeAgentId,
@@ -38,6 +40,8 @@ impl RuntimePgBeadRepository {
             .map(|opt| opt.map(RuntimeBeadId::new))
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn release(&self, agent_id: &RuntimeAgentId) -> crate::runtime::shared::Result<()> {
         sqlx::query("UPDATE agent_state SET bead_id = NULL, current_stage = NULL, status = 'idle' WHERE repo_id = $1 AND agent_id = $2")
              .bind(agent_id.repo_id().value())
@@ -48,6 +52,8 @@ impl RuntimePgBeadRepository {
             .map(|_| ())
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn mark_blocked(
         &self,
         repo_id: &RuntimeRepoId,
@@ -62,9 +68,11 @@ impl RuntimePgBeadRepository {
         .execute(&self.pool)
         .await
         .map_err(|e| RuntimeError::RepositoryError(format!("mark_blocked: {e}")))
-        .map(|_| ())
+            .map(|_| ())
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn recover_stale_claims(
         &self,
         repo_id: &RuntimeRepoId,
@@ -77,6 +85,8 @@ impl RuntimePgBeadRepository {
             .map(|count| u32::try_from(count).unwrap_or(0))
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn heartbeat_claim(
         &self,
         agent_id: &RuntimeAgentId,

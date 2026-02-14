@@ -3,6 +3,8 @@ use crate::error::{Result, SwarmError};
 use crate::types::{ExecutionEvent, RepoId};
 
 impl SwarmDb {
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn get_command_history(
         &self,
         limit: i64,
@@ -57,6 +59,8 @@ impl SwarmDb {
         })
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn list_active_resource_locks(&self) -> Result<Vec<(String, String, i64, i64)>> {
         sqlx::query_as::<
             _,
@@ -91,6 +95,8 @@ impl SwarmDb {
         })
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn get_execution_events(
         &self,
         repo_id: &RepoId,

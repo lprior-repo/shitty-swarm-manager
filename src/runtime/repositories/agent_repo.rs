@@ -24,6 +24,8 @@ impl RuntimePgAgentRepository {
         &self.pool
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails or data is invalid.
     pub async fn find_by_id(
         &self,
         agent_id: &RuntimeAgentId,
@@ -76,6 +78,8 @@ impl RuntimePgAgentRepository {
         )
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn update_status(
         &self,
         agent_id: &RuntimeAgentId,

@@ -122,6 +122,8 @@ impl AgentState {
         self.bead_id.is_some()
     }
 
+    /// # Errors
+    /// Returns an error if agent state invariants are violated.
     pub fn validate_invariants(&self) -> crate::runtime::shared::Result<()> {
         match self.status {
             AgentStatus::Working => {

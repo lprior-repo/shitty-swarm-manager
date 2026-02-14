@@ -1,6 +1,9 @@
 use crate::config::database_url_candidates_for_cli;
 use crate::SwarmError;
 
+#[allow(clippy::too_many_arguments)]
+/// # Errors
+/// Returns an error if the database connection or operation fails.
 pub async fn audit_request(
     cmd: &str,
     rid: Option<&str>,
@@ -44,6 +47,7 @@ fn mask_url_password(obj: &mut serde_json::Map<String, serde_json::Value>, key: 
     }
 }
 
+#[must_use]
 pub fn compose_database_url_candidates(
     explicit_database_url: Option<&str>,
     discovered_candidates: Vec<String>,

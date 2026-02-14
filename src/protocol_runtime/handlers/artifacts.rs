@@ -29,7 +29,7 @@ struct ArtifactQuery {
 }
 
 impl ArtifactQuery {
-    fn new(repo_id: crate::RepoId, bead_id: BeadId, artifact_type: Option<ArtifactType>) -> Self {
+    const fn new(repo_id: crate::RepoId, bead_id: BeadId, artifact_type: Option<ArtifactType>) -> Self {
         Self {
             repo_id,
             bead_id,
@@ -61,6 +61,7 @@ impl ArtifactQueryPort for SwarmDbArtifactPort {
     }
 }
 
+#[allow(clippy::future_not_send)]
 async fn fetch_artifacts<P: ArtifactHandlerPorts>(
     ports: &P,
     query: &ArtifactQuery,

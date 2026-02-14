@@ -8,6 +8,8 @@ use tokio::process::Command;
 pub const EMBEDDED_COORDINATOR_SCHEMA_SQL: &str = include_str!("../../schema.sql");
 pub const EMBEDDED_COORDINATOR_SCHEMA_REF: &str = "embedded:crates/swarm-coordinator/schema.sql";
 
+/// # Errors
+/// Returns an error if not in a git repository.
 pub async fn current_repo_root() -> std::result::Result<PathBuf, Box<ProtocolEnvelope>> {
     Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
@@ -33,6 +35,8 @@ pub async fn current_repo_root() -> std::result::Result<PathBuf, Box<ProtocolEnv
         })
 }
 
+/// # Errors
+/// Returns an error if the schema file cannot be read.
 pub async fn load_schema_sql(
     rid: Option<String>,
     schema: Option<&str>,

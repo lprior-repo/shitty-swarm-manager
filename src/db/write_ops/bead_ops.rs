@@ -14,6 +14,8 @@ use serde_json::json;
 use sqlx::Acquire;
 
 impl SwarmDb {
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn claim_bead(&self, agent_id: &AgentId, bead_id: &BeadId) -> Result<bool> {
         let mut tx = self
             .pool()
@@ -116,6 +118,8 @@ impl SwarmDb {
         Ok(true)
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn heartbeat_claim(
         &self,
         agent_id: &AgentId,
@@ -132,6 +136,8 @@ impl SwarmDb {
             .map_err(|e| SwarmError::DatabaseError(format!("Failed to heartbeat bead claim: {e}")))
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn recover_expired_claims(&self, repo_id: &RepoId) -> Result<u32> {
         sqlx::query_scalar::<_, i32>("SELECT recover_expired_bead_claims($1)")
             .bind(repo_id.value())
@@ -143,6 +149,8 @@ impl SwarmDb {
             .map(i32::cast_unsigned)
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn enqueue_backlog_batch(
         &self,
         repo_id: &RepoId,
@@ -163,6 +171,8 @@ impl SwarmDb {
         .map_err(|e| SwarmError::DatabaseError(format!("Failed to enqueue backlog batch: {e}")))
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn mark_bead_blocked(
         &self,
         agent_id: &AgentId,

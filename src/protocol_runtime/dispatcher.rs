@@ -10,6 +10,7 @@ pub struct CommandSuccess {
     pub state: serde_json::Value,
 }
 
+#[must_use]
 pub fn project_next_recommendation(payload: &serde_json::Value) -> serde_json::Value {
     if payload.get("id").is_some() {
         return payload.clone();
@@ -36,6 +37,8 @@ pub fn bead_id_from_recommendation(recommendation: &serde_json::Value) -> Option
         .map(std::string::ToString::to_string)
 }
 
+/// # Errors
+/// Returns an error if request validation fails or command execution fails.
 pub async fn execute_request(
     request: ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
@@ -47,6 +50,8 @@ pub async fn execute_request(
     }
 }
 
+/// # Errors
+/// Returns an error if request validation fails or command execution fails.
 pub async fn execute_request_no_batch(
     request: ProtocolRequest,
 ) -> std::result::Result<CommandSuccess, Box<ProtocolEnvelope>> {
@@ -67,6 +72,8 @@ pub async fn dispatch_request(
 }
 
 #[allow(clippy::large_stack_frames)]
+/// # Errors
+/// Returns an error if command execution fails.
 pub async fn dispatch_no_batch(
     request: &ProtocolRequest,
     cmd: &str,
@@ -115,6 +122,7 @@ pub async fn dispatch_no_batch(
     }
 }
 
+#[must_use]
 pub fn dry_run_success(
     _request: &ProtocolRequest,
     steps: Vec<serde_json::Value>,

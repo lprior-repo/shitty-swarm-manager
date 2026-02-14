@@ -277,7 +277,7 @@ pub struct SymbolRecord {
 }
 
 impl SymbolRecord {
-    /// Convert to a TrackedSymbol.
+    /// Convert to a `TrackedSymbol`.
     #[must_use]
     pub fn to_tracked_symbol(&self) -> TrackedSymbol {
         let kind = SymbolKind::try_from(self.kind.as_str()).unwrap_or(SymbolKind::Function);

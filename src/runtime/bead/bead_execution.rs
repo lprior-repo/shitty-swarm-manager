@@ -19,6 +19,8 @@ pub struct BeadExecution {
 }
 
 impl BeadExecution {
+    /// # Errors
+    /// Returns an error if bead execution invariants are violated.
     pub fn new(
         current_stage: Stage,
         implementation_attempt: u32,
@@ -55,6 +57,8 @@ impl BeadExecution {
         self.status
     }
 
+    /// # Errors
+    /// Returns an error if invariants are violated or stage result is Started.
     pub fn determine_transition(
         &self,
         result: &StageResult,
@@ -75,6 +79,8 @@ impl BeadExecution {
         ))
     }
 
+    /// # Errors
+    /// Returns an error if bead execution invariants are violated.
     pub fn validate_invariants(&self) -> crate::runtime::shared::Result<()> {
         if self.max_implementation_attempts == 0 {
             return Err(RuntimeError::InvariantViolation(

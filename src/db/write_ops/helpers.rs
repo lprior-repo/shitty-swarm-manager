@@ -12,7 +12,7 @@ use crate::runtime::{
 use crate::types::{BeadId, RepoId, Stage, StageResult};
 use crate::BrSyncStatus;
 
-pub(crate) fn build_failure_diagnostics(message: Option<&str>) -> FailureDiagnosticsPayload {
+pub fn build_failure_diagnostics(message: Option<&str>) -> FailureDiagnosticsPayload {
     let detail = message
         .map(redact_sensitive)
         .filter(|value| !value.trim().is_empty());
@@ -27,7 +27,7 @@ pub(crate) fn build_failure_diagnostics(message: Option<&str>) -> FailureDiagnos
     }
 }
 
-pub(crate) fn classify_failure_category(message: &str) -> &'static str {
+pub fn classify_failure_category(message: &str) -> &'static str {
     let lowered = message.to_ascii_lowercase();
     if lowered.contains("timeout") {
         "timeout"
@@ -40,7 +40,7 @@ pub(crate) fn classify_failure_category(message: &str) -> &'static str {
     }
 }
 
-pub(crate) fn redact_sensitive(message: &str) -> String {
+pub fn redact_sensitive(message: &str) -> String {
     message
         .split_whitespace()
         .map(redact_token)
@@ -48,7 +48,7 @@ pub(crate) fn redact_sensitive(message: &str) -> String {
         .join(" ")
 }
 
-pub(crate) fn landing_retry_causation_id(reason: &str) -> String {
+pub fn landing_retry_causation_id(reason: &str) -> String {
     format!(
         "landing-sync:retry:{}",
         reason
@@ -58,7 +58,7 @@ pub(crate) fn landing_retry_causation_id(reason: &str) -> String {
     )
 }
 
-pub(crate) const fn landing_sync_status_key(status: BrSyncStatus) -> &'static str {
+pub const fn landing_sync_status_key(status: BrSyncStatus) -> &'static str {
     match status {
         BrSyncStatus::Synchronized => "synchronized",
         BrSyncStatus::RetryScheduled => "retry_scheduled",
@@ -66,7 +66,7 @@ pub(crate) const fn landing_sync_status_key(status: BrSyncStatus) -> &'static st
     }
 }
 
-pub(crate) fn landing_sync_causation_id(status: BrSyncStatus, reason: Option<&str>) -> String {
+pub fn landing_sync_causation_id(status: BrSyncStatus, reason: Option<&str>) -> String {
     match reason {
         Some(reason)
             if matches!(
@@ -104,7 +104,7 @@ fn redact_token(token: &str) -> String {
     )
 }
 
-pub(crate) fn event_entity_id(bead_id: &BeadId, repo_id: &RepoId) -> String {
+pub fn event_entity_id(bead_id: &BeadId, repo_id: &RepoId) -> String {
     format!("repo:{}:bead:{}", repo_id.value(), bead_id.value())
 }
 
@@ -146,7 +146,7 @@ fn to_runtime_stage_result(result: &StageResult) -> RuntimeStageResult {
     }
 }
 
-fn to_stage(runtime_stage: RuntimeStage) -> Stage {
+const fn to_stage(runtime_stage: RuntimeStage) -> Stage {
     match runtime_stage {
         RuntimeStage::RustContract => Stage::RustContract,
         RuntimeStage::Implement => Stage::Implement,

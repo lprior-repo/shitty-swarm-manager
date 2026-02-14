@@ -20,6 +20,8 @@ impl ArtifactRepository {
         Self { pool }
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn store(
         &self,
         stage_history_id: i64,

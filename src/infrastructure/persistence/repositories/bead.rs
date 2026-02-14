@@ -20,16 +20,20 @@ impl BeadRepository {
         Self { pool }
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn claim_next(&self, agent_id: &AgentId) -> Result<Option<BeadId>> {
         sqlx::query_scalar::<_, Option<String>>("SELECT claim_next_bead($1, $2)")
             .bind(agent_id.repo_id().value())
-            .bind(agent_id.number() as i32)
+            .bind(agent_id.number().cast_signed())
             .fetch_one(&self.pool)
             .await
             .map_err(|e| SwarmError::DatabaseError(format!("Failed to claim next bead: {e}")))
             .map(|value| value.map(BeadId::new))
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn heartbeat_claim(
         &self,
         agent_id: &AgentId,
@@ -38,7 +42,7 @@ impl BeadRepository {
     ) -> Result<bool> {
         sqlx::query_scalar::<_, bool>("SELECT heartbeat_bead_claim($1, $2, $3, $4)")
             .bind(agent_id.repo_id().value())
-            .bind(agent_id.number() as i32)
+            .bind(agent_id.number().cast_signed())
             .bind(bead_id.value())
             .bind(lease_extension_ms)
             .fetch_one(&self.pool)
@@ -46,17 +50,21 @@ impl BeadRepository {
             .map_err(|e| SwarmError::DatabaseError(format!("Failed to heartbeat bead claim: {e}")))
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn recover_expired_claims(&self, repo_id: &RepoId) -> Result<u32> {
         sqlx::query_scalar::<_, i32>("SELECT recover_expired_bead_claims($1)")
             .bind(repo_id.value())
             .fetch_one(&self.pool)
             .await
-            .map(|count| count as u32)
+            .map(i32::cast_unsigned)
             .map_err(|e| {
                 SwarmError::DatabaseError(format!("Failed to recover expired claims: {e}"))
             })
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn enqueue_batch(&self, repo_id: &RepoId, prefix: &str, count: u32) -> Result<()> {
         sqlx::query(
             "INSERT INTO bead_backlog (repo_id, bead_id, priority, status)
@@ -65,7 +73,7 @@ impl BeadRepository {
         )
         .bind(repo_id.value())
         .bind(prefix)
-        .bind(count as i32)
+        .bind(count.cast_signed())
         .execute(&self.pool)
         .await
         .map(|_| ())

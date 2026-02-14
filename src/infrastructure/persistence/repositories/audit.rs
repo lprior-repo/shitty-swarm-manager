@@ -19,6 +19,8 @@ impl AuditRepository {
         Self { pool }
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn record_command(
         &self,
         cmd: &str,
@@ -36,7 +38,7 @@ impl AuditRepository {
         .bind(rid)
         .bind(args)
         .bind(ok)
-        .bind(ms as i64)
+        .bind(ms.cast_signed())
         .bind(error_code)
         .execute(&self.pool)
         .await

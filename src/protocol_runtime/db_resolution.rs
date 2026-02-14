@@ -171,6 +171,7 @@ pub(super) fn mask_database_url(url: &str) -> String {
     }
 }
 
+#[must_use]
 pub fn mask_database_url_public(url: &str) -> String {
     mask_database_url(url)
 }

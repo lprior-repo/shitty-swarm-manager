@@ -15,6 +15,8 @@ use serde_json::json;
 use sqlx::Acquire;
 
 impl SwarmDb {
+    /// # Errors
+    /// Returns an error if push confirmation validation fails or database operations fail.
     pub async fn finalize_after_push_confirmation(
         &self,
         agent_id: &AgentId,
@@ -36,6 +38,7 @@ impl SwarmDb {
         .await
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(super) async fn apply_stage_transition(
         &self,
         input: StageTransitionInput<'_>,

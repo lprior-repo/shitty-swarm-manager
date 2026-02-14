@@ -10,6 +10,8 @@ use crate::error::{Result, SwarmError};
 use crate::types::ArtifactType;
 
 impl SwarmDb {
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn store_stage_artifact(
         &self,
         stage_history_id: i64,

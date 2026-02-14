@@ -4,6 +4,9 @@
 #![warn(clippy::pedantic)]
 #![warn(clippy::nursery)]
 #![forbid(unsafe_code)]
+#![allow(clippy::cast_precision_loss)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_sign_loss)]
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -115,7 +118,7 @@ impl BehavioralFingerprint {
     }
 
     #[must_use]
-    pub fn health_status(&self) -> AgentHealthStatus {
+    pub const fn health_status(&self) -> AgentHealthStatus {
         if self.is_stuck(300, 5) {
             AgentHealthStatus::Stuck
         } else if self.is_retry_loop(10) {

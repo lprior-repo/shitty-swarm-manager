@@ -15,6 +15,8 @@ pub struct StreamCapture {
     pub truncated: bool,
 }
 
+/// # Errors
+/// Returns an error if the stream read fails.
 pub async fn capture_stream_limited<R>(
     mut stream: R,
     max_bytes: usize,
@@ -48,6 +50,8 @@ where
     Ok(StreamCapture { bytes, truncated })
 }
 
+/// # Errors
+/// Returns an error if the command execution fails or returns non-JSON output.
 pub async fn run_external_json_command(
     program: &str,
     args: &[&str],
@@ -64,6 +68,8 @@ pub async fn run_external_json_command(
     .await
 }
 
+/// # Errors
+/// Returns an error if the command execution fails, times out, or returns non-JSON output.
 pub async fn run_external_json_command_with_timeout(
     program: &str,
     args: &[&str],
@@ -227,6 +233,8 @@ pub async fn run_external_json_command_with_timeout(
     })
 }
 
+/// # Errors
+/// Returns an error if the command execution fails or returns non-JSON output.
 pub async fn run_external_json_command_with_ms(
     program: &str,
     args: &[&str],

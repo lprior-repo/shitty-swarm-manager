@@ -9,6 +9,8 @@ use crate::db::SwarmDb;
 use crate::error::{Result, SwarmError};
 
 impl SwarmDb {
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn record_command_audit(
         &self,
         cmd: &str,

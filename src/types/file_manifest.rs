@@ -21,7 +21,7 @@ pub struct FileDeclaration {
 impl FileDeclaration {
     /// Create a new file declaration.
     #[must_use]
-    pub fn new(path: String, modification_type: ModificationType) -> Self {
+    pub const fn new(path: String, modification_type: ModificationType) -> Self {
         Self {
             path,
             modification_type,
@@ -256,7 +256,7 @@ impl FileConflict {
             self.conflicting_agents.join(", "),
             self.involved_beads
                 .iter()
-                .map(|b| b.to_string())
+                .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(", ")
         )

@@ -104,6 +104,8 @@ pub const fn passed_stage_transition(stage: Stage) -> TransitionDecision {
     }
 }
 
+/// # Errors
+/// Returns an error if the transition requires push confirmation but it was not provided.
 pub fn validate_completion_requires_push_confirmation(
     transition: StageTransition,
     push_confirmed: bool,

@@ -9,6 +9,7 @@ use super::parser::CliError;
 
 /// # Errors
 /// Returns `CliError::UnknownCommand` if an unknown flag is found.
+#[allow(dead_code)]
 pub fn ensure_no_unknown_flags(args: &[String], allowed_flags: &[&str]) -> Result<(), CliError> {
     let invalid = args
         .iter()

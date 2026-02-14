@@ -12,6 +12,8 @@ use sqlx::Acquire;
 use std::collections::HashSet;
 
 impl SwarmDb {
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn register_repo(&self, repo_id: &RepoId, name: &str, path: &str) -> Result<()> {
         sqlx::query(
             "INSERT INTO repos (repo_id, name, path) VALUES ($1, $2, $3)
@@ -26,6 +28,8 @@ impl SwarmDb {
         .map(|_result| ())
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn register_agent(&self, agent_id: &AgentId) -> Result<bool> {
         let repo_scoped = self.table_has_column("agent_state", "repo_id").await?;
 
@@ -60,6 +64,8 @@ impl SwarmDb {
         }
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn seed_idle_agents(&self, count: u32) -> Result<()> {
         let repo_scoped = self.table_has_column("agent_state", "repo_id").await?;
         let default_repo = RepoId::new("local");
@@ -246,6 +252,8 @@ impl SwarmDb {
         }
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn release_agent(&self, agent_id: &AgentId) -> Result<Option<BeadId>> {
         let mut tx = self
             .pool()

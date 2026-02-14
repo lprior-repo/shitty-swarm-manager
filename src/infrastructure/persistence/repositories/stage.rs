@@ -20,6 +20,8 @@ impl StageRepository {
         Self { pool }
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn record_started(
         &self,
         agent_id: &AgentId,
@@ -34,15 +36,17 @@ impl StageRepository {
              VALUES ($1, $2, $3, $4, $5, 'started') RETURNING id",
         )
         .bind(agent_id.repo_id().value())
-        .bind(agent_id.number() as i32)
+        .bind(agent_id.number().cast_signed())
         .bind(bead_id.value())
         .bind(stage.as_str())
-        .bind(attempt as i32)
+        .bind(attempt.cast_signed())
         .fetch_one(&self.pool)
         .await
         .map_err(|e| SwarmError::DatabaseError(format!("Failed to record stage start: {e}")))
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn record_completed(
         &self,
         agent_id: &AgentId,
@@ -66,14 +70,16 @@ impl StageRepository {
              )",
         )
         .bind(agent_id.repo_id().value())
-        .bind(agent_id.number() as i32)
+        .bind(agent_id.number().cast_signed())
         .bind(bead_id.value())
         .bind(stage.as_str())
-        .bind(attempt as i32)
+        .bind(attempt.cast_signed())
         .bind(status)
         .bind(message)
         .bind(message)
-        .bind(duration_ms as i32)
+        .bind(i32::try_from(duration_ms).map_err(|_| {
+            SwarmError::DatabaseError("Duration overflow updating stage history".to_string())
+        })?)
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -82,6 +88,8 @@ impl StageRepository {
         Ok(())
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn advance_agent_stage(&self, agent_id: &AgentId, next_stage: Stage) -> Result<()> {
         sqlx::query(
             "UPDATE agent_state
@@ -89,7 +97,7 @@ impl StageRepository {
              WHERE repo_id = $1 AND agent_id = $2",
         )
         .bind(agent_id.repo_id().value())
-        .bind(agent_id.number() as i32)
+        .bind(agent_id.number().cast_signed())
         .bind(next_stage.as_str())
         .execute(&self.pool)
         .await

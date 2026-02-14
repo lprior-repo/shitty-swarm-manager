@@ -5,6 +5,8 @@ use crate::types::{
 };
 
 impl SwarmDb {
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn get_resume_context_projections(
         &self,
         repo_id: &RepoId,
@@ -48,6 +50,8 @@ impl SwarmDb {
             .collect()
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn get_deep_resume_contexts(
         &self,
         repo_id: &RepoId,

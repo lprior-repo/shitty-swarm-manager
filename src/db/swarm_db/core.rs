@@ -21,10 +21,14 @@ impl Clone for SwarmDb {
 }
 
 impl SwarmDb {
+    /// # Errors
+    /// Returns an error if the database connection fails.
     pub async fn new(connection_string: &str) -> Result<Self> {
         Self::new_with_timeout(connection_string, None).await
     }
 
+    /// # Errors
+    /// Returns an error if the database connection fails.
     pub async fn new_with_timeout(
         connection_string: &str,
         timeout_ms: Option<u64>,

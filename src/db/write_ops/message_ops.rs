@@ -10,6 +10,8 @@ use crate::error::{Result, SwarmError};
 use crate::types::{AgentId, BeadId, MessageType};
 
 impl SwarmDb {
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn write_broadcast(&self, from_agent: &str, msg: &str) -> Result<i64> {
         sqlx::query("DELETE FROM resource_locks WHERE until_at <= NOW()")
             .execute(self.pool())
@@ -29,6 +31,8 @@ impl SwarmDb {
             .map_err(|e| SwarmError::DatabaseError(format!("Failed to count agents: {e}")))
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn send_agent_message(
         &self,
         from_agent: &AgentId,
@@ -59,6 +63,8 @@ impl SwarmDb {
         .map_err(|e| SwarmError::DatabaseError(format!("Failed to send agent message: {e}")))
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn mark_messages_read(&self, agent_id: &AgentId, message_ids: &[i64]) -> Result<()> {
         if message_ids.is_empty() {
             return Ok(());

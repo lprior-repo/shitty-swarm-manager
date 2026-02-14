@@ -20,7 +20,7 @@ pub enum StageTransition {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct FailureDiagnosticsPayload {
+pub struct FailureDiagnosticsPayload {
     pub category: String,
     pub retryable: bool,
     pub next_command: String,
@@ -28,7 +28,7 @@ pub(crate) struct FailureDiagnosticsPayload {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ExecutionEventWriteInput {
+pub struct ExecutionEventWriteInput {
     pub stage: Option<Stage>,
     pub event_type: &'static str,
     pub causation_id: Option<String>,
@@ -36,7 +36,7 @@ pub(crate) struct ExecutionEventWriteInput {
     pub diagnostics: Option<FailureDiagnosticsPayload>,
 }
 
-pub(crate) struct StageTransitionInput<'a> {
+pub struct StageTransitionInput<'a> {
     pub transition: &'a StageTransition,
     pub agent_id: &'a crate::types::AgentId,
     pub bead_id: &'a crate::types::BeadId,

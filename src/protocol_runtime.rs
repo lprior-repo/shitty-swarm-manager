@@ -69,6 +69,8 @@ fn bounded_history_limit(limit: Option<i64>) -> i64 {
     parsing::bounded_history_limit(limit, DEFAULT_HISTORY_LIMIT, MAX_HISTORY_LIMIT)
 }
 
+/// # Errors
+/// Returns an error if the request parsing or execution fails.
 pub async fn process_protocol_line(line: &str) -> std::result::Result<(), SwarmError> {
     let mut stdout = tokio::io::stdout();
     let started = Instant::now();

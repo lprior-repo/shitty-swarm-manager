@@ -19,6 +19,8 @@ impl LockRepository {
         Self { pool }
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn acquire(
         &self,
         resource: &str,
@@ -46,6 +48,8 @@ impl LockRepository {
         Ok(acquired)
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn release(&self, resource: &str, agent: &str) -> Result<bool> {
         sqlx::query("DELETE FROM resource_locks WHERE resource = $1 AND agent = $2")
             .bind(resource)
@@ -56,6 +60,8 @@ impl LockRepository {
             .map_err(|e| SwarmError::DatabaseError(format!("Failed to unlock resource: {e}")))
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn list_active(&self) -> Result<Vec<(String, String, i64, i64)>> {
         sqlx::query("DELETE FROM resource_locks WHERE until_at <= NOW()")
             .execute(&self.pool)

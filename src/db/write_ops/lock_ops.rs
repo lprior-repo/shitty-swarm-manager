@@ -10,6 +10,8 @@ use crate::error::{Result, SwarmError};
 use sqlx::Acquire;
 
 impl SwarmDb {
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn acquire_resource_lock(
         &self,
         resource: &str,
@@ -51,6 +53,8 @@ impl SwarmDb {
             .map(|()| acquired)
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn unlock_resource(&self, resource: &str, agent: &str) -> Result<bool> {
         sqlx::query("DELETE FROM resource_locks WHERE resource = $1 AND agent = $2")
             .bind(resource)

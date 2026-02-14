@@ -7,6 +7,8 @@ use crate::runtime::{
 use crate::types::{AgentId, AgentStatus, AvailableAgent, RepoId};
 
 impl SwarmDb {
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn get_agent_state(&self, agent_id: &AgentId) -> Result<Option<RuntimeAgentState>> {
         let row = sqlx::query_as::<_, (Option<String>, Option<String>, String, i32)>(
             "SELECT bead_id, current_stage, status, implementation_attempt
@@ -49,6 +51,8 @@ impl SwarmDb {
         )
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn get_available_agents(&self, repo_id: &RepoId) -> Result<Vec<AvailableAgent>> {
         let rows = sqlx::query_as::<_, (i32, String, i32, i32, i32)>(
             "SELECT
@@ -87,6 +91,8 @@ impl SwarmDb {
             .collect()
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn get_active_agents(
         &self,
         repo_id: &RepoId,

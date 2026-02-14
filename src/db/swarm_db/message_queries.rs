@@ -3,6 +3,8 @@ use crate::error::{Result, SwarmError};
 use crate::types::{AgentMessage, BeadId, MessageType};
 
 impl SwarmDb {
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn get_all_unread_messages(&self) -> Result<Vec<AgentMessage>> {
         let rows = sqlx::query_as::<
             _,

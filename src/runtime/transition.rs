@@ -9,6 +9,8 @@ use crate::runtime::bead::{BeadExecution, BeadExecutionStatus};
 use crate::runtime::shared::RuntimeError;
 use crate::runtime::stage::{Stage, StageResult, StageTransition, TransitionDecision};
 
+/// # Errors
+/// Returns an error if the transition requires push confirmation but it was not provided.
 pub fn validate_completion_requires_push_confirmation(
     transition: StageTransition,
     push_confirmed: bool,
@@ -51,15 +53,12 @@ pub fn runtime_determine_transition_decision(
             ))
         });
 
-    computed_decision.map_or_else(
-        |_| {
-            TransitionDecision::new(
-                StageTransition::Block,
-                crate::runtime::stage::TransitionReason::StageFailedMaxAttemptsReached,
-            )
-        },
-        |decision| decision,
-    )
+    computed_decision.unwrap_or_else(|_| {
+        TransitionDecision::new(
+            StageTransition::Block,
+            crate::runtime::stage::TransitionReason::StageFailedMaxAttemptsReached,
+        )
+    })
 }
 
 #[must_use]

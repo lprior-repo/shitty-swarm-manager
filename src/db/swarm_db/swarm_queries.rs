@@ -3,6 +3,8 @@ use crate::error::{Result, SwarmError};
 use crate::types::{AgentId, BeadId, ProgressSummary, RepoId, SwarmConfig, SwarmStatus};
 
 impl SwarmDb {
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn get_config(&self, repo_id: &RepoId) -> Result<SwarmConfig> {
         let row = sqlx::query_as::<
             _,
@@ -48,6 +50,8 @@ impl SwarmDb {
         })
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn get_progress(&self, repo_id: &RepoId) -> Result<ProgressSummary> {
         let row = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
             "SELECT
@@ -79,6 +83,8 @@ impl SwarmDb {
         })
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn claim_next_bead(&self, agent_id: &AgentId) -> Result<Option<BeadId>> {
         sqlx::query_scalar::<_, Option<String>>("SELECT claim_next_bead($1, $2)")
             .bind(agent_id.repo_id().value())

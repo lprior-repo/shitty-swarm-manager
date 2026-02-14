@@ -25,6 +25,8 @@ impl RuntimePgStageRepository {
         &self.pool
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn record_started(
         &self,
         agent_id: &RuntimeAgentId,
@@ -43,9 +45,11 @@ impl RuntimePgStageRepository {
         .bind(attempt.cast_signed())
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| RuntimeError::RepositoryError(format!("record_started: {e}")))
+            .map_err(|e| RuntimeError::RepositoryError(format!("record_started: {e}")))
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn record_completed(
         &self,
         agent_id: &RuntimeAgentId,

@@ -11,6 +11,8 @@ use crate::types::{RepoId, SwarmStatus};
 use tracing::info;
 
 impl SwarmDb {
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn set_swarm_status(&self, repo_id: &RepoId, status: SwarmStatus) -> Result<()> {
         let repo_scoped = self.table_has_column("swarm_config", "repo_id").await?;
 
@@ -37,6 +39,8 @@ impl SwarmDb {
         }
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn update_config(&self, max_agents: u32) -> Result<()> {
         sqlx::query("UPDATE swarm_config SET max_agents = $1")
             .bind(max_agents.cast_signed())
@@ -46,6 +50,8 @@ impl SwarmDb {
             .map_err(|e| SwarmError::DatabaseError(format!("Failed to update config: {e}")))
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn start_swarm(&self, repo_id: &RepoId) -> Result<()> {
         let repo_scoped = self.table_has_column("swarm_config", "repo_id").await?;
 
@@ -73,6 +79,8 @@ impl SwarmDb {
         }
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn initialize_schema_from_sql(&self, schema_sql: &str) -> Result<()> {
         sqlx::raw_sql(schema_sql)
             .execute(self.pool())

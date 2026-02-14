@@ -8,8 +8,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum CircuitState {
+    #[default]
     Closed,
     Open,
     HalfOpen,
@@ -28,12 +29,6 @@ impl CircuitState {
             Self::Open => "open",
             Self::HalfOpen => "half_open",
         }
-    }
-}
-
-impl Default for CircuitState {
-    fn default() -> Self {
-        Self::Closed
     }
 }
 
@@ -109,13 +104,13 @@ impl CircuitBreakerRecord {
     }
 
     #[must_use]
-    pub fn should_open(&self) -> bool {
+    pub const fn should_open(&self) -> bool {
         matches!(self.state, CircuitState::Closed)
             && self.failure_count >= self.config.failure_threshold
     }
 
     #[must_use]
-    pub fn should_close(&self) -> bool {
+    pub const fn should_close(&self) -> bool {
         matches!(self.state, CircuitState::HalfOpen)
             && self.success_count >= self.config.success_threshold
     }
@@ -152,7 +147,7 @@ impl CircuitBreakerRecord {
     pub fn try_half_open(mut self) -> Self {
         if self.state == CircuitState::Open {
             if let Some(opened_at) = self.opened_at {
-                let elapsed = (Utc::now() - opened_at).num_seconds() as u64;
+                let elapsed = (Utc::now() - opened_at).num_seconds().cast_unsigned();
                 if elapsed >= self.config.reset_timeout_secs {
                     self.state = CircuitState::HalfOpen;
                     self.success_count = 0;

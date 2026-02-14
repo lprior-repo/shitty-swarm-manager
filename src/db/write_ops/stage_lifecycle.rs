@@ -16,6 +16,8 @@ use sqlx::Acquire;
 use tracing::debug;
 
 impl SwarmDb {
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn record_stage_started(
         &self,
         agent_id: &AgentId,
@@ -94,6 +96,8 @@ impl SwarmDb {
             .map(|()| stage_history_id)
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn record_stage_complete(
         &self,
         agent_id: &AgentId,
@@ -133,6 +137,8 @@ impl SwarmDb {
         Ok(())
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn record_stage_complete_without_transition(
         &self,
         agent_id: &AgentId,

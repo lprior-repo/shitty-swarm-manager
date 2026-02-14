@@ -23,6 +23,8 @@ const CONTEXT_ARTIFACT_TYPES: [ArtifactType; 3] = [
 ];
 
 impl SwarmDb {
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn persist_retry_packet(
         &self,
         stage_history_id: Option<i64>,
@@ -134,6 +136,8 @@ impl SwarmDb {
         .map(|_| ())
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn mark_landing_retryable(&self, agent_id: &AgentId, reason: &str) -> Result<()> {
         let bead_id = {
             let mut tx = self

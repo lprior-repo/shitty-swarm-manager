@@ -50,7 +50,7 @@ impl BudgetLimit {
 
     /// Calculate remaining budget given current usage.
     #[must_use]
-    pub fn remaining(&self, usage: &TokenUsage) -> BudgetRemaining {
+    pub const fn remaining(&self, usage: &TokenUsage) -> BudgetRemaining {
         BudgetRemaining {
             input: self.max_input_tokens.saturating_sub(usage.input_tokens),
             output: self.max_output_tokens.saturating_sub(usage.output_tokens),
@@ -159,7 +159,7 @@ impl BudgetStatus {
 
     /// Get remaining budget.
     #[must_use]
-    pub fn remaining(&self) -> BudgetRemaining {
+    pub const fn remaining(&self) -> BudgetRemaining {
         self.limit.remaining(&self.usage)
     }
 }
@@ -190,9 +190,9 @@ pub struct BudgetRecord {
 }
 
 impl BudgetRecord {
-    /// Convert to a BudgetStatus.
+    /// Convert to a `BudgetStatus`.
     #[must_use]
-    pub fn to_status(&self) -> BudgetStatus {
+    pub const fn to_status(&self) -> BudgetStatus {
         BudgetStatus {
             limit: BudgetLimit::new(
                 self.max_input_tokens,

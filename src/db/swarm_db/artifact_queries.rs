@@ -3,6 +3,8 @@ use crate::error::{Result, SwarmError};
 use crate::types::{ArtifactType, BeadId, RepoId, StageArtifact};
 
 impl SwarmDb {
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn get_stage_artifacts(
         &self,
         repo_id: &RepoId,
@@ -59,6 +61,8 @@ impl SwarmDb {
             .collect()
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn get_bead_artifacts_by_type(
         &self,
         repo_id: &RepoId,
@@ -117,6 +121,8 @@ impl SwarmDb {
             .collect()
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn get_first_bead_artifact_by_type(
         &self,
         repo_id: &RepoId,
@@ -134,6 +140,8 @@ impl SwarmDb {
             })
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn get_latest_bead_artifact_by_type(
         &self,
         repo_id: &RepoId,
@@ -145,6 +153,8 @@ impl SwarmDb {
             .map(|mut artifacts| artifacts.pop())
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn bead_has_artifact_type(
         &self,
         repo_id: &RepoId,
@@ -169,6 +179,8 @@ impl SwarmDb {
         })
     }
 
+    /// # Errors
+    /// Returns an error if the database operation fails.
     pub async fn get_bead_artifacts(
         &self,
         repo_id: &RepoId,

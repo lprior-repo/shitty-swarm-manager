@@ -4,6 +4,8 @@ use serde_json::json;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+/// # Errors
+/// Returns an error if stdin reading or stdout writing fails.
 pub async fn run_protocol_loop() -> std::result::Result<(), SwarmError> {
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
